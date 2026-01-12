@@ -19,7 +19,7 @@ import os
 FREE_JOB_MAX_TIME = 60 * 30  # 30 minutes in seconds for a free job
 
 
-class Validator(Torchnode):
+class ValidatorThread(Torchnode):
     def __init__(
         self,
         request_queue,
@@ -32,8 +32,10 @@ class Validator(Torchnode):
         endpoint=True,
         endpoint_ip="0.0.0.0",
         load_previous_state=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
-        super(Validator, self).__init__(
+        super(ValidatorThread, self).__init__(
             request_queue,
             response_queue,
             "V",
@@ -41,6 +43,8 @@ class Validator(Torchnode):
             upnp=upnp,
             off_chain_test=off_chain_test,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
 
         # Additional attributes specific to the Validator class
@@ -345,7 +349,7 @@ class Validator(Torchnode):
 
     def create_hf_job(self, job_info: dict, requesters_ip: str = None):
         """
-        This can be invoked directly from the API endpoint for a hosted HF model, or via a UserNode
+        This can be invoked directly from the API endpoint for a hosted HF model, or via a User
         request for hosting on the user's device. This will trigger HF model inspection in the
         Validator ML process and will create a config of eligible workers and their assigned modules.
         """
@@ -448,7 +452,7 @@ class Validator(Torchnode):
 
     def _handle_job_req(self, data: bytes, node: Connection):
         """
-        This method is invoked by a job request directly from a UserNode. If a model name
+        This method is invoked by a job request directly from a User. If a model name
         was provided, we call create_hf_job, otherwise we create_base_job
         """
         job_req = json.loads(data[7:])

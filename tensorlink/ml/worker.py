@@ -35,7 +35,10 @@ from tensorlink.ml.utils import (
     get_optimizer_from_spec,
 )
 from tensorlink.ml.injector import LayerGroupModule
-from tensorlink.mpc.shared_memory import get_from_shared_memory, store_in_shared_memory
+from tensorlink.nodes.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 
 
 def _find_module_path_by_class(

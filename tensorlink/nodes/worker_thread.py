@@ -12,7 +12,7 @@ import logging
 import time
 
 
-class Worker(Torchnode):
+class WorkerThread(Torchnode):
     """
     Todo:
         - link workers to database or download training data for complete offloading
@@ -32,8 +32,10 @@ class Worker(Torchnode):
         mining_active=None,
         reserved_memory=None,
         duplicate="",
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
-        super(Worker, self).__init__(
+        super(WorkerThread, self).__init__(
             request_queue,
             response_queue,
             "W" + duplicate,
@@ -41,6 +43,8 @@ class Worker(Torchnode):
             upnp=upnp,
             off_chain_test=off_chain_test,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
 
         self.training = False
@@ -72,27 +76,15 @@ class Worker(Torchnode):
 
             self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
 
-            if not self.local_test and not self.off_chain_test:
+            if self.local_test is False:
                 attempts = 0
 
-                self.debug_print("Bootstrapping...", tag="Worker")
                 while attempts < 3 and len(self.validators) == 0:
                     self.bootstrap()
-                    if len(self.validators) == 0:
-                        time.sleep(15)
-                        self.debug_print(
-                            "No validators found, trying again...", tag="Worker"
-                        )
-                        attempts += 1
 
-                if len(self.validators) == 0:
-                    self.debug_print(
-                        "No validators found, shutting down...",
-                        level=logging.CRITICAL,
-                        tag="Worker",
-                    )
-                    self.stop()
-                    self.terminate_flag.set()
+                    if len(self.nodes) == 0:
+                        time.sleep(10)
+                        attempts += 1
 
         self.keeper.load_previous_state()
 

@@ -6,7 +6,7 @@ processes. It simulates a local environment with a user, worker, and validator n
 simple model.
 """
 
-from tensorlink import DistributedModel
+from tensorlink.ml import DistributedModel
 import torch.nn as nn
 import torch.optim as optim
 import torch

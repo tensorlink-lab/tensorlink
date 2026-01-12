@@ -4,11 +4,40 @@ import sys
 import threading
 import time
 import torch.multiprocessing as mp
+from dataclasses import dataclass
+from typing import Optional, List
 
 from tensorlink.ml.worker import DistributedWorker
-from tensorlink.nodes.user import User
-from tensorlink.nodes.validator import Validator
-from tensorlink.nodes.worker import Worker
+from tensorlink.nodes.user_thread import UserThread
+from tensorlink.nodes.validator_thread import ValidatorThread
+from tensorlink.nodes.worker_thread import WorkerThread
+
+
+@dataclass
+class BaseNodeConfig:
+    upnp: bool = True
+    max_connections: int = 0
+    off_chain_test: bool = False
+    local_test: bool = False
+    print_level: int = logging.INFO
+    priority_nodes: Optional[List[str]] = None
+    seed_validators: Optional[List[str]] = None
+
+
+@dataclass
+class WorkerConfig(BaseNodeConfig):
+    duplicate: str = ""
+
+
+@dataclass
+class ValidatorConfig(BaseNodeConfig):
+    endpoint: bool = True
+    endpoint_ip: str = "0.0.0.0"
+
+
+@dataclass
+class UserConfig(BaseNodeConfig):
+    pass
 
 
 def spinning_cursor():
@@ -40,37 +69,22 @@ mp.set_start_method("spawn", force=True)
 class BaseNode:
     def __init__(
         self,
-        upnp=True,
-        max_connections: int = 0,
-        off_chain_test=False,
-        local_test=False,
-        print_level=logging.INFO,
-        trusted=False,
-        utilization=True,
-        duplicate="",
+        config: BaseNodeConfig,
+        trusted: bool = False,
+        utilization: bool = True,
     ):
+        self.config = config
+        self.trusted = trusted
+        self.utilization = utilization
+
         self.node_requests = mp.Queue()
         self.node_responses = mp.Queue()
         self.mpc_lock = mp.Lock()
 
-        self.init_kwargs = {
-            "print_level": print_level,
-            "max_connections": max_connections,
-            "upnp": upnp,
-            "off_chain_test": off_chain_test,
-            "local_test": local_test,
-        }
-        self.trusted = trusted
-        self.upnp_enabled = upnp
-        self.utilization = utilization
-        self.duplicate = duplicate
-
         self.node_process = None
-        self.node_instance = None
-
         self._stop_event = mp.Event()
+
         self._setup_signal_handlers()
-        self._initialized = True
         self.start()
 
     def _setup_signal_handlers(self):
@@ -139,39 +153,29 @@ class BaseNode:
         if node_id is None:
             node_id = ""
 
-        self.send_request("connect_node", (node_id, host, port), timeout=timeout)
+        self.send_request("connect_node", (host, port, node_id), timeout=timeout)
 
 
-class WorkerNode(BaseNode):
-    def __init__(self, *args, **kwargs):
-        self.mining_active = mp.Value('b', False)  # boolean
-        self.reserved_memory = mp.Value('d', 0.0)  # double for GPU memory
-        super().__init__(*args, **kwargs)
-
-    distributed_worker = None
+class Worker(BaseNode):
+    def __init__(self, config: WorkerConfig, **kwargs):
+        self.mining_active = mp.Value('b', False)
+        self.reserved_memory = mp.Value('d', 0.0)
+        super().__init__(config, **kwargs)
 
     def run_role(self):
-        kwargs = self.init_kwargs.copy()
-        kwargs.update(
-            {
-                "upnp": kwargs.get("upnp", True),
-                "off_chain_test": kwargs.get("off_chain_test", False),
-                "mining_active": self.mining_active,  # Pass shared state
-                "reserved_memory": self.reserved_memory,
-                "duplicate": self.duplicate,
-            }
+        node = WorkerThread(
+            self.node_requests,
+            self.node_responses,
+            **vars(self.config),
+            mining_active=self.mining_active,
+            reserved_memory=self.reserved_memory,
         )
 
-        node_instance = Worker(self.node_requests, self.node_responses, **kwargs)
-        try:
-            node_instance.activate()
-            node_instance.run()
+        node.activate()
+        node.run()
 
-            while node_instance.is_alive():
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            node_instance.stop()
+        while node.is_alive():
+            time.sleep(1)
 
     def start(self):
         super().start()
@@ -179,62 +183,32 @@ class WorkerNode(BaseNode):
         if self.utilization:
             t = threading.Thread(target=distributed_worker.run, daemon=True)
             t.start()
-            time.sleep(3)
+            time.sleep(1)
         else:
             distributed_worker.run()
 
 
-class ValidatorNode(BaseNode):
-    def __init__(
-        self,
-        upnp=True,
-        max_connections: int = 0,
-        off_chain_test=False,
-        local_test=False,
-        print_level=logging.INFO,
-        trusted=False,
-        utilization=True,
-        endpoint=True,
-    ):
-        self.endpoint = endpoint
-        super().__init__(
-            upnp=upnp,
-            max_connections=max_connections,
-            off_chain_test=off_chain_test,
-            local_test=local_test,
-            print_level=print_level,
-            trusted=trusted,
-            utilization=utilization,
-        )
+class Validator(BaseNode):
+    def __init__(self, config: ValidatorConfig, **kwargs):
+        super().__init__(config, **kwargs)
 
     def run_role(self):
-        kwargs = self.init_kwargs.copy()
-        kwargs.update(
-            {
-                "upnp": kwargs.get("upnp", True),
-                "off_chain_test": kwargs.get("off_chain_test", False),
-                "endpoint": self.endpoint,
-            }
+        node = ValidatorThread(
+            self.node_requests,
+            self.node_responses,
+            **vars(self.config),
         )
 
-        node_instance = Validator(self.node_requests, self.node_responses, **kwargs)
+        node.run()
 
-        try:
-            node_instance.run()
-
-            while node_instance.is_alive():
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            node_instance.stop()
+        while node.is_alive():
+            time.sleep(1)
 
     def start(self):
         from tensorlink.ml.validator import DistributedValidator
 
         super().start()
-        distributed_validator = DistributedValidator(
-            self, trusted=self.trusted, endpoint=self.endpoint
-        )
+        distributed_validator = DistributedValidator(self, trusted=self.trusted)
         if self.utilization:
             t = threading.Thread(target=distributed_validator.run, daemon=True)
             t.start()
@@ -243,19 +217,21 @@ class ValidatorNode(BaseNode):
             distributed_validator.run()
 
 
-class UserNode(BaseNode):
+class User(BaseNode):
+    def __init__(self, config: UserConfig, **kwargs):
+        super().__init__(config, **kwargs)
+
     def run_role(self):
-        kwargs = self.init_kwargs.copy()
+        node = UserThread(
+            self.node_requests,
+            self.node_responses,
+            **vars(self.config),
+        )
 
-        node_instance = User(self.node_requests, self.node_responses, **kwargs)
-        try:
-            node_instance.run()
+        node.run()
 
-            while node_instance.is_alive():
-                time.sleep(1)
-
-        except KeyboardInterrupt:
-            node_instance.stop()
+        while node.is_alive():
+            time.sleep(1)
 
     def cleanup(self):
         """Downloads parameters from workers before shutting down"""

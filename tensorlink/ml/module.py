@@ -47,7 +47,10 @@ from tensorlink.ml.utils import (
     get_optimizer_from_spec,
     optimizer_to_spec,
 )
-from tensorlink.mpc.shared_memory import get_from_shared_memory, store_in_shared_memory
+from tensorlink.nodes.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 
 
 MAX_WAIT_TIME = 150
@@ -123,6 +126,21 @@ class CustomAutogradRouter(torch.autograd.Function):
 
         # Return gradients for model and output_tensor
         return None, grad_input
+
+
+def _create_user_node():
+    """Create a User instance if one wasn't provided."""
+    from tensorlink.nodes import User, UserConfig
+
+    node = User(
+        config=UserConfig(
+            upnp=True, off_chain_test=False, local_test=False, print_level=logging.INFO
+        )
+    )
+
+    # Allow time for node to initialize
+    time.sleep(1)
+    return node
 
 
 class DistributedModel(nn.Module):
@@ -207,7 +225,7 @@ class DistributedModel(nn.Module):
             _confirm_action()
 
         # Setup node if not provided
-        self.node = node if node else self._create_user_node()
+        self.node = node if node else _create_user_node()
 
         # Node communication attributes
         self.node_requests = self.node.node_requests
@@ -225,7 +243,7 @@ class DistributedModel(nn.Module):
             print(f"DistributedModel '{self.name}' initialized on {self.device}")
 
         # Initialize model distribution
-        if self.node.__class__.__name__ == "UserNode":
+        if self.node.__class__.__name__ == "User":
             self._initialize_distribution()
 
     def forward(self, *args, **kwargs):
@@ -848,17 +866,6 @@ class DistributedModel(nn.Module):
             self.mpc_lock.release()
 
         return response["return"]
-
-    def _create_user_node(self):
-        """Create a UserNode instance if one wasn't provided."""
-        from tensorlink import UserNode
-
-        node = UserNode(
-            upnp=True, off_chain_test=False, local_test=False, print_level=logging.INFO
-        )
-        # Allow time for node to initialize
-        time.sleep(3)
-        return node
 
     def _initialize_distribution(self):
         """Initialize the distributed model."""

@@ -25,7 +25,15 @@ Overview:
 
 """
 
-from tensorlink import UserNode, ValidatorNode, WorkerNode, DistributedModel
+from tensorlink.ml import DistributedModel
+from tensorlink.nodes import (
+    User,
+    UserConfig,
+    Validator,
+    ValidatorConfig,
+    Worker,
+    WorkerConfig,
+)
 
 from transformers import AutoTokenizer
 import torch
@@ -56,14 +64,29 @@ TEMPERATURE = 0.7
 if __name__ == "__main__":
     # Launches a node of each type in their own process (Not necessary if just accessing a DistributedModel
     # as a user, it will do this in the background...
-    validator = ValidatorNode(
-        upnp=UPNP, off_chain_test=OFFCHAIN, local_test=LOCAL, print_level=logging.DEBUG
+    validator = Validator(
+        config=ValidatorConfig(
+            upnp=UPNP,
+            off_chain_test=OFFCHAIN,
+            local_test=LOCAL,
+            print_level=logging.DEBUG,
+        )
     )
-    user = UserNode(
-        upnp=UPNP, off_chain_test=OFFCHAIN, local_test=LOCAL, print_level=logging.DEBUG
+    user = User(
+        config=UserConfig(
+            upnp=UPNP,
+            off_chain_test=OFFCHAIN,
+            local_test=LOCAL,
+            print_level=logging.DEBUG,
+        )
     )
-    worker = WorkerNode(
-        upnp=UPNP, off_chain_test=OFFCHAIN, local_test=LOCAL, print_level=logging.DEBUG
+    worker = Worker(
+        config=WorkerConfig(
+            upnp=UPNP,
+            off_chain_test=OFFCHAIN,
+            local_test=LOCAL,
+            print_level=logging.DEBUG,
+        )
     )
 
     # Get validator node information for connecting

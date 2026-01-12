@@ -1,3 +1,5 @@
+from tensorlink.nodes import Worker, WorkerConfig
+
 import torch.cuda as cuda
 import subprocess
 import logging
@@ -5,8 +7,6 @@ import json
 import time
 import sys
 import os
-
-from tensorlink.mpc.nodes import WorkerNode
 
 
 def get_root_dir():
@@ -22,13 +22,17 @@ def create_env_file(_env_path, _config):
     """
     if not os.path.exists(_env_path):
         with open(_env_path, "w") as env_file:
-            env_file.write(f"PUBLIC_KEY={_config.get('address')}\n")
+            env_file.write(f"PUBLIC_KEY={_config.get('crypto').get('address')}\n")
 
 
 def load_config(config_path="config.json"):
     try:
         with open(config_path, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            if config.get("config"):
+                return config.get("config")
+            return config
+
     except FileNotFoundError:
         logging.warning(f"Config file {config_path} not found, using defaults")
         return {}
@@ -37,7 +41,7 @@ def load_config(config_path="config.json"):
         return {}
 
 
-def is_gpu_available(worker_node: WorkerNode):
+def is_gpu_available(worker_node: Worker):
     try:
         is_loaded = worker_node.send_request("is_loaded", "", timeout=10)
     except Exception as e:
@@ -109,22 +113,30 @@ def main():
     config = load_config(os.path.join(root_dir, "config.json"))
     create_env_file(env_path, config)
 
+    crypto_config = config.get("crypto")
+    network_config = config.get("network")
+    ml_config = config.get("ml")
+
     mining_process = None
-    mining_script = config.get("mining-script")
+    mining_script = crypto_config.get("mining-script")
     use_sudo = True if os.geteuid() == 0 else False
-    local = config.get("local", False)
-    trusted = config.get("trusted", False)
-    mining_enabled = config.get("mining", False)
+    local = network_config.get("local", False)
+    trusted = ml_config.get("trusted", False)
+    mining_enabled = crypto_config.get("mining", False)
     upnp = not local
 
     if trusted:
         _confirm_action()
 
-    worker = WorkerNode(
-        upnp=upnp,
-        local_test=local,
-        off_chain_test=local,
-        print_level=logging.INFO,
+    worker = Worker(
+        config=WorkerConfig(
+            upnp=upnp,
+            local_test=local,
+            off_chain_test=local,
+            print_level=logging.INFO,
+            priority_nodes=network_config.get("priority_nodes"),
+            seed_validators=crypto_config.get("seed_validators"),
+        ),
         trusted=trusted,
         utilization=True,
     )

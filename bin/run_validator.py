@@ -8,7 +8,7 @@ import time
 import dotenv
 import torch.cuda as cuda
 
-from tensorlink.mpc.nodes import ValidatorNode
+from tensorlink.nodes import Validator, ValidatorConfig
 
 
 def get_root_dir():
@@ -46,15 +46,31 @@ def main():
 
     # Load config if needed
     config = load_config(os.path.join(root_dir, "config.json"))
+    network_config = config["network"]
+    crypto_config = config["crypto"]
+    ml_config = config["ml"]
+
     check_env_file(env_path, config)
 
-    local = config.get("local", False)
+    trusted = ml_config.get("trusted", False)
+    local = network_config.get("local", False)
     upnp = True
     if local == "true":
         upnp = False
 
-    validator = ValidatorNode(
-        upnp=upnp, local_test=local, off_chain_test=local, print_level=logging.DEBUG
+    priority_nodes = network_config["priority_nodes"]
+    seed_validators = crypto_config["seed_validators"]
+
+    validator = Validator(
+        config=ValidatorConfig(
+            upnp=upnp,
+            local_test=local,
+            off_chain_test=local,
+            print_level=logging.DEBUG,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
+        ),
+        trusted=trusted,
     )
 
     try:

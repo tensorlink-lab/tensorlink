@@ -1,7 +1,7 @@
 import os
 
 from tensorlink.ml.utils import get_gpu_memory
-from tensorlink.mpc.shared_memory import get_from_shared_memory
+from tensorlink.nodes.shared_memory import get_from_shared_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.smart_node import Smartnode
 
@@ -40,6 +40,8 @@ class Torchnode(Smartnode):
         upnp=True,
         off_chain_test=False,
         local_test=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
         super(Torchnode, self).__init__(
             role=role,
@@ -47,6 +49,8 @@ class Torchnode(Smartnode):
             upnp=upnp,
             off_chain_test=off_chain_test,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
 
         # Available GPU mpc estimation
@@ -677,8 +681,8 @@ class Torchnode(Smartnode):
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_connect_node(self, request):
-        node_id, host, port = request["args"]
-        connected = self.connect_node(node_id, host, port)
+        host, port, node_id = request["args"]
+        connected = self.connect_node(host, port, node_id)
         self.response_queue.put({"status": "SUCCESS", "return": connected})
 
     def _handle_get_info(self, request):

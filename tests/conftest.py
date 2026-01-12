@@ -3,7 +3,14 @@ import logging
 import time
 import pytest
 
-from tensorlink import UserNode, ValidatorNode, WorkerNode
+from tensorlink.nodes import (
+    User,
+    Validator,
+    Worker,
+    UserConfig,
+    WorkerConfig,
+    ValidatorConfig,
+)
 
 
 PRINT_LEVEL = logging.DEBUG
@@ -15,37 +22,39 @@ UPNP = False
 def nodes():
     """
     Create Tensorlink nodes once per test session.
-    Use session scope ONLY if nodes are stable.
     """
 
-    user = UserNode(
-        upnp=UPNP,
-        off_chain_test=LOCAL,
-        local_test=LOCAL,
-        print_level=PRINT_LEVEL,
+    user = User(
+        config=UserConfig(
+            upnp=UPNP,
+            off_chain_test=LOCAL,
+            local_test=LOCAL,
+            print_level=PRINT_LEVEL,
+        )
     )
     time.sleep(1)
 
-    validator = ValidatorNode(
-        upnp=UPNP,
-        off_chain_test=LOCAL,
-        local_test=LOCAL,
-        print_level=PRINT_LEVEL,
-        endpoint=False,
+    validator = Validator(
+        config=ValidatorConfig(
+            upnp=UPNP,
+            off_chain_test=LOCAL,
+            local_test=LOCAL,
+            print_level=PRINT_LEVEL,
+            endpoint=False,
+        )
     )
     time.sleep(1)
 
-    worker = WorkerNode(
-        upnp=UPNP,
-        off_chain_test=LOCAL,
-        local_test=LOCAL,
-        print_level=PRINT_LEVEL,
+    worker = Worker(
+        config=WorkerConfig(
+            upnp=UPNP, off_chain_test=LOCAL, local_test=LOCAL, print_level=PRINT_LEVEL
+        )
     )
     time.sleep(1)
 
     yield validator, user, worker
 
-    # Hard cleanup (important for sockets/processes)
+    # Hard cleanup
     user.cleanup()
     worker.cleanup()
     validator.cleanup()

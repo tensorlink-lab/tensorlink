@@ -1,7 +1,20 @@
 {
-  "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",
-  "local": false,
-  "trusted": false,
-  "mining": false,
-  "mining-script": "path/to/mining.executable"
+  "config": {
+    "network": {
+      "endpoint": false,
+      "local": false,
+      "priority_nodes": []
+    },
+    "crypto": {
+      "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",
+      "mining": false,
+      "mining-script": "path/to/mining.executable",
+      "seed_validators": [
+        ["smartnodes.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
+      ]
+    },
+    "ml": {
+      "trusted": false
+    }
+  }
 }
