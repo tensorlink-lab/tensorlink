@@ -31,10 +31,15 @@ def check_env_file(_env_path, _config):
 def load_config(config_path="config.json"):
     try:
         with open(config_path, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            if config.get("config"):
+                return config.get("config")
+            return config
+
     except FileNotFoundError:
         logging.warning(f"Config file {config_path} not found, using defaults")
         return {}
+
     except json.JSONDecodeError as e:
         logging.error(f"Invalid JSON in config file: {e}")
         return {}
