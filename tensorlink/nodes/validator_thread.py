@@ -100,7 +100,6 @@ class ValidatorThread(Torchnode):
                 self.current_proposal = (
                     self.multi_sig_contract.functions.nextProposalId.call()
                 )
-                # self.bootstrap()
 
             else:
                 self.debug_print(

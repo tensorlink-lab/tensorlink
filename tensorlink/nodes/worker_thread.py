@@ -76,15 +76,13 @@ class WorkerThread(Torchnode):
 
             self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
 
-            if self.local_test is False:
-                attempts = 0
+        attempts = 0
+        while attempts < 3 and len(self.validators) == 0:
+            self.bootstrap()
 
-                while attempts < 3 and len(self.validators) == 0:
-                    self.bootstrap()
-
-                    if len(self.nodes) == 0:
-                        time.sleep(10)
-                        attempts += 1
+            if len(self.nodes) == 0:
+                time.sleep(10)
+                attempts += 1
 
         self.keeper.load_previous_state()
 
