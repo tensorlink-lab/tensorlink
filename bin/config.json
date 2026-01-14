@@ -15,6 +15,9 @@
     },
     "ml": {
       "trusted": false
+    },
+    "logging": {
+      "level": "INFO"
     }
   }
 }

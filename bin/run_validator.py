@@ -50,14 +50,11 @@ def main():
     env_path = os.path.join(root_dir, ".tensorlink.env")
 
     config = load_config(os.path.join(root_dir, "config.json"))
-    network_config = config["network"]
-    crypto_config = config["crypto"]
-    ml_config = config["ml"]
 
     check_env_file(env_path, config)
 
-    trusted = ml_config.get("trusted", False)
-    mode = network_config.get("mode", "private")
+    trusted = config["ml"]["trusted"]
+    mode = config["network"]["mode"]
 
     # Defaults
     local = False
@@ -80,8 +77,8 @@ def main():
             local_test=local,
             on_chain=on_chain,
             print_level=logging.DEBUG,
-            priority_nodes=network_config.get("priority_nodes", []),
-            seed_validators=crypto_config.get("seed_validators", []),
+            priority_nodes=config["network"]["priority_nodes"],
+            seed_validators=config["crypto"]["seed_validators"],
         ),
         trusted=trusted,
     )

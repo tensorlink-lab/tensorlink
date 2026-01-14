@@ -8,6 +8,22 @@ import time
 import sys
 import os
 
+# Network mode presets
+MODE_PRESETS = {
+    "local": dict(local_test=True, upnp=False, on_chain=False),
+    "private": dict(local_test=False, upnp=True, on_chain=False),
+    "public": dict(local_test=False, upnp=True, on_chain=True),
+}
+
+DEBUG_LEVELS = {
+    "CRITICAL",
+    "ERROR",
+    "WARNING",
+    "INFO",
+    "DEBUG",
+    "NOTSET",
+}
+
 
 def get_root_dir():
     if getattr(sys, "frozen", False):  # Check if running as an executable
@@ -110,31 +126,39 @@ def _confirm_action():
 def main():
     root_dir = get_root_dir()
     env_path = os.path.join(root_dir, ".tensorlink.env")
-
     config = load_config(os.path.join(root_dir, "config.json"))
     create_env_file(env_path, config)
 
-    crypto_config = config["crypto"]
-    network_config = config["network"]
-    ml_config = config["ml"]
+    trusted = config["ml"]["trusted"]
+    mode = config["network"]["mode"]
 
-    trusted = ml_config.get("trusted", False)
-    mode = network_config.get("mode", "private")
+    level_str = config["logging"]["level"].upper()
 
-    # Network mode presets (keep in sync with validator)
-    MODE_PRESETS = {
-        "local": dict(local_test=True, upnp=False, on_chain=False),
-        "private": dict(local_test=False, upnp=True, on_chain=False),
-        "public": dict(local_test=False, upnp=True, on_chain=True),
-    }
+    if not hasattr(logging, level_str):
+        raise ValueError(
+            f"Invalid logging level '{level_str}'. "
+            f"Must be one of: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
+        )
 
-    try:
-        net_flags = MODE_PRESETS[mode]
-    except KeyError:
+    log_level = getattr(logging, level_str)
+    logging.basicConfig(level=log_level)
+
+    local = False
+    upnp = True
+    on_chain = False
+
+    if mode == "local":
+        local = True
+        upnp = False
+    elif mode == "public":
+        on_chain = True
+    elif mode == "private":
+        pass
+    else:
         raise ValueError(f"Unknown network mode: {mode}")
 
-    mining_enabled = crypto_config.get("mining", False)
-    mining_script = crypto_config.get("mining-script")
+    mining_enabled = config["crypto"]["mining"]
+    mining_script = config["crypto"]["mining-script"]
     use_sudo = os.geteuid() == 0
 
     if trusted:
@@ -142,10 +166,12 @@ def main():
 
     worker = Worker(
         config=WorkerConfig(
-            **net_flags,
-            print_level=logging.INFO,
-            priority_nodes=network_config.get("priority_nodes", []),
-            seed_validators=crypto_config.get("seed_validators", []),
+            upnp=upnp,
+            local_test=local,
+            on_chain=on_chain,
+            print_level=log_level,
+            priority_nodes=config["network"]["priority_nodes"],
+            seed_validators=config["crypto"]["seed_validators"],
         ),
         trusted=trusted,
         utilization=True,

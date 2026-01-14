@@ -107,6 +107,21 @@ def _set_micro(local: threading.local, micro: int):
             pass
 
 
+def _create_user_node():
+    """Create a User instance if one wasn't provided."""
+    from tensorlink.nodes import User, UserConfig
+
+    node = User(
+        config=UserConfig(
+            upnp=True, on_chain=True, local_test=False, print_level=logging.INFO
+        )
+    )
+
+    # Allow time for node to initialize
+    time.sleep(1)
+    return node
+
+
 class CustomAutogradRouter(torch.autograd.Function):
     @staticmethod
     def forward(ctx, model, output_tensor):
@@ -126,21 +141,6 @@ class CustomAutogradRouter(torch.autograd.Function):
 
         # Return gradients for model and output_tensor
         return None, grad_input
-
-
-def _create_user_node():
-    """Create a User instance if one wasn't provided."""
-    from tensorlink.nodes import User, UserConfig
-
-    node = User(
-        config=UserConfig(
-            upnp=True, on_chain=True, local_test=False, print_level=logging.INFO
-        )
-    )
-
-    # Allow time for node to initialize
-    time.sleep(1)
-    return node
 
 
 class DistributedModel(nn.Module):

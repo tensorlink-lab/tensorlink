@@ -286,13 +286,13 @@ class TensorlinkAPI:
                     return ModelStatusResponse(
                         model_name=model_name,
                         status="loaded",
-                        message="Model is already loaded and ready to use",
+                        message="Model is already loaded and ready to use.",
                     )
                 elif status["status"] == "loading":
                     return ModelStatusResponse(
                         model_name=model_name,
                         status="loading",
-                        message="Model is currently being loaded",
+                        message="Model is currently being loaded.",
                     )
 
                 # Trigger the loading process
