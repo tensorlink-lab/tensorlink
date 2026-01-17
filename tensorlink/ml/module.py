@@ -33,10 +33,9 @@ from tensorlink.ml.graphing import ModelParser
 from tensorlink.ml.utils import (
     get_gpu_memory,
     get_batch_size,
-    chunk,
     handle_output,
     combine_micro_batches,
-    split_into_micro_batches,
+    split_micro_batches,
     replace_output_with_custom_grad,
     access_module,
     detach_tensor,
@@ -46,8 +45,12 @@ from tensorlink.ml.utils import (
     get_nested_module,
     get_optimizer_from_spec,
     optimizer_to_spec,
+    handle_output,
 )
-from tensorlink.mpc.shared_memory import get_from_shared_memory, store_in_shared_memory
+from tensorlink.nodes.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 
 
 MAX_WAIT_TIME = 150
@@ -102,6 +105,21 @@ def _set_micro(local: threading.local, micro: int):
             delattr(local, "micro")
         except AttributeError:
             pass
+
+
+def _create_user_node():
+    """Create a User instance if one wasn't provided."""
+    from tensorlink.nodes import User, UserConfig
+
+    node = User(
+        config=UserConfig(
+            upnp=True, on_chain=True, local_test=False, print_level=logging.INFO
+        )
+    )
+
+    # Allow time for node to initialize
+    time.sleep(1)
+    return node
 
 
 class CustomAutogradRouter(torch.autograd.Function):
@@ -207,7 +225,7 @@ class DistributedModel(nn.Module):
             _confirm_action()
 
         # Setup node if not provided
-        self.node = node if node else self._create_user_node()
+        self.node = node if node else _create_user_node()
 
         # Node communication attributes
         self.node_requests = self.node.node_requests
@@ -225,7 +243,7 @@ class DistributedModel(nn.Module):
             print(f"DistributedModel '{self.name}' initialized on {self.device}")
 
         # Initialize model distribution
-        if self.node.__class__.__name__ == "UserNode":
+        if self.node.__class__.__name__ == "User":
             self._initialize_distribution()
 
     def forward(self, *args, **kwargs):
@@ -234,7 +252,10 @@ class DistributedModel(nn.Module):
         - Splits input into micro-batches and runs them in parallel.
         - Creates multiple parallel streams of workers for model parallel acceleration
         """
-        if isinstance(args, tuple) and len(args) == 1:
+        if not args and "input_ids" in kwargs:
+            args = kwargs.pop("input_ids")
+
+        elif isinstance(args, tuple) and len(args) == 1:
             args = args[0]
 
         batch_size = get_batch_size(args)
@@ -248,8 +269,8 @@ class DistributedModel(nn.Module):
         ), "Minibatch size must be divisible by n_pipelines!"
 
         # Split the input tensor and kwargs into micro-batches
-        micro_batch_args = chunk(args, self.n_pipelines)
-        micro_batch_kwargs = chunk(kwargs, self.n_pipelines)
+        micro_batch_args = split_micro_batches(args, self.n_pipelines)
+        micro_batch_kwargs = split_micro_batches(kwargs, self.n_pipelines)
 
         # Create queues for forward and backward passes
         self.model.forward_queues = {m: queue.Queue() for m in range(self.n_pipelines)}
@@ -296,7 +317,7 @@ class DistributedModel(nn.Module):
             micro_losses = loss.micro_loss
         else:
             # Split the combined loss into micro-batch-specific losses
-            micro_losses = split_into_micro_batches(loss, self.n_pipelines)
+            micro_losses = split_micro_batches(loss, self.n_pipelines)
 
         threads = []
         for micro in range(self.n_pipelines):
@@ -600,8 +621,8 @@ class DistributedModel(nn.Module):
                     host_modules[module_id] = module_info
                 else:
                     self._wrap_hf_module(module_id, module_info)
+
             else:
-                # self.wrap_module(config)
                 raise "Custom models are currently not supported."
 
         if host_modules:
@@ -620,16 +641,7 @@ class DistributedModel(nn.Module):
         ]  # Queue to hold intermediates, must be converted into dictionary
         # of queues if we wish to perform multiple epochs concurrently
 
-        return 0, 0
-
     def generate(self, *args, **kwargs):
-        """
-        Generate method.
-
-        Args:
-            *args: Input tensors
-            **kwargs: Additional generation parameters
-        """
         with _set_micro(self._thread_local, 0):
             return self.model.generate(*args, **kwargs)
 
@@ -849,17 +861,6 @@ class DistributedModel(nn.Module):
 
         return response["return"]
 
-    def _create_user_node(self):
-        """Create a UserNode instance if one wasn't provided."""
-        from tensorlink import UserNode
-
-        node = UserNode(
-            upnp=True, off_chain_test=False, local_test=False, print_level=logging.INFO
-        )
-        # Allow time for node to initialize
-        time.sleep(3)
-        return node
-
     def _initialize_distribution(self):
         """Initialize the distributed model."""
         if self.optimizer is None:
@@ -945,6 +946,25 @@ class DistributedModel(nn.Module):
         if module_path_list[0] == "model" and not hasattr(self.model, "model"):
             module_path_list.pop(0)
 
+        # Special case: entire model
+        if not module_path_list:
+            logging.info(
+                "Module path refers to full model; loading directly into root model"
+            )
+
+            state_dict = self._load_module_weights(self.model_name, ["model"])
+
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                state_dict, strict=False
+            )
+
+            if missing_keys:
+                logging.warning(f"Model missing keys: {missing_keys}")
+            if unexpected_keys:
+                logging.warning(f"Model unexpected keys: {unexpected_keys}")
+
+            return
+
         # Navigate to parent
         for attr in module_path_list[:-1]:
             target = getattr(target, attr)
@@ -1029,19 +1049,28 @@ class DistributedModel(nn.Module):
                 logging.info("No safetensors found, trying .bin files")
                 bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
 
-                if bin_files:
-                    for bin_path in bin_files:
-                        shard_dict = torch.load(bin_path, map_location="cpu")
-
-                        for key, value in shard_dict.items():
-                            for module_path in module_paths:
-                                prefix = module_path + "."
-                                if key.startswith(prefix):
-                                    new_key = key[len(prefix) :]
-                                    state_dict[new_key] = value
-                                    break
-                else:
+                if not bin_files:
                     raise ValueError(f"No weight files found in {model_path}")
+
+                for bin_path in bin_files:
+                    shard_dict = torch.load(bin_path, map_location="cpu")
+
+                    # FULL MODEL LOAD (no filtering, no prefix stripping)
+                    if module_paths == ["model"]:
+                        logging.info(
+                            f"Loading full state_dict from {os.path.basename(bin_path)}"
+                        )
+                        state_dict.update(shard_dict)
+                        continue
+
+                    # PARTIAL MODULE LOAD
+                    for key, value in shard_dict.items():
+                        for module_path in module_paths:
+                            prefix = module_path + "."
+                            if key.startswith(prefix):
+                                new_key = key[len(prefix) :]
+                                state_dict[new_key] = value
+                                break
 
             logging.info(f"Loaded {len(state_dict)} weight tensors for host modules")
 
@@ -1123,11 +1152,17 @@ class OffloadedModule(nn.Module):
             pass
 
     def generate(self, *args, **kwargs):
+        stream = kwargs.get("stream", False)
+        if stream:
+            kwargs.pop("stream")
+
         args_bytes = tensor_to_bytes(args)
         kwargs_bytes = tensor_to_bytes(kwargs)
         request_bytes = self.module_id.encode() + args_bytes + b"::" + kwargs_bytes
         size, shm_name = store_in_shared_memory(request_bytes, encoded=True)
-        self.parent_model.send_request("generate", (self.worker_id, size, shm_name))
+        self.parent_model.send_request(
+            "generate", (self.worker_id, size, shm_name, stream)
+        )
 
         # Wait for response, change to appending waiting thread to list in master
         waiting = True
@@ -1149,8 +1184,6 @@ class OffloadedModule(nn.Module):
         return output
 
     def forward(self, *args, **kwargs):
-        from tensorlink.ml.utils import handle_output
-
         start_time = time.time()
         n_batch = self.parent_model.model.n_batch
         n_micro = getattr(self.parent_model._thread_local, "micro", None)

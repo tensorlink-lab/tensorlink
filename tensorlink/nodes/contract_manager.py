@@ -153,7 +153,7 @@ class ContractManager:
         #
         #         if node_info:
         #             node_host, node_port = node_info["host"], node_info["port"]
-        #             connected = self.connect_node(node_info["id"], node_host, node_port)
+        #             connected = self.connect_node(node_host, node_port, node_info["id"])
         #
         #             # Verify the roles is online and in the network
         #             if connected:
@@ -466,7 +466,7 @@ class ContractManager:
     def _is_validator_online(self, node_info: Dict[str, Any]) -> bool:
         """Check if a validator is online and connected to the network."""
         node_host, node_port = node_info["host"], node_info["port"]
-        return self.node.connect_node(node_info["id"], node_host, node_port)
+        return self.node.connect_node(node_host, node_port, node_info["id"])
 
     def _get_validator_address(self, validator: str) -> Optional[str]:
         """Get the blockchain address for a validator."""

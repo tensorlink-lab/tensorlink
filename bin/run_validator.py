@@ -8,7 +8,7 @@ import time
 import dotenv
 import torch.cuda as cuda
 
-from tensorlink.mpc.nodes import ValidatorNode
+from tensorlink.nodes import Validator, ValidatorConfig
 
 
 def get_root_dir():
@@ -31,10 +31,15 @@ def check_env_file(_env_path, _config):
 def load_config(config_path="config.json"):
     try:
         with open(config_path, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            if config.get("config"):
+                return config.get("config")
+            return config
+
     except FileNotFoundError:
         logging.warning(f"Config file {config_path} not found, using defaults")
         return {}
+
     except json.JSONDecodeError as e:
         logging.error(f"Invalid JSON in config file: {e}")
         return {}
@@ -44,17 +49,38 @@ def main():
     root_dir = get_root_dir()
     env_path = os.path.join(root_dir, ".tensorlink.env")
 
-    # Load config if needed
     config = load_config(os.path.join(root_dir, "config.json"))
+
     check_env_file(env_path, config)
 
-    local = config.get("local", False)
-    upnp = True
-    if local == "true":
-        upnp = False
+    trusted = config["ml"]["trusted"]
+    mode = config["network"]["mode"]
 
-    validator = ValidatorNode(
-        upnp=upnp, local_test=local, off_chain_test=local, print_level=logging.DEBUG
+    # Defaults
+    local = False
+    upnp = True
+    on_chain = False
+
+    if mode == "local":
+        local = True
+        upnp = False
+    elif mode == "public":
+        on_chain = True
+    elif mode == "private":
+        pass
+    else:
+        raise ValueError(f"Unknown network mode: {mode}")
+
+    validator = Validator(
+        config=ValidatorConfig(
+            upnp=upnp,
+            local_test=local,
+            on_chain=on_chain,
+            print_level=logging.DEBUG,
+            priority_nodes=config["network"]["priority_nodes"],
+            seed_validators=config["crypto"]["seed_validators"],
+        ),
+        trusted=trusted,
     )
 
     try:

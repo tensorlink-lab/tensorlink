@@ -207,9 +207,11 @@ class Smartnode(threading.Thread):
         role,
         max_connections: int = 0,
         upnp: bool = True,
-        off_chain_test: bool = False,
+        on_chain: bool = False,
         local_test: bool = False,
         debug_colour=None,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
         super(Smartnode, self).__init__()
 
@@ -264,12 +266,11 @@ class Smartnode(threading.Thread):
             name: Web3.keccak(text=sig).hex()
             for name, sig in SNO_EVENT_SIGNATURES.items()
         }
-        self.off_chain_test = off_chain_test
+        self.on_chain = on_chain
         self.local_test = local_test
 
         if local_test:
             self.upnp = False
-            # self.off_chain_test = True
 
         self.public_key = None
 
@@ -281,7 +282,9 @@ class Smartnode(threading.Thread):
 
         self._init_sock()
 
-        if self.off_chain_test is False:
+        self._priority_nodes = priority_nodes or []
+        self._seed_validators = seed_validators or []
+        if self.on_chain:
             # Smart nodes parameters for additional security and contract connectivity
             self.url = CHAIN_URL
             self.chain = Web3(Web3.HTTPProvider(CHAIN_URL))
@@ -677,7 +680,7 @@ class Smartnode(threading.Thread):
         """Perform comprehensive credential validation"""
 
         # Check node reputation from validator nodes
-        if len(self.nodes) > 0 and self.off_chain_test is False:
+        if len(self.nodes) > 0 and self.on_chain:
             dht_info = self.dht.query(
                 node_info['node_id_hash'], keys_to_exclude=[node_info['node_id_hash']]
             )
@@ -713,7 +716,7 @@ class Smartnode(threading.Thread):
         self, node_info: dict, connection: socket.socket
     ) -> bool:
         """Validate node credentials against on-chain information"""
-        if self.off_chain_test:
+        if not self.on_chain:
             return True
 
         try:
@@ -1061,7 +1064,11 @@ class Smartnode(threading.Thread):
             thread_client.adjust_chunk_size("large")
 
     def connect_node(
-        self, id_hash: Union[bytes, str], host: str, port: int, reconnect: bool = False
+        self,
+        host: str,
+        port: int,
+        id_hash: Union[bytes, str] = None,
+        reconnect: bool = False,
     ) -> bool:
         """
         Attempt to connect to another node in the Smartnodes network.
@@ -1076,15 +1083,19 @@ class Smartnode(threading.Thread):
           (role, public keys) and perform a handshake.
 
         Args:
-            id_hash (Union[bytes, str]): Unique identifier of the target node.
             host (str): Host address of the target node.
             port (int): Port of the target node.
+            id_hash (Union[bytes, str], optional): Unique identifier of the target node.
             reconnect (bool, optional): Whether to attempt reconnecting if already connected. Defaults to False.
 
         Returns:
             bool: True if the handshake and connection succeed, False otherwise.
         """
-        if isinstance(id_hash, bytes):
+        # Validate id_hash requirement based on on_chain setting
+        if self.on_chain and id_hash is None:
+            raise ValueError("id_hash is required when on_chain is True")
+
+        if id_hash is not None and isinstance(id_hash, bytes):
             id_hash = id_hash.decode()
 
         # Override host for local testing BEFORE any connection checks
@@ -1095,7 +1106,7 @@ class Smartnode(threading.Thread):
         _can_connect = self._can_connect(host, port)
 
         # Avoid duplicate connections
-        if id_hash in self.nodes and not reconnect:
+        if id_hash is not None and id_hash in self.nodes and not reconnect:
             self.debug_print(
                 f"connect_node: Already connected to {id_hash}", tag="Smartnode"
             )
@@ -1159,57 +1170,55 @@ class Smartnode(threading.Thread):
             return False
 
     def bootstrap(self):
-        """Bootstrap node to existing validators"""
-        if self.off_chain_test is True:
-            return
-
-        candidates = []
-
+        """
+        Bootstrap node to priority nodes. These are specified in the user's config.json file
+        or as direct kwargs to the node.
+        """
         # Connect with some seed nodes from config file
-        with open(os.path.join(CONFIG_PATH, "config.json"), "r") as file:
-            _config = json.load(file)
-            seed_validators = _config["network"]["mainnet"]["seeds"]
-
-            for seed_validator in seed_validators:
-                id_hash, host, port = seed_validator
-                connected = self.connect_node(id_hash, host, port)
-                if connected:
-                    candidates.append(id_hash)
-                else:
+        if self.on_chain and not self.local_test:
+            self.debug_print("Bootstrapping to public network...", tag="Smartnode")
+            for seed_validator in self._seed_validators:
+                host, port, id_hash = seed_validator
+                connected = self.connect_node(host, port, id_hash)
+                if not connected:
                     self.dht.delete(id_hash)
 
-        # # Connect to additional randomly selected validators from the network
-        # n_validators = 1
-        # sample_size = min(n_validators, 0)
-        # for i in [random.randint(1, n_validators) for _ in range(sample_size)]:
-        #     # Random validator id
-        #     validator_id = random.randrange(1, n_validators + 1)
-        #
-        #     # Get key validator information from smart contract
-        #     validator_contract_info = self.get_validator_info(validator_id)
-        #
-        #     if validator_contract_info is not None:
-        #         is_active, id_hash = validator_contract_info
-        #         id_hash = id_hash.hex()
-        #         validator_p2p_info = self.dht.query(id_hash)
-        #
-        #         if validator_p2p_info is None:
-        #             self.dht.delete(id_hash)
-        #             continue
-        #
-        #         # Connect to the validator's node and exchange information
-        #         # TODO what if we receive false connection info from validator: how to report?
-        #         connected = self.connect_node(
-        #             id_hash, validator_p2p_info["host"], validator_p2p_info["port"]
-        #         )
-        #
-        #         if not connected:
-        #             self.dht.delete(id_hash)
-        #             continue
-        #
-        #         candidates.append(validator_id)
+            # # Connect to additional randomly selected validators from the network
+            # n_validators = 1
+            # sample_size = min(n_validators, 0)
+            # for i in [random.randint(1, n_validators) for _ in range(sample_size)]:
+            #     # Random validator id
+            #     validator_id = random.randrange(1, n_validators + 1)
+            #
+            #     # Get key validator information from smart contract
+            #     validator_contract_info = self.get_validator_info(validator_id)
+            #
+            #     if validator_contract_info is not None:
+            #         is_active, id_hash = validator_contract_info
+            #         id_hash = id_hash.hex()
+            #         validator_p2p_info = self.dht.query(id_hash)
+            #
+            #         if validator_p2p_info is None:
+            #             self.dht.delete(id_hash)
+            #             continue
+            #
+            #         # Connect to the validator's node and exchange information
+            #         # TODO what if we receive false connection info from validator: how to report?
+            #         connected = self.connect_node(
+            #             validator_p2p_info["host"], validator_p2p_info["port"], id_hash
+            #         )
+            #
+            #         if not connected:
+            #             self.dht.delete(id_hash)
+            #             continue
+            #
+            #         candidates.append(validator_id)
 
-        return candidates
+        if self._priority_nodes:
+            self.debug_print("Connecting priority nodes...", tag="Smartnode")
+            for seed_node in self._priority_nodes:
+                host, port = seed_node
+                self.connect_node(host, port)
 
     def _init_sock(self) -> None:
         """Initializes the main socket for handling incoming connections."""

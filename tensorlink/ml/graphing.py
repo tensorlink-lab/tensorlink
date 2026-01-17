@@ -1,4 +1,5 @@
 from tensorlink.ml.utils import estimate_memory
+from tensorlink.ml.injector import find_loop_in_module_hierarchy
 
 from transformers import AutoModel, AutoConfig
 from accelerate import init_empty_weights
@@ -127,6 +128,32 @@ def _group_sequential_layers(config: dict) -> dict:
             new_config[path] = cfg
 
     return new_config
+
+
+def _is_loop_iterable_module(module: nn.Module, module_path: str) -> bool:
+    """
+    Detect if this module is iterated over in a loop during the forward pass.
+
+    Uses the same loop detection logic as the injector.
+
+    Returns:
+        True if the module is iterated in a loop, False otherwise
+    """
+    try:
+        # Try to find a loop in this module or its immediate children
+        module_with_loop, loop_node, path = find_loop_in_module_hierarchy(
+            module, max_depth=1  # Only check this level
+        )
+
+        # If we found a loop at this level, it's loop-iterable
+        return True
+
+    except ValueError:
+        # No loop found, check if modulelist
+        if isinstance(module, nn.ModuleList):
+            return True
+
+        return False
 
 
 class ModelParser:
@@ -307,6 +334,9 @@ class ModelParser:
 
         indent = "  " * depth
 
+        # Root rule, host can never load entire model
+        is_root = module_path == "model"
+
         # Log current module being processed
         if self.verbose:
             print(f"{indent}Processing: {module_path}")
@@ -331,7 +361,8 @@ class ModelParser:
 
         # Local host small module logic
         if (
-            host_load_small
+            not is_root
+            and host_load_small
             and (memory / 1e6) <= host_threshold_mb
             and depth <= host_max_depth
         ):
@@ -354,14 +385,23 @@ class ModelParser:
             }
 
             if self.verbose:
-                print(f"{indent} ✓ Kept on host (local) — {memory / 1e6:.2f}MB")
+                print(f"{indent} Kept on host (local) — {memory / 1e6:.2f}MB")
             return config, None
 
-        assigned_worker = self._try_assign_worker(
-            memory, module_path, workers_state, last_worker
-        )
+        # Check if module is loop-iterable BEFORE trying to assign
+        is_loop_iterable = _is_loop_iterable_module(module, module_path)
 
-        # full module fits on a worker
+        if is_loop_iterable and depth > 0:
+            if self.verbose:
+                print(f"{indent}   Module is loop-iterable, will recurse into children")
+            # Don't try to assign, just skip to recursion
+            assigned_worker = None
+        else:
+            assigned_worker = self._try_assign_worker(
+                memory, module_path, workers_state, last_worker
+            )
+
+        # full module fits on a worker and the module is not iterated on during the forward pass
         if assigned_worker:
             config[module_path] = {
                 "type": "offloaded",
@@ -408,10 +448,11 @@ class ModelParser:
                     f"Unable to assign {module_path}: exceeded max depth {max_offload_depth}"
                 )
 
-        # too large, recurse into children
+        # Module is either too large OR is loop-iterable - recurse into children
         if self.verbose:
+            reason = "is loop-iterable" if is_loop_iterable else "too large"
             print(
-                f"{indent}   Module {module_path} ({memory / 1e6:.2f}MB) too large, recursing into children..."
+                f"{indent}   Module {module_path} ({memory / 1e6:.2f}MB) {reason}, recursing into children..."
             )
 
         children = list(module.named_children())
@@ -425,7 +466,7 @@ class ModelParser:
                 print(f"{indent}   No children to recurse into - FAILED")
 
             raise AssignmentError(
-                f"Unable to assign {module_path}: exceeded max depth {max_offload_depth}"
+                f"Unable to assign {module_path}: no children to distribute"
             )
 
         parent_forward_code = self._extract_forward_code(module)
@@ -466,7 +507,7 @@ class ModelParser:
 
             except AssignmentError as e:
                 if self.verbose:
-                    print(f"{indent}   ✗ Child {child_path} failed: {e}")
+                    print(f"{indent}   Child {child_path} failed: {e}")
                 raise
 
         if len(child_workers) > 1 and parent_forward_code:

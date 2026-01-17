@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 from tensorlink import DistributedModel, UserNode
 
 
-model_name = "Qwen/Qwen2.5-7B-Instruct"
+model_name = "Qwen/Qwen3-8B-Instruct"
 
 # Parameters for distributed model request.
 BATCH_SIZE = 16

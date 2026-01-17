@@ -1,3 +1,5 @@
+from tensorlink.nodes import Worker, WorkerConfig
+
 import torch.cuda as cuda
 import subprocess
 import logging
@@ -6,7 +8,21 @@ import time
 import sys
 import os
 
-from tensorlink.mpc.nodes import WorkerNode
+# Network mode presets
+MODE_PRESETS = {
+    "local": dict(local_test=True, upnp=False, on_chain=False),
+    "private": dict(local_test=False, upnp=True, on_chain=False),
+    "public": dict(local_test=False, upnp=True, on_chain=True),
+}
+
+DEBUG_LEVELS = {
+    "CRITICAL",
+    "ERROR",
+    "WARNING",
+    "INFO",
+    "DEBUG",
+    "NOTSET",
+}
 
 
 def get_root_dir():
@@ -22,13 +38,17 @@ def create_env_file(_env_path, _config):
     """
     if not os.path.exists(_env_path):
         with open(_env_path, "w") as env_file:
-            env_file.write(f"PUBLIC_KEY={_config.get('address')}\n")
+            env_file.write(f"PUBLIC_KEY={_config.get('crypto').get('address')}\n")
 
 
 def load_config(config_path="config.json"):
     try:
         with open(config_path, "r") as f:
-            return json.load(f)
+            config = json.load(f)
+            if config.get("config"):
+                return config.get("config")
+            return config
+
     except FileNotFoundError:
         logging.warning(f"Config file {config_path} not found, using defaults")
         return {}
@@ -37,7 +57,7 @@ def load_config(config_path="config.json"):
         return {}
 
 
-def is_gpu_available(worker_node: WorkerNode):
+def is_gpu_available(worker_node: Worker):
     try:
         is_loaded = worker_node.send_request("is_loaded", "", timeout=10)
     except Exception as e:
@@ -109,25 +129,55 @@ def main():
     config = load_config(os.path.join(root_dir, "config.json"))
     create_env_file(env_path, config)
 
-    mining_process = None
-    mining_script = config.get("mining-script")
-    use_sudo = True if os.geteuid() == 0 else False
-    local = config.get("local", False)
-    trusted = config.get("trusted", False)
-    mining_enabled = config.get("mining", False)
-    upnp = not local
+    trusted = config["ml"]["trusted"]
+    mode = config["network"]["mode"]
+
+    level_str = config["logging"]["level"].upper()
+
+    if not hasattr(logging, level_str):
+        raise ValueError(
+            f"Invalid logging level '{level_str}'. "
+            f"Must be one of: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
+        )
+
+    log_level = getattr(logging, level_str)
+    logging.basicConfig(level=log_level)
+
+    local = False
+    upnp = True
+    on_chain = False
+
+    if mode == "local":
+        local = True
+        upnp = False
+    elif mode == "public":
+        on_chain = True
+    elif mode == "private":
+        pass
+    else:
+        raise ValueError(f"Unknown network mode: {mode}")
+
+    mining_enabled = config["crypto"]["mining"]
+    mining_script = config["crypto"]["mining-script"]
+    use_sudo = os.geteuid() == 0
 
     if trusted:
         _confirm_action()
 
-    worker = WorkerNode(
-        upnp=upnp,
-        local_test=local,
-        off_chain_test=local,
-        print_level=logging.INFO,
+    worker = Worker(
+        config=WorkerConfig(
+            upnp=upnp,
+            local_test=local,
+            on_chain=on_chain,
+            print_level=log_level,
+            priority_nodes=config["network"]["priority_nodes"],
+            seed_validators=config["crypto"]["seed_validators"],
+        ),
         trusted=trusted,
         utilization=True,
     )
+
+    mining_process = None
 
     try:
         while True:
@@ -137,19 +187,17 @@ def main():
                         logging.info("Starting mining...")
                         mining_process = start_mining(mining_script, use_sudo)
 
-                        # Update shared state
                         worker.mining_active.value = True
                         time.sleep(2)
 
                         total_mem = cuda.get_device_properties(0).total_memory
-                        available = cuda.memory_reserved(0)
-                        worker.reserved_memory.value = total_mem - available
+                        reserved = cuda.memory_reserved(0)
+                        worker.reserved_memory.value = total_mem - reserved
                 else:
                     if mining_process and mining_process.poll() is None:
                         logging.info("Stopping mining...")
                         stop_mining(mining_process)
 
-                        # Clear shared state
                         worker.mining_active.value = False
                         worker.reserved_memory.value = 0.0
 

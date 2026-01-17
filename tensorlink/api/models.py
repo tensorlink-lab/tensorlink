@@ -9,7 +9,7 @@ class NodeRequest(BaseModel):
 class JobRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     hf_name: str
-    model_type: Optional[str] = None
+    model_type: Optional[str] = "chat"
     time: int = 1800
     payment: int = 0
 

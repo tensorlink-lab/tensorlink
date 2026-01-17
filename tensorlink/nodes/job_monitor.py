@@ -11,7 +11,7 @@ import logging
 import time
 
 if TYPE_CHECKING:
-    from validator import Validator
+    from validator_thread import Validator
 
 
 class JobStatus(Enum):
@@ -179,7 +179,7 @@ class JobMonitor:
         try:
             worker_info = self.node.dht.query(worker)
             connected = self.node.connect_node(
-                worker.encode(), worker_info["host"], worker_info["port"]
+                worker_info["host"], worker_info["port"], worker.encode()
             )
 
             if not connected:
@@ -346,7 +346,7 @@ class JobMonitor:
             if job_data["author"] != self.node.rsa_key_hash:
                 user_data = self.node.dht.query(job_data["author"])
                 connected = self.node.connect_node(
-                    job_data["author"], user_data["host"], user_data["port"]
+                    user_data["host"], user_data["port"], job_data["author"]
                 )
 
                 if connected:
@@ -520,9 +520,9 @@ class JobMonitor:
             #     user_data = self.node.dht.query(job_data["author"])
             #     if user_data:
             #         connected = self.node.connect_node(
-            #             job_data["author"].encode(),
             #             user_data["host"],
             #             user_data["port"],
+            #             job_data["author"].encode()
             #         )
             #         if connected:
             #             # Send alert (decline or cancel job)

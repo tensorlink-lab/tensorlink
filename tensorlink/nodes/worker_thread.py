@@ -12,7 +12,7 @@ import logging
 import time
 
 
-class Worker(Torchnode):
+class WorkerThread(Torchnode):
     """
     Todo:
         - link workers to database or download training data for complete offloading
@@ -27,20 +27,25 @@ class Worker(Torchnode):
         print_level=logging.INFO,
         max_connections: int = 0,
         upnp=True,
-        off_chain_test=False,
+        on_chain=False,
         local_test=False,
         mining_active=None,
         reserved_memory=None,
         duplicate="",
+        load_previous_state=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
-        super(Worker, self).__init__(
+        super(WorkerThread, self).__init__(
             request_queue,
             response_queue,
             "W" + duplicate,
             max_connections=max_connections,
             upnp=upnp,
-            off_chain_test=off_chain_test,
+            on_chain=on_chain,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
 
         self.training = False
@@ -61,7 +66,7 @@ class Worker(Torchnode):
         self.mining_active = mining_active
         self.reserved_memory = reserved_memory
 
-        if self.off_chain_test is False:
+        if self.on_chain:
             self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
             if not self.public_key:
                 self.debug_print(
@@ -72,29 +77,25 @@ class Worker(Torchnode):
 
             self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
 
-            if not self.local_test and not self.off_chain_test:
-                attempts = 0
+        should_bootstrap = bool(self._priority_nodes) or self.on_chain
+        if should_bootstrap:
+            attempts = 0
+            while attempts < 3 and len(self.validators) == 0:
+                self.bootstrap()
 
-                self.debug_print("Bootstrapping...", tag="Worker")
-                while attempts < 3 and len(self.validators) == 0:
-                    self.bootstrap()
-                    if len(self.validators) == 0:
-                        time.sleep(15)
-                        self.debug_print(
-                            "No validators found, trying again...", tag="Worker"
-                        )
-                        attempts += 1
+                if len(self.nodes) == 0:
+                    time.sleep(3)
+                    attempts += 1
+        else:
+            self.debug_print(
+                "Skipping bootstrap (no priority nodes and not on-chain).",
+                tag="Worker",
+                level=logging.INFO,
+            )
 
-                if len(self.validators) == 0:
-                    self.debug_print(
-                        "No validators found, shutting down...",
-                        level=logging.CRITICAL,
-                        tag="Worker",
-                    )
-                    self.stop()
-                    self.terminate_flag.set()
-
-        self.keeper.load_previous_state()
+        # Finally, load up previous saved state if any
+        if on_chain or load_previous_state:
+            self.keeper.load_previous_state()
 
     def handle_data(self, data: bytes, node: Connection):
         """
@@ -168,7 +169,7 @@ class Worker(Torchnode):
                 module_size = module_info["memory"]
                 model_name = module_info["name"]
                 training = module_info["training"]
-                optimizer_name = json.dumps(module_info["optimizer_spec"])
+                optimizer_name = json.dumps(module_info.get("optimizer_spec"))
                 module_info["status"] = "loading"
 
                 if self.available_gpu_memory >= module_size:

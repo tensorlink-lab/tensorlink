@@ -1,7 +1,7 @@
 import os
 
 from tensorlink.ml.utils import get_gpu_memory
-from tensorlink.mpc.shared_memory import get_from_shared_memory
+from tensorlink.nodes.shared_memory import get_from_shared_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.smart_node import Smartnode
 
@@ -12,6 +12,10 @@ import threading
 import time
 import json
 import psutil
+
+
+MSG_TOKEN = b"TOKEN"
+MSG_STREAM_END = b"END__"
 
 
 def format_size(size_bytes):
@@ -38,15 +42,19 @@ class Torchnode(Smartnode):
         role,
         max_connections: int = 0,
         upnp=True,
-        off_chain_test=False,
+        on_chain=False,
         local_test=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
         super(Torchnode, self).__init__(
             role=role,
             max_connections=max_connections,
             upnp=upnp,
-            off_chain_test=off_chain_test,
+            on_chain=on_chain,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
 
         # Available GPU mpc estimation
@@ -249,18 +257,28 @@ class Torchnode(Smartnode):
         # Received a forward pass
         self.debug_print("RECEIVED GENERATE", tag="Torchnode")
 
-        # if self.role == "U":
-        #
-        # else:
-        module_id = data[8:72]
+        # Unpack data
+        module_id_size = 64
+        header_size = 8
+        stream_flag_size = 1
+        module_id = data[
+            header_size
+            + stream_flag_size : module_id_size
+            + header_size
+            + stream_flag_size
+        ]
+        stream_flag = data[header_size]
+        payload = data[module_id_size + header_size + stream_flag_size :]
 
-        size = len(data[72:])
+        stream = bool(stream_flag)
+        key = module_id.decode()
+        size = len(payload)
+
         shm = shared_memory.SharedMemory(create=True, size=size)
         buffer = shm.buf[:size]
-        buffer[:] = data[72:]
-        key = module_id.decode()
+        buffer[:size] = payload
 
-        self.modules[key]["forward_queue"][key] = (size, shm.name)
+        self.modules[key]["forward_queue"][key] = (size, shm.name, stream)
         self.memory_manager[key] = shm.name
         del buffer
         shm.close()
@@ -377,6 +395,8 @@ class Torchnode(Smartnode):
                 "info": self._handle_get_info,
                 "debug_print": self._handle_debug_print,
                 "generate": self._handle_send_generate,
+                "send_token": self._handle_send_token,
+                "send_stream_end": self._handle_send_stream_end,
             }
 
             handler = handlers.get(req_type)
@@ -445,10 +465,33 @@ class Torchnode(Smartnode):
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_send_generate(self, request):
-        node_id, size, shm_name = request["args"]
+        node_id, size, shm_name, stream = request["args"]
         node = self.nodes[node_id]
         generate_bytes = get_from_shared_memory(size, shm_name, encoded=True)
-        self.send_to_node(node, b"GENERATE" + generate_bytes)
+        stream_flag = b"\x01" if stream else b"\x00"
+
+        packet = b"GENERATE" + stream_flag + generate_bytes
+        self.send_to_node(node, packet)
+
+        self.response_queue.put({"status": "SUCCESS", "return": None})
+
+    def _handle_send_token(self, request):
+        module_id, token, host_id = request["args"]
+        node = self.nodes[host_id]
+
+        token_bytes = token.to_bytes(4, byteorder="big", signed=True)
+        bytes_to_send = MSG_TOKEN + module_id.encode() + b"|" + token_bytes
+        self.send_to_node(node, bytes_to_send)
+
+        self.response_queue.put({"status": "SUCCESS", "return": None})
+
+    def _handle_send_stream_end(self, request):
+        module_id, host_id = request["args"]
+        node = self.nodes[host_id]
+
+        end_bytes = MSG_STREAM_END + module_id.encode()
+        self.send_to_node(node, end_bytes)
+
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_send_backward(self, request):
@@ -677,8 +720,8 @@ class Torchnode(Smartnode):
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_connect_node(self, request):
-        node_id, host, port = request["args"]
-        connected = self.connect_node(node_id, host, port)
+        host, port, node_id = request["args"]
+        connected = self.connect_node(host, port, node_id)
         self.response_queue.put({"status": "SUCCESS", "return": connected})
 
     def _handle_get_info(self, request):

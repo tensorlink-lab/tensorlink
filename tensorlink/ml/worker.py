@@ -1,5 +1,6 @@
 import gc
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import time
 import glob
 from contextlib import contextmanager
 
+from threading import Thread
 import torch
 import torch.amp as amp
 from accelerate import init_empty_weights
@@ -20,7 +22,9 @@ from transformers import (
     AutoModelForVision2Seq,
     AutoModelForSeq2SeqLM,
     AutoModelForSpeechSeq2Seq,
+    Cache,
 )
+from transformers.generation.streamers import BaseStreamer
 from safetensors import safe_open
 from huggingface_hub import snapshot_download
 
@@ -35,7 +39,10 @@ from tensorlink.ml.utils import (
     get_optimizer_from_spec,
 )
 from tensorlink.ml.injector import LayerGroupModule
-from tensorlink.mpc.shared_memory import get_from_shared_memory, store_in_shared_memory
+from tensorlink.nodes.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 
 
 def _find_module_path_by_class(
@@ -93,6 +100,29 @@ def _create_layer_group_wrapper(
     )
 
 
+def normalize_past_key_values(pkv):
+    """
+    Ensures past_key_values has shape:
+    Tuple[Tuple[Tensor, Tensor], ...]
+    """
+    if pkv is None:
+        return None
+
+    if isinstance(pkv, Cache):
+        return pkv
+
+    # unwrap accidental singleton nesting
+    while (
+        isinstance(pkv, (list, tuple))
+        and len(pkv) == 1
+        and isinstance(pkv[0], (list, tuple))
+    ):
+        pkv = pkv[0]
+
+    # enforce tuple-of-tuples
+    return tuple(tuple(layer) for layer in pkv)
+
+
 def _load_model_skeleton(model_name: str, module_id: str, model_type: str = "chat"):
     """Load the HF model structure with empty weights"""
     with init_empty_weights():
@@ -110,6 +140,30 @@ def _load_model_skeleton(model_name: str, module_id: str, model_type: str = "cha
 
     skeleton_model.eval()  # Set to eval mode initially
     return skeleton_model
+
+
+class TensorlinkWorkerStreamer(BaseStreamer):
+    def __init__(self, send_token, send_end):
+        super().__init__()
+        self.send_token = send_token
+        self.send_end = send_end
+
+    def put(self, value):
+        if not isinstance(value, torch.Tensor):
+            return
+
+        # Normalize shape
+        if value.dim() == 2:
+            token_id = value[0, -1].item()
+        elif value.dim() == 1:
+            token_id = value[-1].item()
+        else:
+            token_id = value.item()
+
+        self.send_token(token_id)
+
+    def end(self):
+        self.send_end()
 
 
 class DistributedWorker:
@@ -132,6 +186,9 @@ class DistributedWorker:
         # Mixed precision setup vars (set on model load)
         self.scaler = None
         self.use_amp = False
+
+        self.GC_CHECK_INTERVAL = 1_000
+        self.CHECK_COUNTER = 1
 
         # Initialize CUDA streams for overlapping operations
         if self.device.type == "cuda":
@@ -177,6 +234,7 @@ class DistributedWorker:
         """Send request to coordinator node with timeout handling"""
         request = {"type": request_type, "args": args}
         try:
+            # print(f"MPC Locked: {self.node.__class__.__name__}: {request_type}")
             self.mpc_lock.acquire(timeout=timeout)
             self.node_requests.put(request)
             response = self.node_responses.get(
@@ -259,7 +317,7 @@ class DistributedWorker:
                 torch.cuda.empty_cache()
 
     def _handle_forward(self, module_id, key, size, name):
-        """Handle forward pass with mixed precision"""
+        """Handle forward pass with proper KV cache structure preservation"""
         module = self.modules[module_id]
 
         # Get data from shared memory
@@ -274,6 +332,11 @@ class DistributedWorker:
 
         if not isinstance(inp, (list, tuple)):
             inp = (inp,)
+
+        if "past_key_values" in kwargs:
+            kwargs["past_key_values"] = normalize_past_key_values(
+                kwargs.get("past_key_values")
+            )
 
         # Forward pass
         if self.use_amp and module.training:
@@ -309,73 +372,90 @@ class DistributedWorker:
         if self.device.type == "cuda" and module.n_batch % 20 == 0:
             torch.cuda.empty_cache()
 
-    def _handle_generate(self, module_id, size, name):
-        """Optimized text generation with CUDA acceleration"""
-        module = self.modules.get(module_id)
-        query_bytes = get_from_shared_memory(size, name, encoded=True)
-        args, kwargs = query_bytes.split(b"::")
+    def _handle_generate(self, module_id, size, name, stream):
+        """
+        Optimized text generation with optional stream generation. Called upon only
+        if we have a full model loaded and not a submodule.
+        """
+        module = self.modules[module_id]
+        payload = get_from_shared_memory(size, name, encoded=True)
 
-        # Convert args to tensor and move to device
-        input_ids = bytes_to_tensor(args)
+        # Deserialize
 
-        if isinstance(input_ids, list):
-            input_ids = input_ids[-1]
+        args_bytes, kwargs_bytes = payload.split(b"::")
+        args = bytes_to_tensor(args_bytes)
+        kwargs = bytes_to_tensor(kwargs_bytes)
 
+        # Attach input_ids from args if missing
+        if "input_ids" not in kwargs:
+            if args is None:
+                raise ValueError("generate() missing input_ids (no args, no kwargs)")
+            kwargs["input_ids"] = args
+
+        # Validate input_ids
+        if not isinstance(kwargs["input_ids"], torch.Tensor):
+            try:
+                kwargs["input_ids"] = torch.Tensor(kwargs["input_ids"][0])
+            except:
+                raise ValueError("input_ids must be convertible to torch.Tensor")
+
+        if kwargs["input_ids"].numel() == 0 or kwargs["input_ids"].shape[-1] == 0:
+            raise ValueError("input_ids is empty; cannot generate")
+
+        # Move everything to device
+        kwargs = attach_tensor(kwargs, self.device)
+
+        # CUDA defaults (non-invasive)
         if self.device.type == "cuda":
-            # Pin memory for faster transfers
-            input_ids = input_ids.pin_memory()
+            kwargs.setdefault("use_cache", True)
 
-        # Load kwargs but filter out non-generation parameters
-        all_kwargs = bytes_to_tensor(kwargs)
-        if hasattr(input_ids, "input_ids"):
-            all_kwargs['input_ids'] = input_ids.input_ids
-            if hasattr(input_ids, "attention_mask"):
-                all_kwargs["attention_mask"] = input_ids.attention_mask
-        else:
-            all_kwargs['input_ids'] = input_ids
-
-        all_kwargs = attach_tensor(all_kwargs, self.device)
-
-        # Filter out other known non-generation parameters
-        known_non_generation_params = ['module', 'class', 'data']
-        for param in known_non_generation_params:
-            all_kwargs.pop(param, None)
-
-        # Optimize generation parameters if not specified
-        if 'num_beams' not in all_kwargs and self.device.type == "cuda":
-            all_kwargs['num_beams'] = 2
-
-        # Use efficient attention if available and not specified
-        if self.device.type == "cuda" and 'use_cache' not in all_kwargs:
-            all_kwargs['use_cache'] = True  # Enable KV caching for faster generation
+        host_id = module.host
 
         try:
-            with torch.no_grad():
-                # Use pinned memory for faster host->device transfer and synchronize for accurate profiling
-                if self.device.type == "cuda":
-                    with torch.cuda.stream(self.compute_stream):
-                        output = module.generate(**all_kwargs)
-                    self.compute_stream.synchronize()
+            if (
+                not stream
+                or "streamer" not in inspect.signature(module.generate).parameters
+            ):
+                with torch.no_grad():
+                    output = module.generate(**kwargs)
+            else:
+                streamer = TensorlinkWorkerStreamer(
+                    send_token=lambda token: self._send_token(
+                        module_id, token, host_id
+                    ),
+                    send_end=lambda: self._send_stream_end(module_id, host_id),
+                )
+                kwargs["streamer"] = streamer
 
-                else:
-                    output = module.generate(**all_kwargs)
+                def _run_generate():
+                    with torch.no_grad():
+                        module.generate(**kwargs)
 
-            # Detach and store generated output
-            detached_out = detach_tensor(output)
-            output_bytes = tensor_to_bytes(detached_out)
+                gen_thread = Thread(target=_run_generate, daemon=True)
+                gen_thread.start()
+                gen_thread.join()
+
+            output_bytes = tensor_to_bytes(detach_tensor(output))
 
         except Exception as e:
-            # Handle any exceptions during generation
             output_bytes = json.dumps({"error": str(e)}).encode()
+            if stream:
+                self._send_stream_end(module_id, host_id)
 
         size, name = store_in_shared_memory(output_bytes)
+        self.send_request("send_forward", (host_id, size, name, "generate"))
 
-        # Send the generated output back
-        self.send_request("send_forward", (module.host, size, name, "generate"))
-
-        # Clean memory
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def _send_token(self, module_id, token, host_id):
+        if isinstance(token, torch.Tensor):
+            token = token.item()
+
+        self.send_request("send_token", (module_id, token, host_id))
+
+    def _send_stream_end(self, module_id, host_id):
+        self.send_request("send_stream_end", (module_id, host_id))
 
     def load_module(self, module_info: dict):
         """
@@ -951,7 +1031,6 @@ class DistributedWorker:
         or model update requests, and then processes any outstanding forwards or backwards passes on the loaded modules
         """
         # Check for new modules to load
-
         args = self.send_request("check_module", None)
 
         # If we have received model info now load the model in this process
@@ -972,14 +1051,15 @@ class DistributedWorker:
 
                 self.send_request("debug_print", (f"Module {args} removed.",))
 
-        # Check for termination request
-        shutdown_signal = self.send_request("check_shutdown", None)
-        if shutdown_signal:
-            self.send_request(
-                "debug_print",
-                "Termination signal received. Shutting down DistributedWorker process...",
-            )
-            self.terminate = True
+        if self.CHECK_COUNTER % self.GC_CHECK_INTERVAL == 0:
+            # Check for termination request
+            shutdown_signal = self.send_request("check_shutdown", None)
+            if shutdown_signal:
+                self.send_request(
+                    "debug_print",
+                    "Termination signal received. Shutting down DistributedWorker process...",
+                )
+                self.terminate = True
 
         # Process each module sequentially
         if self.modules:
@@ -1020,10 +1100,12 @@ class DistributedWorker:
                 # Handle forward queue
                 forward_task = self.send_request("check_forward", module_id)
                 if forward_task:
-                    key, (size, name) = forward_task
-                    if isinstance(key, str):
-                        self._handle_generate(module_id, size, name)
+                    key, args = forward_task
+                    if len(args) == 3:
+                        size, name, stream = args
+                        self._handle_generate(module_id, size, name, stream)
                     else:
+                        size, name = args
                         self._handle_forward(module_id, key, size, name)
 
                 # Handle backward queue
@@ -1032,13 +1114,14 @@ class DistributedWorker:
                     tag, loss_relay = backward_task
                     self._handle_backward(module_id, tag, loss_relay)
 
-        # Small sleep to prevent CPU hogging
-        time.sleep(0.001)
+        self.CHECK_COUNTER += 1
 
     def run(self):
         """Main execution thread"""
         while not self.terminate:
             self.main_loop()
+
+            # Small sleep to prevent CPU hogging
             time.sleep(0.001)
 
         # Final cleanup

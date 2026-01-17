@@ -11,7 +11,7 @@ import threading
 import time
 
 
-class User(Torchnode):
+class UserThread(Torchnode):
     def __init__(
         self,
         request_queue,
@@ -19,17 +19,21 @@ class User(Torchnode):
         print_level=logging.DEBUG,
         max_connections: int = 0,
         upnp=True,
-        off_chain_test=False,
+        on_chain=False,
         local_test=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
     ):
-        super(User, self).__init__(
+        super(UserThread, self).__init__(
             request_queue,
             response_queue,
             "U",
             max_connections=max_connections,
             upnp=upnp,
-            off_chain_test=off_chain_test,
+            on_chain=on_chain,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
         )
         self.print_level = print_level
         self.distributed_graph = {}
@@ -64,7 +68,7 @@ class User(Torchnode):
         #     ):
         #         time.sleep(5)
 
-        if self.off_chain_test is False:
+        if self.on_chain:
             self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
             if not self.public_key:
                 self.debug_print(
@@ -75,27 +79,13 @@ class User(Torchnode):
 
             self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
 
-            if self.local_test is False:
-                attempts = 0
+        attempts = 0
+        while attempts < 3 and len(self.validators) == 0:
+            self.bootstrap()
 
-                self.debug_print("Bootstrapping...", tag="User")
-                while attempts < 3 and len(self.validators) == 0:
-                    self.bootstrap()
-                    if len(self.validators) == 0:
-                        time.sleep(15)
-                        self.debug_print(
-                            "No validators found, trying again...", tag="User"
-                        )
-                        attempts += 1
-
-                if len(self.validators) == 0:
-                    self.debug_print(
-                        "No validators found, shutting down...",
-                        level=logging.WARNING,
-                        tag="User",
-                    )
-                    self.stop()
-                    self.terminate_flag.set()
+            if len(self.nodes) == 0:
+                time.sleep(3)
+                attempts += 1
 
     def handle_data(self, data: bytes, node: Connection) -> bool:
         """
@@ -228,9 +218,9 @@ class User(Torchnode):
 
                         # Connect to workers for each model
                         connected = self.connect_worker(
-                            worker_info["id"],
                             worker_info["host"],
                             worker_info["port"],
+                            worker_info["id"],
                             mod_id,
                         )
 
@@ -446,27 +436,27 @@ class User(Torchnode):
 
     def connect_worker(
         self,
-        id_hash: bytes,
         host: str,
         port: int,
-        module_id: bytes,
+        id_hash: bytes = None,
+        module_id: bytes = None,
         reconnect: bool = False,
     ) -> bool:
         """
         Connect to a worker node in the Smartnodes network.
 
         Args:
-            id_hash (bytes): Unique identifier of the worker node.
             host (str): Worker host address.
             port (int): Worker port.
-            module_id (bytes): Identifier of the worker's module/service.
+            id_hash (bytes, optional): Unique identifier of the worker node.
+            module_id (bytes, optional): Identifier of the worker's module/service.
             reconnect (bool, optional): Whether to attempt reconnecting
                 if already connected. Defaults to False.
 
         Returns:
             bool: True if the worker connection succeeds, False otherwise.
         """
-        connected = self.connect_node(id_hash, host, port, reconnect)
+        connected = self.connect_node(host, port, id_hash, reconnect)
         return connected
 
     # def activate_job(self, job_id, workers):
