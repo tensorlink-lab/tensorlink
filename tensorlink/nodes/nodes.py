@@ -20,8 +20,8 @@ class BaseNodeConfig:
     on_chain: bool = False
     local_test: bool = False
     print_level: int = logging.INFO
-    priority_nodes: Optional[List[str]] = None
-    seed_validators: Optional[List[str]] = None
+    priority_nodes: Optional[List[List[str]]] = None
+    seed_validators: Optional[List[List[str]]] = None
 
 
 @dataclass
@@ -33,7 +33,8 @@ class WorkerConfig(BaseNodeConfig):
 @dataclass
 class ValidatorConfig(BaseNodeConfig):
     endpoint: bool = True
-    endpoint_ip: str = "0.0.0.0"
+    endpoint_url: str = "0.0.0.0"
+    endpoint_port: int = 64747
     load_previous_state: bool = False
 
 

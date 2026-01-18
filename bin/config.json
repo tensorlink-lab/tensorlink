@@ -4,22 +4,21 @@
       "type": "worker",
       "mode": "public",
       "endpoint": false,
-      "endpoint-url": "127.0.0.1",
-      "priority_nodes": []
+      "endpoint_url": "127.0.0.1",
+      "endpoint_port": 64747,
+      "priority_nodes": [],
+      "logging": "INFO"
     },
     "crypto": {
       "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",
       "mining": false,
-      "mining-script": "path/to/mining.executable",
+      "mining_script": "path/to/mining.executable",
       "seed_validators": [
         ["smartnodes.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
       ]
     },
     "ml": {
       "trusted": false
-    },
-    "logging": {
-      "level": "INFO"
     }
   }
 }

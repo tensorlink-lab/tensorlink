@@ -7,7 +7,7 @@ authors = [
     "Matthew Hawken",
     "Nikita Vassilyev"
 ]
-readme = "README.md"
+readme = "SMALL_README.md"
 packages = [{include = "tensorlink"}]
 homepage = "https://smartnodes.ca/tensorlink"
 documentation = "https://smartnodes.ca/tensorlink/docs"

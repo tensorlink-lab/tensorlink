@@ -78,7 +78,7 @@ def parse_network_mode(mode):
 
 def setup_logging(config):
     """Setup logging based on configuration."""
-    level_str = config.get("logging", {}).get("level", "INFO").upper()
+    level_str = config.get("node", {}).get("logging", "INFO").upper()
 
     if not hasattr(logging, level_str):
         raise ValueError(
@@ -152,7 +152,7 @@ def stop_mining(mining_process):
 def run_worker_loop(worker, config):
     """Main loop for worker nodes with mining management."""
     mining_enabled = config.get("crypto", {}).get("mining", False)
-    mining_script = config.get("crypto", {}).get("mining-script", "")
+    mining_script = config.get("crypto", {}).get("mining_script", "")
     use_sudo = os.geteuid() == 0
     mining_process = None
 
@@ -255,7 +255,8 @@ def main():
                 local_test=local,
                 on_chain=on_chain,
                 endpoint=config.get("node", {}).get("endpoint", False),
-                endpoint_ip=config.get("node", {}).get("endpoint-url", "127.0.0.1"),
+                endpoint_url=config.get("node", {}).get("endpoint_url", "127.0.0.1"),
+                endpoint_port=config.get("node", {}).get("endpoint_port", 64747),
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),

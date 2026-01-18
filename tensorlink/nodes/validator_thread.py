@@ -30,7 +30,8 @@ class ValidatorThread(Torchnode):
         on_chain=False,
         local_test=False,
         endpoint=True,
-        endpoint_ip="0.0.0.0",
+        endpoint_url="0.0.0.0",
+        endpoint_port=64747,
         load_previous_state=False,
         priority_nodes: list = None,
         seed_validators: list = None,
@@ -112,9 +113,9 @@ class ValidatorThread(Torchnode):
 
         # Start up the API for handling public jobs
         if endpoint:
-            self.endpoint = TensorlinkAPI(self, host=endpoint_ip)
+            self.endpoint = TensorlinkAPI(self, host=endpoint_url, port=endpoint_port)
             if not local_test:
-                self.add_port_mapping(64747, 64747)
+                self.add_port_mapping(endpoint_port, endpoint_port)
 
         self.stream_buffers = {}
 

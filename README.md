@@ -18,95 +18,189 @@
 
 ## What is Tensorlink?
 
-Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across a 
-peer-to-peer network of GPUs. It enables:
-- Running large models without local VRAM 
-- Hosting models on your own hardware and accessing them remotely via API 
-- Distributing model execution across multiple consumer GPUs 
-- Contributing idle compute to earn network rewards
-
-All without relying on centralized cloud inference providers.
-
-> **Early Access:** Tensorlink is under active development. APIs and internals may evolve. [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
+Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across 
+peer-to-peer networks. It enables you to run, train, and serve large models securely across distributed hardware without relying on 
+centralized cloud inference providers.
 
 ### Key Features
-- **Native PyTorch Integration** - Wrap Hugging Face or custom PyTorch models and execute them across the network.
-- **REST API for Inference** - Access hosted models via HTTP without PyTorch dependencies.  
-- **Distributed Model Execution** - Run models larger than a single GPU by partitioning execution across peers.
-- **Privacy Options**: Route queries exclusively to your own hardware for private usage.
-- **Incentivized Compute Sharing** - Earn rewards by contributing idle GPUs to the network.
+- **Native PyTorch & REST API Access** – Use models directly in Python or via HTTP endpoints  
+- **Run Large Models Without Local VRAM** – Execute models that exceed your GPU capacity  
+- **Remote Access to Your Own Hardware** – Securely host and access models on your devices via API  
+- **Plug-and-Play Distributed Execution** – Automatic model sharding across multiple GPUs  
+- **Training & Inference Support** – Train models with distributed optimizers or run inference across the network  
+- **Streaming Generation** – Token-by-token streaming for real-time responses   
+- **Privacy Controls** – Route queries exclusively to your own hardware for private usage  
+- **Earn Rewards for Idle Compute** – Contribute GPU resources to the network and get compensated  
+
+> **Early Access:** Tensorlink is under active development. APIs and internals may evolve.  
+> [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
+> Learn more in the [**Litepaper**](docs/LITEPAPER.md)
 
 ## Quick Start
 
-Tensorlink can be accessed via API or directly within Python. 
+### Option 1: Distributed Models in Python
 
-### Use the Inference API
-
-```python
-import requests
-
-inference_query = requests.post(
-    "http://smartnodes.ddns.net/tensorlink-api/generate",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "message": "Does this user query require an internet search? Response with either only yes, or no.",
-        "max_new_tokens": 32,
-        "stream": False,
-    }
-)
-
-
-request_model = requests.post(
-    "http://smartnodes.ddns.net/tensorlink-api/request-model",
-    json={}
-)
-
-```
-
-### Installation
+#### Installation
 
 ```bash
 pip install tensorlink
 ```
+**Requirements:** Python 3.10+, PyTorch 2.3+, UNIX/MacOS (Windows: use WSL)
 
-**Requirements:** Python 3.10+, PyTorch 2.3+, UNIX/MacOS (Windows support coming soon)
+#### Basic Usage
 
-### Run Your First Distributed Model
-
-This example illustrates how to spawn a HuggingFace Pre-trained model on the tensorlink public network. If you  wish to 
-leverage your own hardware, or for a more complex breakdown, proceed to the Examples section.
+Execute Hugging Face models distributed across the network.
 
 ```python
-from tensorlink import DistributedModel
-import torch
+from tensorlink.ml import DistributedModel
+
+MODEL_NAME = "Qwen/Qwen3-8B"
 
 # Connect to a pre-trained model on the network
 model = DistributedModel(
-    model="Qwen/Qwen3-8B-Instruct",
-    training=False,
-    device="cuda",
-    dtype=torch.float16
+    model=MODEL_NAME,
+    training=True,
+    device="cuda"
+)
+optimizer = model.create_optimizer(lr=0.001)
+```
+> See [Examples](docs/examples) for streaming generation, distributed training, custom models, 
+> and network configurations.
+
+### Option 2: Accessing Models via HTTP
+
+Access models via HTTP on the public network, or configure your own hardware for private API access. 
+Tensorlink exposes OpenAI-style endpoints for distributed inference:
+```python
+import requests
+
+response = requests.post(
+    "http://smartnodes.ddns.net/tensorlink-api/v1/generate",
+    json={
+        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
+        "message": "Explain quantum computing in one sentence.",
+        "max_new_tokens": 50,
+        "stream": False,
+    }
 )
 
-# Use it like any PyTorch model
-inputs = tokenizer("Hello, world!", return_tensors="pt")
-outputs = model.generate(inputs, max_new_tokens=100)
+print(response.json())
+```
+>Access the public network or configure your own hardware for private API access. See [Examples](docs/examples) for 
+>streaming, chat completions, and API reference.
+
+### Option 3: Run a Node
+
+Run Tensorlink nodes to host models, shard workloads across GPUs, and expose them via Python and HTTP APIs.
+Nodes can act as workers (run models), validators (route requests + expose API), or both. This allows you to 
+build private clusters, public compute providers, or local development environments.
+
+1. Download the latest `tensorlink-node` from [Releases](...)
+2. Edit `config.json` to configure your nodes.
+3. Run: `./run-node.sh`
+
+> By default, the config is set for running a public worker node. Your GPU will process network workloads and earn 
+> rewards via the networking layer ([Smartnodes](https://smartnodes.ca)). See [Examples](docs/examples) for different 
+> device and network configurations.
+
+---
+
+## Configuration Reference
+
+Your `config.json` controls networking, rewards, and model execution behavior.
+
+### Node
+
+| Field            | Type                     | Description                                                                  |
+|------------------|--------------------------|------------------------------------------------------------------------------|
+| `type`           | `worker\|validator`      | Node type                                                            |
+| `mode`           | `public\|private\|local` | Network type: public (earn rewards), private (your devices), local (testing) |
+| `endpoint`       | `bool`                   | Enables REST API server on this node (validator role)                        |
+| `endpoint_url`   | `str`                    | Address the API binds to. Use `0.0.0.0` to expose on LAN                     |
+| `endpoint_port`  | `int`                    | Port for the HTTP API (default: `64747`)                                     |
+| `priority_nodes` | `[[ip, port]]`           | Bootstrap peers to connect to first (for private clusters)                   |
+
+### Crypto
+
+| Field           | Type   | Description                                              |
+|-----------------|--------|----------------------------------------------------------|
+| `address`       | `str`  | Wallet address used for identity and rewards             |
+| `mining`        | `bool` | Contribute GPU compute to the public network for rewards |
+| `mining_script` | `str`  | Path to mining / GPU workload executable                 |
+
+### ML
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `trusted` | `bool` | Allows execution of custom user-supplied models |
+| `max_vram_gb` | `int` | Limits VRAM usage per node to prevent overload |
+
+> For common configuration recipes and examples, see [**Examples: Node Configuration**](docs/EXAMPLES.md#node-configuration-examples)
+
+---
+
+## API Reference
+
+Tensorlink exposes **OpenAI-compatible HTTP endpoints** for distributed inference.
+
+### Endpoints
+
+- `POST /v1/generate` – Simple text generation
+- `POST /v1/chat/completions` – OpenAI-compatible chat interface
+- `POST /request-model` – Preload models across the network
+
+### Example: `/v1/generate`
+
+```python
+import requests
+
+r = requests.post(
+    "http://localhost:64747/v1/generate",
+    json={
+        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
+        "message": "Explain quantum computing in one sentence.",
+        "max_new_tokens": 64,
+        "temperature": 0.7,
+        "stream": False,
+    }
+)
+
+print(r.json()["generated_text"])
 ```
 
-### Contribute Compute (Mining)
+### Example: `/v1/chat/completions` (OpenAI-compatible)
 
-1. Download the latest `tensorlink-miner` from [Releases](...)
-2. Configure your wallet address in `config.json`
-3. Run: `./run-worker.sh`
+```python
+r = requests.post(
+    "http://localhost:64747/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Explain quantum computing."}
+        ],
+        "max_tokens": 128,
+        "stream": True
+    },
+    stream=True,
+)
 
-That's it! Your GPU will earn rewards by processing AI workloads from the network.
+for line in r.iter_lines():
+    if line:
+        print(line.decode(), end="")
+```
+
+> For complete API documentation, streaming examples, and parameters, see [**Examples: HTTP API**](docs/EXAMPLES.md#http-api-examples)
+
+---
 
 ## Learn More
 
-- 📚 **[Documentation](https://smartnodes.ca/tensorlink/docs)** - Full API reference and guides
-- 💬 **[Discord Community](https://discord.gg/aCW2kTNzJ2)** - Get help and connect with developers
-- 🎮 **[Live Demo](https://smartnodes.ca/localhostGPT)** - Try localhostGPT powered by Tensorlink
-- 📘 **[Litepaper](docs/LITEPAPER.md)** - Technical overview and architecture
+- 📚 **[Documentation](https://smartnodes.ca/tensorlink/docs)** – Full API reference and guides
+- 🎯 **[Examples](docs/EXAMPLES.md)** – Comprehensive usage patterns and recipes
+- 💬 **[Discord Community](https://discord.gg/aCW2kTNzJ2)** – Get help and connect with developers
+- 🎮 **[Live Demo](https://smartnodes.ca/localhostGPT)** – Try localhostGPT powered by Tensorlink
+- 📘 **[Litepaper](docs/LITEPAPER.md)** – Technical overview and architecture
 
 ## Contributing
 
@@ -116,7 +210,5 @@ We welcome contributions! Here's how to get involved:
 - 💡 **Suggest features** on our [Discord](https://discord.gg/aCW2kTNzJ2)
 - 🔧 **Submit PRs** to improve code or documentation
 - ☕ **Support the project** via [Buy Me a Coffee](https://www.buymeacoffee.com/smartnodes)
-
-## License
 
 Tensorlink is released under the [MIT License](LICENSE).
