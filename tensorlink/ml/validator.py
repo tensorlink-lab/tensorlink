@@ -609,10 +609,7 @@ class DistributedValidator(DistributedWorker):
                 prompt_tokens=prompt_tokens,
                 model_max_length=model_max_length,
             )
-            print(f"📊 Generation args: {args}")
-            print(
-                f"📏 Prompt: {prompt_tokens} tokens, Max new: {args['max_new_tokens']} tokens"
-            )
+
         except ValueError as e:
             # Prompt is too long
             request.output = f"Error: {str(e)}"
@@ -629,7 +626,7 @@ class DistributedValidator(DistributedWorker):
             try:
                 outputs = distributed_model.generate(
                     inputs.input_ids,
-                    max_new_tokens=args["max_new_tokens"],
+                    # max_new_tokens=args["max_new_tokens"],
                     temperature=args["temperature"],
                     pad_token_id=args["pad_token_id"],
                     eos_token_id=args["eos_token_id"],
