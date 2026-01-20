@@ -40,8 +40,8 @@ def test_node_start(nodes):
     worker, user, validator = nodes
 
     # Connect worker and user to validator
-    worker.connect_node(validator.rsa_key_hash, validator.host, validator.port)
-    user.connect_node(validator.rsa_key_hash, validator.host, validator.port)
+    worker.connect_node(validator.host, validator.port, validator.rsa_key_hash)
+    user.connect_node(validator.host, validator.port, validator.rsa_key_hash)
 
     assert (
         worker.is_alive()

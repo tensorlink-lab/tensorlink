@@ -626,7 +626,7 @@ class DistributedValidator(DistributedWorker):
             try:
                 outputs = distributed_model.generate(
                     inputs.input_ids,
-                    # max_new_tokens=args["max_new_tokens"],
+                    max_new_tokens=args["max_new_tokens"],
                     temperature=args["temperature"],
                     pad_token_id=args["pad_token_id"],
                     eos_token_id=args["eos_token_id"],
