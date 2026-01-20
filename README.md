@@ -16,6 +16,16 @@
   </a>
 </p>
 
+## Table of Contents
+
+- [What is Tensorlink?](#what-is-tensorlink)
+- [Quick Start](#quick-start)
+- [Node Configuration](#configuration-reference)
+- [API Reference](#api-reference)
+- [Supported Models](#supported-models)
+- [Learn More](#learn-more)
+- [Contributing](#contributing)
+
 ## What is Tensorlink?
 
 Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across 
@@ -95,7 +105,7 @@ Run Tensorlink nodes to host models, shard workloads across GPUs, and expose the
 Nodes can act as workers (run models), validators (route requests + expose API), or both. This allows you to 
 build private clusters, public compute providers, or local development environments.
 
-1. Download the latest `tensorlink-node` from [Releases](...)
+1. Download the latest `tensorlink-node` from [Releases](releases)
 2. Edit `config.json` to configure your nodes.
 3. Run: `./run-node.sh`
 
@@ -107,26 +117,20 @@ build private clusters, public compute providers, or local development environme
 
 ## Configuration Reference
 
-Your `config.json` controls networking, rewards, and model execution behavior.
+Your `config.json` controls networking, rewards, and model execution behavior. By default, the `config.json` is set for 
+running a public worker node. 
 
 ### Node
 
-| Field            | Type                     | Description                                                                  |
-|------------------|--------------------------|------------------------------------------------------------------------------|
-| `type`           | `worker\|validator`      | Node type                                                            |
-| `mode`           | `public\|private\|local` | Network type: public (earn rewards), private (your devices), local (testing) |
-| `endpoint`       | `bool`                   | Enables REST API server on this node (validator role)                        |
-| `endpoint_url`   | `str`                    | Address the API binds to. Use `0.0.0.0` to expose on LAN                     |
-| `endpoint_port`  | `int`                    | Port for the HTTP API (default: `64747`)                                     |
-| `priority_nodes` | `[[ip, port]]`           | Bootstrap peers to connect to first (for private clusters)                   |
-
-### Crypto
-
-| Field           | Type   | Description                                              |
-|-----------------|--------|----------------------------------------------------------|
-| `address`       | `str`  | Wallet address used for identity and rewards             |
-| `mining`        | `bool` | Contribute GPU compute to the public network for rewards |
-| `mining_script` | `str`  | Path to mining / GPU workload executable                 |
+| Field            | Type                   | Description                                                                                             |
+|------------------|------------------------|---------------------------------------------------------------------------------------------------------|
+| `type`           | `str`                  | Node Type (`worker\|validator\|both`): validator accepts job & api requests, workers run models         |
+| `mode`           | `str`                  | Network Type (`public\|private\|local`): public (earn rewards), private (your devices), local (testing) |
+| `endpoint`       | `bool`                 | Endpoint Toggle: Enables REST API server on this node (validator role)                                  |
+| `endpoint_url`   | `str`                  | Endpoint URL: Address the API binds to. Use `0.0.0.0` to expose on LAN                                  |
+| `endpoint_port`  | `int`                  | Endpoint Port: Port for the HTTP API (default: `64747`)                                                 |
+| `priority_nodes` | `List[List[str, int]]` | Nodes to Connect: Bootstrap trusted peers to connect to first (e.g.,`[["192.168.2.42", 38751]]`)        |
+| `logging`        | `int`                  | Console logging mode (e.g., `DEBUG\|INFO\|WARNING`)                                                     |
 
 ### ML
 
@@ -134,6 +138,15 @@ Your `config.json` controls networking, rewards, and model execution behavior.
 |-------|------|-------------|
 | `trusted` | `bool` | Allows execution of custom user-supplied models |
 | `max_vram_gb` | `int` | Limits VRAM usage per node to prevent overload |
+
+### Crypto
+
+| Field             | Type                        | Description                                              |
+|-------------------|-----------------------------|----------------------------------------------------------|
+| `address`         | `str`                       | Wallet address used for identity and rewards             |
+| `mining`          | `bool`                      | Contribute GPU compute to the public network for rewards |
+| `mining_script`   | `str`                       | Path to mining / GPU workload executable                 |
+| `seed_validators` | `List[List[str, int, str]]` | Path to mining / GPU workload executable                 |
 
 > For common configuration recipes and examples, see [**Examples: Node Configuration**](docs/examples/EXAMPLES.md#node-configuration-examples)
 
@@ -149,7 +162,31 @@ Tensorlink exposes **OpenAI-compatible HTTP endpoints** for distributed inferenc
 - `POST /v1/chat/completions` – OpenAI-compatible chat interface
 - `POST /request-model` – Preload models across the network
 
-### Example: `/v1/generate`
+---
+
+### `/v1/generate`
+
+Simple generation endpoint with flexible output formats.
+
+#### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hf_name` | string | *required* | Hugging Face model identifier |
+| `message` | string | *required* | Input text to generate from |
+| `prompt` | string | `null` | Alternative to `message` |
+| `model_type` | string | `"auto"` | Model architecture hint |
+| `max_length` | int | `2048` | Maximum total sequence length |
+| `max_new_tokens` | int | `2048` | Maximum tokens to generate |
+| `temperature` | float | `0.7` | Sampling temperature (0.01-2.0) |
+| `do_sample` | bool | `true` | Enable sampling vs greedy decode |
+| `num_beams` | int | `1` | Beam search width |
+| `stream` | bool | `false` | Enable streaming responses |
+| `input_format` | string | `"raw"` | `"chat"` or `"raw"` |
+| `output_format` | string | `"simple"` | `"simple"`, `"openai"`, or `"raw"` |
+| `history` | array | `null` | Chat history for multi-turn conversations |
+
+#### Example: Basic Generation
 
 ```python
 import requests
@@ -168,9 +205,85 @@ r = requests.post(
 print(r.json()["generated_text"])
 ```
 
-### Example: `/v1/chat/completions` (OpenAI-compatible)
+#### Example: Chat Format with History
 
 ```python
+r = requests.post(
+    "http://localhost:64747/v1/generate",
+    json={
+        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
+        "message": "What about entanglement?",
+        "input_format": "chat",
+        "output_format": "openai",
+        "history": [
+            {"role": "user", "content": "Explain quantum computing."},
+            {"role": "assistant", "content": "Quantum computing uses..."}
+        ],
+        "max_new_tokens": 128,
+    }
+)
+
+print(r.json())
+```
+
+---
+
+### `/v1/chat/completions`
+
+OpenAI-compatible chat completions endpoint with full streaming support.
+
+#### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | string | *required* | Hugging Face model identifier |
+| `messages` | array | *required* | Array of chat messages |
+| `temperature` | float | `0.7` | Sampling temperature (0.01-2.0) |
+| `top_p` | float | `1.0` | Nucleus sampling threshold |
+| `n` | int | `1` | Number of completions to generate |
+| `stream` | bool | `false` | Enable SSE streaming |
+| `stop` | string/array | `null` | Stop sequences |
+| `max_tokens` | int | `1024` | Maximum tokens to generate |
+| `presence_penalty` | float | `0.0` | Presence penalty (-2.0 to 2.0) |
+| `frequency_penalty` | float | `0.0` | Frequency penalty (-2.0 to 2.0) |
+| `user` | string | `null` | User identifier for tracking |
+
+#### Message Format
+
+```python
+{
+    "role": "system" | "user" | "assistant",
+    "content": "message text"
+}
+```
+
+#### Example: Non-Streaming
+
+```python
+import requests
+
+r = requests.post(
+    "http://localhost:64747/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Explain quantum computing in simple terms."}
+        ],
+        "max_tokens": 128,
+        "temperature": 0.7,
+    }
+)
+
+response = r.json()
+print(response["choices"][0]["message"]["content"])
+```
+
+#### Example: Streaming
+
+```python
+import requests
+
 r = requests.post(
     "http://localhost:64747/v1/chat/completions",
     json={
@@ -187,10 +300,101 @@ r = requests.post(
 
 for line in r.iter_lines():
     if line:
-        print(line.decode(), end="")
+        if line.decode().startswith("data: "):
+            data = line.decode()[6:]  # Remove "data: " prefix
+            if data != "[DONE]":
+                import json
+                chunk = json.loads(data)
+                if chunk["choices"][0]["delta"].get("content"):
+                    print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
 ```
 
-> For complete API documentation, streaming examples, and parameters, see [**Examples: HTTP API**](docs/examples/EXAMPLES.md#http-api-examples)
+#### Response Format (Non-Streaming)
+
+```json
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Quantum computing harnesses quantum mechanics..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 50,
+    "total_tokens": 70
+  }
+}
+```
+
+#### Response Format (Streaming)
+
+```
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"Qwen/Qwen2.5-7B-Instruct","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"Qwen/Qwen2.5-7B-Instruct","choices":[{"index":0,"delta":{"content":"Quantum"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"Qwen/Qwen2.5-7B-Instruct","choices":[{"index":0,"delta":{"content":" computing"},"finish_reason":null}]}
+
+...
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"Qwen/Qwen2.5-7B-Instruct","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+---
+
+### `/request-model`
+
+Preload a model across the distributed network before making generation requests.
+
+#### Request Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `hf_name` | string | Hugging Face model identifier |
+
+#### Example
+
+```python
+import requests
+
+r = requests.post(
+    "http://localhost:64747/request-model",
+    json={"hf_name": "Qwen/Qwen2.5-7B-Instruct"}
+)
+
+print(r.json())
+# {"status": "success", "message": "Model loading initiated"}
+```
+
+### Supported Models
+
+Tensorlink supports any Hugging Face `AutoModelForCausalLM` compatible model, for example:
+- **Qwen 3**: `Qwen/Qwen3-14B`, `Qwen/Qwen3-8B`, etc.
+- **Llama 3**: `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.1-70B-Instruct`
+- **Mistral**: `mistralai/Mistral-7B-Instruct-v0.3`, `mistralai/Mixtral-8x7B-Instruct-v0.1`
+- **Phi**: `microsoft/phi-3-mini-4k-instruct`
+- **DeepSeek**: `deepseek-ai/deepseek-coder-33b-instruct`
+
+
+### Notes
+
+- **Temperature**: Values below `0.01` automatically disable sampling to prevent numerical instability
+- **Streaming**: Both endpoints support Server-Sent Events (SSE) streaming via `stream: true`
+- **Token IDs**: Automatically handles missing pad/eos tokens with safe fallbacks
+- **Format Control**: Use `input_format="chat"` and `output_format="openai"` for seamless integration
+
+> For complete examples, error handling, and advanced usage, see [**Examples: HTTP API**](docs/examples/EXAMPLES.md#http-api-examples)
 
 ---
 
