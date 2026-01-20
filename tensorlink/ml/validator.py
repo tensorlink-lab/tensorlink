@@ -1,10 +1,13 @@
 from tensorlink.ml.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, OffloadedModule
+from tensorlink.ml.formatter import ResponseFormatter, normalize_generate_args
 from tensorlink.ml.utils import (
     load_models_cache,
     save_models_cache,
     format_chat_prompt,
+    format_stream_chunk,
+    format_stream_final,
     extract_assistant_response,
 )
 from tensorlink.api.models import GenerationRequest
@@ -30,6 +33,79 @@ SUPPORTED_MODELS_PATH = os.path.join(base_dir, "..", "config", "models.json")
 with open(SUPPORTED_MODELS_PATH, "rb") as f:
     MODELS = json.load(f)
     DEFAULT_MODELS = MODELS["DEFAULT_MODELS"]
+
+
+def _format_response(
+    request,
+    clean_output: str,
+    raw_output: str,
+    processing_time: float,
+):
+    """
+    Format the response based on the requested format type.
+    This runs in the validator process after generation completes.
+
+    Args:
+        request: The original generation request
+        clean_output: Cleaned/extracted output text
+        raw_output: Raw model output
+        processing_time: Time taken to process the request
+
+    Returns:
+        Dictionary formatted according to output_format
+    """
+    timestamp = int(time.time())
+    request_id = getattr(request, 'id')
+
+    if request.output_format == "simple":
+        # Minimal response - just the text (no cleaning for simple)
+        return {"response": raw_output}
+
+    elif request.output_format == "openai":
+        # OpenAI-compatible format (always cleaned)
+        return {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": timestamp,
+            "model": request.hf_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": clean_output},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": getattr(request, 'prompt_tokens', -1),
+                "completion_tokens": getattr(request, 'completion_tokens', -1),
+                "total_tokens": getattr(request, 'total_tokens', -1),
+            },
+        }
+
+    else:  # "full" format (default, comprehensive response with all metadata)
+        # For full format, don't clean unless it's openai-style request
+        output_text = raw_output
+        return {
+            "id": request_id,
+            "model": request.hf_name,
+            "response": output_text,
+            "raw_output": raw_output,
+            "created": timestamp,
+            "processing_time": round(processing_time, 3),
+            "generation_params": {
+                "max_length": request.max_length,
+                "max_new_tokens": request.max_new_tokens,
+                "temperature": request.temperature,
+                "do_sample": request.do_sample,
+                "num_beams": request.num_beams,
+            },
+            "metadata": {
+                "has_history": bool(request.history),
+                "history_length": len(request.history) if request.history else 0,
+                "prompt_used": request.prompt is not None,
+                "formatted_as_chat": request.output_format == "openai",
+            },
+        }
 
 
 class RemoteStreamer:
@@ -462,118 +538,219 @@ class DistributedValidator(DistributedWorker):
     #         }
 
     def _handle_generate_request(self, request: GenerationRequest, job_id: str):
-        # Record the request for tracking
+        """Main entry point for generate requests"""
         self._record_request(request.hf_name)
 
         if not self._is_model_ready(job_id):
-            request.output = (
-                "Model is currently not available through the Tensorlink API."
+            error_response = ResponseFormatter.format_error_response(
+                error_message="Model is currently not available through the Tensorlink API.",
+                error_type="model_unavailable",
+                status_code=503,
+                request_id=str(request.id),
             )
+            request.output = error_response["error"]["message"]
+            request.formatted_response = error_response
+            self.send_request("update_api_request", (request,))
+            return
+
+        start_time = getattr(request, 'start_time', time.time())
 
         if hasattr(request, "stream") and request.stream:
+            # Streaming generation
             self._generate_streaming(request, job_id)
         else:
-            self._generate(request, job_id)
+            # Generate
+            self._generate(request, job_id, start_time)
 
-        # Return the clean response
         self.send_request("update_api_request", (request,))
 
-    def _generate(self, request, job_id):
+    def _generate(self, request, job_id, start_time):
+        """
+        Fetches tokenizer, ensures generate arguments are not problematic with
+        normalize_generate_args, and calls DistributedModel.generate.
+        """
         distributed_model = self.models[job_id]
         tokenizer = self.tokenizers[request.hf_name]
 
-        # Format chat history into a standardized prompt
-        formatted_prompt = format_chat_prompt(
-            request.hf_name, request.message, request.history
+        # FORMAT PROMPT
+        if request.input_format == "chat":
+            formatted_prompt = format_chat_prompt(
+                request.hf_name, request.message, request.history
+            )
+        else:
+            formatted_prompt = request.message
+
+        # TOKENIZE
+        # Get model's max length
+        model_max_length = getattr(tokenizer, 'model_max_length', 2048)
+        if model_max_length > 1000000:
+            model_max_length = 2048
+
+        # Tokenize with appropriate max_length
+        max_length = min(
+            getattr(request, 'max_length', 512),
+            model_max_length - 10,  # Leave room for generation
         )
 
-        # Tokenize formatted prompt
         inputs = tokenizer(
             formatted_prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=request.max_length if request.max_length else 512,
+            max_length=max_length,
         )
 
-        # Generate
-        with torch.no_grad():
-            outputs = distributed_model.generate(
-                inputs.input_ids,
-                max_new_tokens=(
-                    request.max_new_tokens
-                    if hasattr(request, 'max_new_tokens')
-                    else 2048
-                ),
-                temperature=request.temperature if request.temperature else 0.6,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                do_sample=(
-                    request.do_sample if hasattr(request, 'do_sample') else True
-                ),
-                num_beams=request.num_beams if request.num_beams else 1,
-            )
+        prompt_tokens = inputs.input_ids.shape[1]
 
-        # Decode generated tokens
+        # NORMALIZE ARGS WITH PROMPT TOKEN COUNT
+        try:
+            args = normalize_generate_args(
+                request,
+                tokenizer,
+                prompt_tokens=prompt_tokens,
+                model_max_length=model_max_length,
+            )
+            print(f"📊 Generation args: {args}")
+            print(
+                f"📏 Prompt: {prompt_tokens} tokens, Max new: {args['max_new_tokens']} tokens"
+            )
+        except ValueError as e:
+            # Prompt is too long
+            request.output = f"Error: {str(e)}"
+            request.formatted_response = ResponseFormatter.format_error_response(
+                error_message=str(e),
+                error_type="prompt_too_long",
+                status_code=400,
+                request_id=str(request.id),
+            )
+            return
+
+        # GENERATE
+        with torch.no_grad():
+            try:
+                outputs = distributed_model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=args["max_new_tokens"],
+                    temperature=args["temperature"],
+                    pad_token_id=args["pad_token_id"],
+                    eos_token_id=args["eos_token_id"],
+                    do_sample=args["do_sample"],
+                    num_beams=args["num_beams"],
+                    **({} if "top_p" not in args else {"top_p": args["top_p"]}),
+                )
+            except RuntimeError as e:
+                # Handle CUDA OOM or other runtime errors
+                error_msg = f"Generation failed: {str(e)}"
+                request.output = error_msg
+                request.formatted_response = ResponseFormatter.format_error_response(
+                    error_message=error_msg,
+                    error_type="generation_error",
+                    status_code=500,
+                    request_id=str(request.id),
+                )
+                return
+
+        # DECODE
         generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Many models echo the prompt, so remove it
+        # Remove prompt echo
         if generated_text.startswith(formatted_prompt):
-            request.output = generated_text[len(formatted_prompt) :].strip()
+            text = generated_text[len(formatted_prompt) :].strip()
         else:
-            request.output = generated_text
+            text = generated_text.strip()
+
+        # Clean for chat models
+        if request.input_format == "chat":
+            text = extract_assistant_response(text, request.hf_name)
+
+        request.output = text
+
+        # COUNT TOKENS & FORMAT RESPONSE
+        completion_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+
+        request.formatted_response = ResponseFormatter.format_non_streaming_response(
+            request=request,
+            output_text=text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            start_time=start_time,
+        )
 
     def _generate_streaming(self, request: GenerationRequest, job_id: str):
         """
-        Handle streaming generation requests using TextIteratorStreamer.
-        Sends tokens to the API as they're generated.
+        Fetches tokenizer, ensures generate arguments are not problematic with
+        normalize_generate_args, and calls DistributedModel.generate with stream. If model is
+        fully loaded on a single worker, the worker will envoke model.generate with stream and send
+        tokens back to us via the RemoteStreamer. If the model is distributed among multiple workers,
+        the streaming is done directly on this end.
         """
         try:
-            # Prepare input
-            distributed_model: DistributedModel = self.models[job_id]
+            start_time = getattr(request, 'start_time', time.time())
+            distributed_model = self.models[job_id]
             tokenizer = self.tokenizers[request.hf_name]
 
-            # Format chat history into a standardized prompt
-            formatted_prompt = format_chat_prompt(
-                request.hf_name, request.message, request.history
-            )
+            # Format input
+            if request.input_format == "chat":
+                formatted_prompt = format_chat_prompt(
+                    request.hf_name, request.message, request.history
+                )
+            else:
+                formatted_prompt = request.message
 
-            # Tokenize formatted prompt
+            # Tokenize
+            model_max_length = getattr(tokenizer, 'model_max_length', 2048)
+            if model_max_length > 1000000:
+                model_max_length = 2048
+
+            max_length = min(getattr(request, 'max_length', 512), model_max_length - 10)
+
             inputs = tokenizer(
                 formatted_prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=request.max_length if request.max_length else 512,
+                max_length=max_length,
             )
 
             input_ids = inputs.input_ids.to(self.device)
-            # Calculate prompt tokens for usage stats
             prompt_tokens = input_ids.shape[1]
 
-            generation_kwargs = dict(
-                input_ids=input_ids,
-                stream=True,
-                max_new_tokens=(
-                    request.max_new_tokens
-                    if hasattr(request, 'max_new_tokens')
-                    else 2048
-                ),
-                temperature=request.temperature if request.temperature else 0.6,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                do_sample=(
-                    request.do_sample if hasattr(request, 'do_sample') else True
-                ),
-                num_beams=request.num_beams if request.num_beams else 1,
-            )
+            # Normalize args
+            try:
+                args = normalize_generate_args(
+                    request,
+                    tokenizer,
+                    prompt_tokens=prompt_tokens,
+                    model_max_length=model_max_length,
+                )
+            except ValueError as e:
+                # Send error to stream
+                error_chunk = ResponseFormatter.format_stream_error(
+                    error_message=str(e), error_type="prompt_too_long"
+                )
+                self.send_request(
+                    "update_stream",
+                    (request.id, {"done": True, "final_chunk": error_chunk}),
+                )
+                request.output = f"Error: {str(e)}"
+                return
 
-            # Stream tokens as they're generated
-            full_text = ""
-            token_count = 0
+            # Build generation kwargs
+            generation_kwargs = {
+                "input_ids": input_ids,
+                "stream": True,
+                "max_new_tokens": args["max_new_tokens"],
+                "temperature": args["temperature"],
+                "pad_token_id": args["pad_token_id"],
+                "eos_token_id": args["eos_token_id"],
+                "do_sample": args["do_sample"],
+                "num_beams": args["num_beams"],
+            }
 
+            if "top_p" in args:
+                generation_kwargs["top_p"] = args["top_p"]
+
+            # Setup streamer
             if isinstance(distributed_model.model, OffloadedModule):
                 module_id = distributed_model.model.module_id
-                # In the case we have a fully offloaded model, generation is done on the worker side,
-                # and the worker sends us tokens back asynchronously.
                 streamer = RemoteStreamer(
                     poll_fn=lambda: self._poll_remote_token(module_id, tokenizer)
                 )
@@ -581,75 +758,66 @@ class DistributedValidator(DistributedWorker):
                     target=distributed_model.generate, kwargs=generation_kwargs
                 )
                 generation_thread.start()
-
             else:
-                # In the case we fragmented / parsed Distributed Model, generation is done on validator (our)
-                # side, and we generate tokens on our end. Generate must be threaded for asynchronicity
                 streamer = TextIteratorStreamer(
                     tokenizer, skip_prompt=True, skip_special_tokens=True
                 )
-
                 generation_kwargs.pop("stream")
                 generation_kwargs["streamer"] = streamer
-
-                # Start generation in a separate thread
                 generation_thread = Thread(
                     target=distributed_model.generate, kwargs=generation_kwargs
                 )
                 generation_thread.start()
 
+            # Stream tokens
+            full_text = ""
+            token_count = 0
+
             for token_text in streamer:
                 full_text += token_text
                 token_count += 1
 
-                # Send token update to API
-                self.send_request(
-                    "update_stream",
-                    (
-                        request.id,
-                        {
-                            "token": token_text,
-                            "done": False,
-                            "token_id": token_count,
-                            "timestamp": time.time(),
-                        },
-                    ),
+                formatted_chunk = ResponseFormatter.format_stream_chunk(
+                    request=request,
+                    token_text=token_text,
+                    index=token_count,
+                    start_time=start_time,
                 )
 
-            # Clean up the response
-            cleaned_text = extract_assistant_response(full_text, request.hf_name)
-            request.output = cleaned_text  # set the final output on the request object
+                self.send_request(
+                    "update_stream",
+                    (request.id, {"chunk": formatted_chunk, "done": False}),
+                )
 
-            # Send final completion message
+            # Clean output
+            if request.input_format == "chat":
+                cleaned_text = extract_assistant_response(full_text, request.hf_name)
+            else:
+                cleaned_text = full_text
+
+            request.output = cleaned_text
+
+            # Send final chunk
+            final_chunk = ResponseFormatter.format_stream_final(
+                request=request,
+                start_time=start_time,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=token_count,
+                full_text=cleaned_text if request.output_format != "openai" else None,
+            )
+
             self.send_request(
                 "update_stream",
-                (
-                    request.id,
-                    {
-                        "token": "",
-                        "done": True,
-                        "full_text": cleaned_text,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": token_count,
-                        "total_tokens": token_count,
-                        "timestamp": time.time(),
-                    },
-                ),
+                (request.id, {"done": True, "final_chunk": final_chunk}),
             )
 
         except Exception as e:
-            # Send error to API
+            error_chunk = ResponseFormatter.format_stream_error(
+                error_message=str(e), error_type="generation_error"
+            )
             self.send_request(
                 "update_stream",
-                (
-                    request.id,
-                    {
-                        "token": "",
-                        "done": True,
-                        "error": str(e),
-                        "timestamp": time.time(),
-                    },
-                ),
+                (request.id, {"done": True, "final_chunk": error_chunk}),
             )
             request.output = f"Error during generation: {str(e)}"
 

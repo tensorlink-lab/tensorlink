@@ -1,8 +1,9 @@
-from tensorlink.ml.utils import get_popular_model_stats, extract_assistant_response
+from tensorlink.ml.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
     GenerationRequest,
     ModelStatusResponse,
+    ChatCompletionRequest,
 )
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
@@ -15,75 +16,6 @@ import random
 import queue
 import time
 import json
-
-
-def _format_response(
-    request: GenerationRequest,
-    processing_time: float,
-    request_id: str,
-):
-    """
-    Format the response based on the requested format type.
-
-    Args:
-        request: The original generation request with output
-        processing_time: Time taken to process the request
-        request_id: Unique identifier for this request
-
-    Returns:
-        Dictionary formatted according to response_format
-    """
-    timestamp = int(time.time())
-
-    # Extract clean text from output
-    clean_output = extract_assistant_response(request.output, request.hf_name)
-
-    if request.response_format == "simple":
-        # Minimal response - just the text
-        return {"response": clean_output}
-
-    elif request.response_format == "openai":
-        # OpenAI-compatible format
-        return {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": timestamp,
-            "model": request.hf_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": clean_output},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": -1,  # Not tracked in current implementation
-                "completion_tokens": -1,
-                "total_tokens": -1,
-            },
-        }
-
-    else:  # "full" format (default, comprehensive response with all metadata)
-        return {
-            "id": request_id,
-            "model": request.hf_name,
-            "response": clean_output,
-            "raw_output": request.output,
-            "created": timestamp,
-            "processing_time": round(processing_time, 3),
-            "generation_params": {
-                "max_length": request.max_length,
-                "max_new_tokens": request.max_new_tokens,
-                "temperature": request.temperature,
-                "do_sample": request.do_sample,
-                "num_beams": request.num_beams,
-            },
-            "metadata": {
-                "has_history": bool(request.history),
-                "history_length": len(request.history) if request.history else 0,
-                "prompt_used": request.prompt is not None,
-            },
-        }
 
 
 def build_hf_job_data(
@@ -142,13 +74,15 @@ class TensorlinkAPI:
     def _define_routes(self):
         @self.router.post("/v1/generate")
         async def generate(request: GenerationRequest):
+            """Updated /v1/generate endpoint"""
             try:
                 start_time = time.time()
+                request.input_format = getattr(request, "input_format", "raw")
+                request.output_format = getattr(request, "output_format", "simple")
 
                 # Log model request
                 current_time = time.time()
                 self.model_request_timestamps[request.hf_name].append(current_time)
-
                 cutoff = current_time - 300
                 self.model_request_timestamps[request.hf_name] = [
                     ts
@@ -156,7 +90,6 @@ class TensorlinkAPI:
                     if ts > cutoff
                 ]
 
-                # Update request counter
                 if request.hf_name not in self.model_name_to_request:
                     self.model_name_to_request[request.hf_name] = 1
                 self.model_name_to_request[request.hf_name] += 1
@@ -165,40 +98,39 @@ class TensorlinkAPI:
                 request_id = f"req_{hash(random.random())}"
                 request.id = hash(request_id)
 
-                # Check if model is loaded, if not trigger loading
+                # Model status checks
                 model_status = self._check_model_status(request.hf_name)
                 if model_status["status"] == "not_loaded":
-                    # Trigger model loading
                     self._trigger_model_load(request.hf_name)
                     raise HTTPException(
                         status_code=503,
-                        detail=f"Model '{request.hf_name}' has been requested on the network. Please try again in a few "
-                        f"moments, or view available models at https://smartnodes.ca/app.",
+                        detail=f"Model '{request.hf_name}' has been requested on the network. "
+                        f"Please try again in a few moments.",
                     )
                 elif model_status["status"] == "loading":
                     raise HTTPException(
                         status_code=503,
-                        detail=f"Model {request.hf_name} is still loading. Please try again in a few moments.",
+                        detail=f"Model {request.hf_name} is still loading. Please try again.",
                     )
 
-                # Check if streaming is requested
                 stream = getattr(request, 'stream', False)
 
                 if stream:
-                    # Return streaming response
                     return StreamingResponse(
                         self._generate_stream(request, request_id, start_time),
                         media_type="text/event-stream",
                     )
                 else:
-                    # Original non-streaming logic
+                    # Non-streaming
                     self.smart_node.endpoint_requests["incoming"].append(request)
                     request = await self._wait_for_result(request)
-                    processing_time = time.time() - start_time
-                    formatted_response = _format_response(
-                        request, processing_time, request_id
-                    )
-                    return formatted_response
+
+                    # Return formatted response (not just output text)
+                    if hasattr(request, 'formatted_response'):
+                        return request.formatted_response
+                    else:
+                        # Fallback for legacy compatibility
+                        return {"text": request.output}
 
             except HTTPException:
                 raise
@@ -206,57 +138,66 @@ class TensorlinkAPI:
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.router.post("/v1/chat/completions")
-        async def chat_completions(request: Request):
+        async def chat_completions(request: ChatCompletionRequest):
             """
             OpenAI-compatible chat completions endpoint.
-            Accepts OpenAI format and returns OpenAI format.
+            Maps OpenAI request into Tensorlink GenerationRequest.
             """
             try:
-                body = await request.json()
-
-                # Extract OpenAI-style parameters
-                model = body.get("model")
-                messages = body.get("messages", [])
-                temperature = body.get("temperature", 0.7)
-                max_tokens = body.get("max_tokens", 2048)
-
-                # Convert to our internal format
-                history = []
-                current_message = ""
-
-                for msg in messages:
-                    role = msg.get("role")
-                    content = msg.get("content", "")
-
-                    if role == "system":
-                        # System messages added to history
-                        history.append({"role": "system", "content": content})
-                    elif role == "user":
-                        # Last user message becomes current_message
-                        if (
-                            current_message
-                        ):  # If there was a previous user message, add to history
-                            history.append({"role": "user", "content": current_message})
-                        current_message = content
-                    elif role == "assistant":
-                        history.append({"role": "assistant", "content": content})
-
-                if not current_message:
+                if not request.messages:
                     raise HTTPException(
-                        status_code=400,
-                        detail="No user message found in messages array",
+                        status_code=400, detail="messages cannot be empty"
                     )
 
-                # Create our internal request
+                # Separate system messages from conversation
+                system_messages = []
+                conversation = []
+
+                for msg in request.messages:
+                    if msg.role not in ("system", "user", "assistant"):
+                        continue
+
+                    if msg.role == "system":
+                        system_messages.append(msg.content)
+                    else:
+                        conversation.append({"role": msg.role, "content": msg.content})
+
+                # Find last user message
+                last_user_message = None
+                last_user_idx = None
+
+                for idx in range(len(conversation) - 1, -1, -1):
+                    if conversation[idx]["role"] == "user":
+                        last_user_message = conversation[idx]["content"]
+                        last_user_idx = idx
+                        break
+
+                if last_user_message is None:
+                    raise HTTPException(status_code=400, detail="No user message found")
+
+                # Build history (everything before the last user message)
+                history = conversation[:last_user_idx]
+
+                # Prepend system message to history if present
+                if system_messages:
+                    combined_system = "\n".join(system_messages)
+                    history.insert(0, {"role": "system", "content": combined_system})
+
+                # Create GenerationRequest
                 gen_request = GenerationRequest(
-                    hf_name=model,
-                    message=current_message,
-                    history=history if history else None,
-                    temperature=temperature,
-                    max_new_tokens=max_tokens,
-                    response_format="openai",
+                    hf_name=request.model,
+                    message=last_user_message,
+                    history=history,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    max_new_tokens=request.max_tokens,
+                    stream=request.stream,
+                    input_format="chat",
+                    output_format="openai",
+                    do_sample=request.temperature > 0,
                 )
 
+                # Call generate endpoint
                 return await generate(gen_request)
 
             except HTTPException:
@@ -436,66 +377,39 @@ class TensorlinkAPI:
 
             # Mark request as streaming
             request.stream = True
+            request.start_time = start_time  # Make sure start_time is set
 
             # Add to processing queue
             self.smart_node.endpoint_requests["incoming"].append(request)
 
             # Stream tokens as they arrive
-            tokens_generated = 0
-            full_text = ""
-
             while True:
                 try:
                     # Wait for next token with timeout
                     token_data = await asyncio.wait_for(token_queue.get(), timeout=30.0)
 
                     if token_data.get("done"):
-                        # Generation complete
-                        processing_time = time.time() - start_time
-
-                        # Send final message
-                        final_data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(start_time),
-                            "model": request.hf_name,
-                            "choices": [
-                                {"index": 0, "delta": {}, "finish_reason": "stop"}
-                            ],
-                            "usage": {
-                                "prompt_tokens": token_data.get("prompt_tokens", 0),
-                                "completion_tokens": tokens_generated,
-                                "total_tokens": token_data.get("prompt_tokens", 0)
-                                + tokens_generated,
-                            },
-                        }
-                        yield f"data: {json.dumps(final_data)}\n\n"
-                        yield "data: [DONE]\n\n"
+                        # Send final chunk if provided
+                        final_chunk = token_data.get("final_chunk")
+                        if final_chunk:
+                            yield final_chunk
+                        # Also check if there's a token in the done message
+                        elif token_data.get("token"):
+                            yield token_data.get("token")
+                        else:
+                            # Fallback
+                            yield "data: [DONE]\n\n"
                         break
 
-                    # Stream the token
-                    token = token_data.get("token", "")
-                    full_text += token
-                    tokens_generated += 1
-
-                    # Format as SSE (Server-Sent Events)
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(start_time),
-                        "model": request.hf_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": token},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    # Pull fully-formatted SSE string from 'token'
+                    sse_chunk = token_data.get("token")
+                    if sse_chunk:
+                        yield sse_chunk
+                    else:
+                        # Skip empty chunks
+                        continue
 
                 except asyncio.TimeoutError:
-                    # Generation timed out
                     error_chunk = {
                         "error": {
                             "message": "Generation timed out",
@@ -515,13 +429,8 @@ class TensorlinkAPI:
 
     def send_token_to_stream(self, request_id, token=None, done=False, **kwargs):
         """
-        Called by the node to send tokens to the streaming response.
-
-        Args:
-            request_id: The request ID
-            token: The generated token (if not done)
-            done: Whether generation is complete
-            **kwargs: Additional data (e.g., prompt_tokens, error, full_text)
+        Push pre-formatted streaming chunks to the SSE queue.
+        The 'token' here is the full SSE chunk string prepared by the validator.
         """
         if request_id not in self.streaming_responses:
             return
@@ -530,9 +439,11 @@ class TensorlinkAPI:
             return
 
         response_queue = self.streaming_responses[request_id]
+
+        # Build data dictionary to put into the asyncio queue
         data = {"token": token, "done": done, **kwargs}
 
-        # Safely add to queue from potentially different thread
+        # Safely enqueue for StreamingResponse
         asyncio.run_coroutine_threadsafe(response_queue.put(data), self.server_loop)
 
     def _check_model_status(self, model_name: str) -> dict:

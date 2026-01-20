@@ -250,6 +250,49 @@ def format_chat_prompt(model_name, current_message, history):
         return formatted_prompt
 
 
+def format_stream_final(request, start_time, prompt_tokens, token_count):
+    if request.output_format == "openai":
+        return {
+            "id": request.id,
+            "object": "chat.completion.chunk",
+            "created": int(start_time),
+            "model": request.hf_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": token_count,
+                "total_tokens": prompt_tokens + token_count,
+            },
+        }
+
+
+def format_stream_chunk(request, token_text, index, start_time):
+    """Format a single streaming token chunk"""
+    token_text = str(token_text)  # ensure it's always a string
+
+    if request.output_format == "openai":
+        return {
+            "id": request.id,
+            "object": "chat.completion.chunk",
+            "created": int(start_time),
+            "model": request.hf_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": token_text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+    else:
+        return {
+            "id": request.id,
+            "token": token_text,
+            "index": index,
+            "done": False,
+        }
+
+
 def find_module(module: nn.Module, target_name: str, ids: list = []):
     if not list(module.named_children()):
         return
