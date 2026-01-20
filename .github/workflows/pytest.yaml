@@ -9,7 +9,8 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-      max-parallel: 1
+      # Each Python version runs in its own VM, so they can run in parallel
+      # But we'll run test files sequentially within each VM
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
           pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir .
 
-      - name: Run All Tests Sequentially
+      - name: Run Tests Sequentially
         run: |
           poetry run pytest tests/test_node.py -s --disable-warnings
           poetry run pytest tests/test_distributed_model.py -s --disable-warnings
