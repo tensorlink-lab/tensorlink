@@ -9,10 +9,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-        test-group:
-          - tests/test_model_api.py
-          - tests/test_distributed_model.py
-          - tests/test_node.py
+      max-parallel: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +36,8 @@ jobs:
           pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir .
 
-      - name: Run Unit Tests
+      - name: Run All Tests Sequentially
         run: |
-          poetry run pytest ${{ matrix.test-group }} -s --disable-warnings
+          poetry run pytest tests/test_node.py -s --disable-warnings
+          poetry run pytest tests/test_distributed_model.py -s --disable-warnings
+          poetry run pytest tests/test_model_api.py -s --disable-warnings
