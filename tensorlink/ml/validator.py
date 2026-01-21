@@ -581,7 +581,7 @@ class DistributedValidator(DistributedWorker):
                 request.hf_name,
                 request.message,
                 request.history,
-                enable_thinking=request.reasoning,
+                enable_thinking=request.reasoning,  # Use consistent field name
             )
         else:
             formatted_prompt = request.message
@@ -590,10 +590,12 @@ class DistributedValidator(DistributedWorker):
         model_max_length = getattr(tokenizer, 'model_max_length', 2048)
         if model_max_length > 100000:
             model_max_length = 2048
+
         max_length = min(
             getattr(request, 'max_length', 512),
             model_max_length - 10,
         )
+
         inputs = tokenizer(
             formatted_prompt,
             return_tensors="pt",
@@ -615,7 +617,6 @@ class DistributedValidator(DistributedWorker):
             )
 
         except ValueError as e:
-            # Prompt is too long
             request.output = f"Error: {str(e)}"
             request.formatted_response = ResponseFormatter.format_error_response(
                 error_message=str(e),
@@ -628,18 +629,8 @@ class DistributedValidator(DistributedWorker):
         # GENERATE
         with torch.no_grad():
             try:
-                outputs = distributed_model.generate(
-                    input_ids,
-                    # max_new_tokens=args["max_new_tokens"],
-                    # temperature=args["temperature"],
-                    # pad_token_id=args["pad_token_id"],
-                    # eos_token_id=args["eos_token_id"],
-                    # do_sample=args["do_sample"],
-                    # num_beams=args["num_beams"],
-                    # **({} if "top_p" not in args else {"top_p": args["top_p"]}),
-                )
+                outputs = distributed_model.generate(input_ids, **args)
             except RuntimeError as e:
-                # Handle CUDA OOM or other runtime errors
                 error_msg = f"Generation failed: {str(e)}"
                 request.output = error_msg
                 request.formatted_response = ResponseFormatter.format_error_response(
@@ -663,8 +654,8 @@ class DistributedValidator(DistributedWorker):
         if request.input_format == "chat":
             reasoning_text, text = extract_reasoning_and_answer(text)
 
-            # Respect enable_thinking flag
-            if not getattr(request, "enable_thinking", True):
+            # Respect reasoning flag - only include reasoning if explicitly enabled
+            if not request.reasoning:
                 reasoning_text = None
 
         request.output = text
@@ -684,10 +675,7 @@ class DistributedValidator(DistributedWorker):
     def _generate_streaming(self, request: GenerationRequest, job_id: str):
         """
         Fetches tokenizer, ensures generate arguments are not problematic with
-        normalize_generate_args, and calls DistributedModel.generate with stream. If model is
-        fully loaded on a single worker, the worker will envoke model.generate with stream and send
-        tokens back to us via the RemoteStreamer. If the model is distributed among multiple workers,
-        the streaming is done directly on this end.
+        normalize_generate_args, and calls DistributedModel.generate with stream.
         """
         try:
             start_time = getattr(request, 'start_time', time.time())
@@ -700,7 +688,7 @@ class DistributedValidator(DistributedWorker):
                     request.hf_name,
                     request.message,
                     request.history,
-                    enable_thinking=request.reasoning,
+                    enable_thinking=request.reasoning,  # Use consistent field name
                 )
             else:
                 formatted_prompt = request.message
@@ -732,7 +720,6 @@ class DistributedValidator(DistributedWorker):
                     allowed_generate_args=distributed_model._generate_args,
                 )
             except ValueError as e:
-                # Send error to stream
                 error_chunk = ResponseFormatter.format_stream_error(
                     error_message=str(e), error_type="prompt_too_long"
                 )
@@ -745,16 +732,6 @@ class DistributedValidator(DistributedWorker):
 
             # Build generation kwargs
             generation_kwargs = {"input_ids": input_ids, "stream": True, **args}
-            # generation_kwargs = {
-            #     "input_ids": input_ids,
-            #     "stream": True,
-            #     "max_new_tokens": args["max_new_tokens"],
-            #     "temperature": args["temperature"],
-            #     # "pad_token_id": args["pad_token_id"],
-            #     # "eos_token_id": args["eos_token_id"],
-            #     "do_sample": args["do_sample"],
-            #     "num_beams": args["num_beams"],
-            # }
 
             # Setup streamer
             if isinstance(distributed_model.model, OffloadedModule):
