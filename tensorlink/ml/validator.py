@@ -629,7 +629,7 @@ class DistributedValidator(DistributedWorker):
         # GENERATE
         with torch.no_grad():
             try:
-                outputs = distributed_model.generate(input_ids, **args)
+                outputs = distributed_model.generate(input_ids)
             except RuntimeError as e:
                 error_msg = f"Generation failed: {str(e)}"
                 request.output = error_msg
@@ -731,10 +731,11 @@ class DistributedValidator(DistributedWorker):
                 return
 
             # Build generation kwargs
-            generation_kwargs = {"input_ids": input_ids, "stream": True, **args}
+            generation_kwargs = {"input_ids": input_ids, "stream": True}
 
             # Setup streamer
             if isinstance(distributed_model.model, OffloadedModule):
+                generation_kwargs.update(**args)
                 module_id = distributed_model.model.module_id
                 streamer = RemoteStreamer(
                     poll_fn=lambda: self._poll_remote_token(module_id, tokenizer)

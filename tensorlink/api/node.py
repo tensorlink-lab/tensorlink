@@ -5,6 +5,7 @@ from tensorlink.api.models import (
     ModelStatusResponse,
     ChatCompletionRequest,
 )
+from tensorlink.ml.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from collections import defaultdict
@@ -378,7 +379,7 @@ class TensorlinkAPI:
 
             # Mark request as streaming
             request.stream = True
-            request.start_time = start_time  # Make sure start_time is set
+            request.start_time = start_time
 
             # Add to processing queue
             self.smart_node.endpoint_requests["incoming"].append(request)
@@ -389,20 +390,14 @@ class TensorlinkAPI:
                     # Wait for next token with timeout
                     token_data = await asyncio.wait_for(token_queue.get(), timeout=30.0)
 
+                    # Check if generation is complete
                     if token_data.get("done"):
-                        # Send final chunk if provided
-                        final_chunk = token_data.get("final_chunk")
-                        if final_chunk:
-                            yield final_chunk
-                        # Also check if there's a token in the done message
-                        elif token_data.get("token"):
-                            yield token_data.get("token")
-                        else:
-                            # Fallback
-                            yield "data: [DONE]\n\n"
+                        # Get the SSE-formatted string (could be final chunk or error)
+                        sse_chunk = token_data.get("token", "data: [DONE]\n\n")
+                        yield sse_chunk
                         break
 
-                    # Pull fully-formatted SSE string from 'token'
+                    # Get the SSE-formatted chunk string
                     sse_chunk = token_data.get("token")
                     if sse_chunk:
                         yield sse_chunk
@@ -411,18 +406,17 @@ class TensorlinkAPI:
                         continue
 
                 except asyncio.TimeoutError:
-                    error_chunk = {
-                        "error": {
-                            "message": "Generation timed out",
-                            "type": "timeout_error",
-                        }
-                    }
-                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    error_chunk = ResponseFormatter.format_stream_error(
+                        error_message="Generation timed out", error_type="timeout_error"
+                    )
+                    yield error_chunk
                     break
 
         except Exception as e:
-            error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            error_chunk = ResponseFormatter.format_stream_error(
+                error_message=str(e), error_type="internal_error"
+            )
+            yield error_chunk
         finally:
             # Clean up
             if request.id in self.streaming_responses:
