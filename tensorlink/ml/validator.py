@@ -581,26 +581,19 @@ class DistributedValidator(DistributedWorker):
                 request.hf_name,
                 request.message,
                 request.history,
-                enable_thinking=(
-                    getattr(request, "enable_thinking", False)
-                    or getattr(request, "reasoning", False)
-                ),
+                enable_thinking=request.reasoning,
             )
         else:
             formatted_prompt = request.message
 
         # TOKENIZE
-        # Get model's max length
         model_max_length = getattr(tokenizer, 'model_max_length', 2048)
         if model_max_length > 100000:
             model_max_length = 2048
-
-        # Tokenize with appropriate max_length
         max_length = min(
             getattr(request, 'max_length', 512),
             model_max_length - 10,
         )
-
         inputs = tokenizer(
             formatted_prompt,
             return_tensors="pt",
@@ -707,10 +700,7 @@ class DistributedValidator(DistributedWorker):
                     request.hf_name,
                     request.message,
                     request.history,
-                    enable_thinking=(
-                        getattr(request, "enable_thinking", False)
-                        or getattr(request, "reasoning", False)
-                    ),
+                    enable_thinking=request.reasoning,
                 )
             else:
                 formatted_prompt = request.message
@@ -790,30 +780,61 @@ class DistributedValidator(DistributedWorker):
             # Stream tokens
             full_text = ""
             token_count = 0
+            in_reasoning_block = False
+            reasoning_buffer = ""
 
             for token_text in streamer:
                 full_text += token_text
-                token_count += 1
 
-                formatted_chunk = ResponseFormatter.format_stream_chunk(
-                    request=request,
-                    token_text=token_text,
-                    index=token_count,
-                    start_time=start_time,
-                )
+                # Track if we're inside a reasoning block (simple detection)
+                if request.input_format == "chat" and not request.reasoning:
+                    # Check for start of reasoning tags
+                    if re.search(
+                        r'<\s*(think|reflection|thought|internal|analysis)\s*>',
+                        reasoning_buffer + token_text,
+                        re.IGNORECASE,
+                    ):
+                        in_reasoning_block = True
+                        reasoning_buffer += token_text
+                        continue
 
-                self.send_request(
-                    "update_stream",
-                    (request.id, {"chunk": formatted_chunk, "done": False}),
-                )
+                    # Check for end of reasoning tags
+                    if in_reasoning_block:
+                        reasoning_buffer += token_text
+                        if re.search(
+                            r'<\s*/\s*(think|reflection|thought|internal|analysis)\s*>',
+                            reasoning_buffer,
+                            re.IGNORECASE,
+                        ):
+                            in_reasoning_block = False
+                            reasoning_buffer = ""
+                        continue
+
+                # Only send non-reasoning tokens when reasoning is disabled
+                if not in_reasoning_block:
+                    token_count += 1
+                    formatted_chunk = ResponseFormatter.format_stream_chunk(
+                        request=request,
+                        token_text=token_text,
+                        index=token_count,
+                        start_time=start_time,
+                    )
+
+                    self.send_request(
+                        "update_stream",
+                        (request.id, {"chunk": formatted_chunk, "done": False}),
+                    )
 
             reasoning_text = None
+            cleaned_text = full_text
 
-            # Clean output
+            # Extract reasoning and clean output
             if request.input_format == "chat":
-                cleaned_text = extract_reasoning_and_answer(full_text)
-            else:
-                cleaned_text = full_text
+                reasoning_text, cleaned_text = extract_reasoning_and_answer(full_text)
+
+                # Only include reasoning if explicitly enabled
+                if not request.reasoning:
+                    reasoning_text = None
 
             request.output = cleaned_text
 
@@ -823,7 +844,8 @@ class DistributedValidator(DistributedWorker):
                 start_time=start_time,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=token_count,
-                full_text=cleaned_text if request.output_format != "openai" else None,
+                full_text=cleaned_text,
+                reasoning_text=reasoning_text,
             )
 
             self.send_request(
