@@ -1,5 +1,3 @@
-import os
-
 from tensorlink.ml.utils import get_gpu_memory
 from tensorlink.nodes.shared_memory import get_from_shared_memory
 from tensorlink.p2p.connection import Connection
@@ -9,13 +7,47 @@ from multiprocessing import shared_memory
 import logging
 import queue
 import threading
-import time
 import json
+import os
+import time
 import psutil
 
 
 MSG_TOKEN = b"TOKEN"
 MSG_STREAM_END = b"END__"
+
+
+def _bar(current, total, width=20):
+    if total <= 0:
+        return "?" * width
+    ratio = min(max(current / total, 0), 1)
+    filled = int(width * ratio)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_gb(x):
+    return f"{x / 1e9:.2f}"
+
+
+def _uptime(start_time):
+    s = int(time.time() - start_time)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02}:{m:02}:{s:02}"
+
+
+class ANSI:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    GRAY = "\033[90m"
 
 
 def format_size(size_bytes):
@@ -59,6 +91,8 @@ class Torchnode(Smartnode):
 
         # Available GPU mpc estimation
         self.available_gpu_memory = get_gpu_memory()
+        self.total_gpu_memory = self.available_gpu_memory
+        self.available_ram = psutil.virtual_memory().available
 
         self._mpc_comms = None
         self.memory_manager = {}
@@ -853,14 +887,79 @@ class Torchnode(Smartnode):
         self.debug_print("Shutting down distributed ML processes...", tag="Torchnode")
         self._mpc_comms.join()
 
-    def print_base_status(self):
+    def print_ui_status(self):
+        used_vram = self.total_gpu_memory - self.available_gpu_memory
+        total_vram = self.total_gpu_memory
+        actual_vram = get_gpu_memory()
+
+        ram = psutil.virtual_memory()
+        used_ram = ram.total - ram.available
+
+        streams = len(getattr(self, "stream_buffers", {}))
+        modules = len(self.modules)
+
+        in_q = len(getattr(self, "endpoint_requests", {}).get("incoming", []))
+        out_q = len(getattr(self, "endpoint_requests", {}).get("outgoing", []))
+
+        def c(label, colour):
+            return f"{colour}{label}{ANSI.RESET}"
+
+        def line(label, value, colour=ANSI.CYAN):
+            return f"{c(label + ':', ANSI.DIM):<16} {colour}{value}{ANSI.RESET}"
+
+        width = 80
+        sep = f"{ANSI.DIM}{'─' * width}{ANSI.RESET}"
+
+        # --- Header ---
+        role_name = "Validator" if self.role.startswith("V") else "Worker"
+        title = f" Tensorlink {role_name} Node "
+
+        print()
+        print(sep)
+        print(f"{ANSI.BOLD}{ANSI.MAGENTA}{title.center(width)}{ANSI.RESET}")
+        print(sep)
+
+        # --- Identity ---
+        print(line("Node ID", self.rsa_key_hash, ANSI.YELLOW))
+        print(line("Address", f"{self.host}:{self.port}", ANSI.GREEN))
+        print(line("Uptime", _uptime(self._start_time), ANSI.BLUE))
+
+        # --- Network ---
+        print(sep)
+        print(line("Connections", len(self.nodes), ANSI.CYAN))
+        print(line("    Workers", len(self.workers), ANSI.CYAN))
+        print(line("    Validators", len(self.validators), ANSI.CYAN))
+        print(line("    Users", len(self.users), ANSI.CYAN))
+
+        # --- Resources ---
+        print(sep)
+
+        vram_bar_estimate = _bar(total_vram - used_vram, total_vram)
+        vram_bar = _bar(total_vram - actual_vram, total_vram)
+        ram_bar = _bar(used_ram, ram.total)
+
         print(
-            f"\n=========== Node Status Report ({'Worker' if self.role == 'W' else 'Validator'}) ==========="
+            f"{ANSI.DIM}{'VRAM':<14}:{ANSI.RESET} "
+            f"{ANSI.MAGENTA}[{vram_bar_estimate}]{ANSI.RESET} "
+            f"{ANSI.MAGENTA}[{vram_bar}]{ANSI.RESET} "
+            f"{ANSI.YELLOW}{_fmt_gb(used_vram)} / {_fmt_gb(total_vram)} GB{ANSI.RESET}"
         )
-        print(f" Node ID: {self.rsa_key_hash} ({self.host}:{self.port})")
-        print(f" Connections: {len(self.nodes)}")
-        print(f"    Workers: {self.workers}")
-        print(f"    Validators: {self.validators}")
-        print(f"    Users: {self.users}")
-        print(f" VRAM Available: {self.available_gpu_memory / 1e9:.2f} GB")
-        print(f" RAM Available: {psutil.virtual_memory().available / 1e9:.2f} GB")
+
+        print(
+            f"{ANSI.DIM}{'RAM':<14}:{ANSI.RESET} "
+            f"{ANSI.GREEN}[{ram_bar}]{ANSI.RESET} "
+            f"{ANSI.YELLOW}{_fmt_gb(used_ram)} / {_fmt_gb(ram.total)} GB{ANSI.RESET}"
+        )
+
+        print(line("Modules", modules, ANSI.MAGENTA))
+
+        # --- Validator ---
+        if self.role.startswith("V"):
+            print(sep)
+            print(line("Proposal ID", self.current_proposal, ANSI.YELLOW))
+            print(line("Streams", streams, ANSI.BLUE))
+            print(line("API Jobs", f"in={in_q} out={out_q}", ANSI.CYAN))
+            print(line("Queues", f"in={in_q} out={out_q}", ANSI.CYAN))
+
+        print(sep)
+        print()

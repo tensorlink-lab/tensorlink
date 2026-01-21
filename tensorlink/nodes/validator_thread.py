@@ -970,7 +970,7 @@ class ValidatorThread(Torchnode):
                 self.clean_port_mappings()
                 self.get_workers()
             if counter % 180 == 0:
-                self.print_status()
+                self.print_ui_status()
 
             time.sleep(1)
             counter += 1
@@ -978,11 +978,6 @@ class ValidatorThread(Torchnode):
     def stop(self):
         self.keeper.write_state()
         super().stop()
-
-    def print_status(self):
-        self.print_base_status()
-        print(f" Current Proposal: {self.current_proposal}")
-        print("=============================================\n")
 
     def get_tensorlink_status(self):
         # Path to package root (where this file lives)

@@ -273,6 +273,7 @@ class Smartnode(threading.Thread):
             self.upnp = False
 
         self.public_key = None
+        self._start_time = time.time()
 
         # DHT Storage
         self.dht = DHT(self)

@@ -5,7 +5,6 @@ from tensorlink.nodes.keeper import Keeper
 
 import torch.nn as nn
 from dotenv import get_key
-import psutil
 import hashlib
 import json
 import logging
@@ -60,9 +59,7 @@ class WorkerThread(Torchnode):
             level=logging.INFO,
             tag="Worker",
         )
-        self.available_gpu_memory = get_gpu_memory()
-        self.total_gpu_memory = self.available_gpu_memory
-        self.available_ram = psutil.virtual_memory().available
+
         self.mining_active = mining_active
         self.reserved_memory = reserved_memory
 
@@ -210,7 +207,7 @@ class WorkerThread(Torchnode):
             if counter % 180 == 0:
                 self.keeper.clean_node()
                 self.clean_port_mappings()
-                self.print_status()
+                self.print_ui_status()
 
             time.sleep(1)
             counter += 1
@@ -267,7 +264,3 @@ class WorkerThread(Torchnode):
 
     def activate(self):
         self.training = True
-
-    def print_status(self):
-        self.print_base_status()
-        print("=============================================\n")

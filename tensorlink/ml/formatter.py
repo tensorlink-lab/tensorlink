@@ -121,12 +121,7 @@ def normalize_generate_args(
     if top_p is not None:
         top_p = max(0.0, min(top_p, 1.0))
 
-    # OPTIONAL EXTENSIONS
-    reasoning = getattr(request, "reasoning", None)
-    enable_thinking = getattr(request, "enable_thinking", None)
-
     # BUILD ARGS DICT and FILTER BY GENERATE SIGNATURE
-    # Build args dict as before
     args = {
         "pad_token_id": pad_token_id,
         "eos_token_id": eos_token_id,
