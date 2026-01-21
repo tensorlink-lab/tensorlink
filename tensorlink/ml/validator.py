@@ -629,7 +629,7 @@ class DistributedValidator(DistributedWorker):
         # GENERATE
         with torch.no_grad():
             try:
-                outputs = distributed_model.generate(input_ids, **args)
+                outputs = distributed_model.generate(input_ids)
             except RuntimeError as e:
                 error_msg = f"Generation failed: {str(e)}"
                 request.output = error_msg
@@ -653,6 +653,7 @@ class DistributedValidator(DistributedWorker):
         reasoning_text = None
         if request.input_format == "chat":
             reasoning_text, text = extract_reasoning_and_answer(text)
+            print(reasoning_text)
 
             # Respect reasoning flag - only include reasoning if explicitly enabled
             if not request.reasoning:
@@ -731,10 +732,11 @@ class DistributedValidator(DistributedWorker):
                 return
 
             # Build generation kwargs
-            generation_kwargs = {"input_ids": input_ids, "stream": True, **args}
+            generation_kwargs = {"input_ids": input_ids, "stream": True}
 
             # Setup streamer
             if isinstance(distributed_model.model, OffloadedModule):
+                generation_kwargs.update(**args)
                 module_id = distributed_model.model.module_id
                 streamer = RemoteStreamer(
                     poll_fn=lambda: self._poll_remote_token(module_id, tokenizer)
@@ -759,35 +761,38 @@ class DistributedValidator(DistributedWorker):
             token_count = 0
             in_reasoning_block = False
             reasoning_buffer = ""
+            start_re = re.compile(
+                r'<\s*(think|reflection|thought|internal|analysis)\s*>',
+                re.IGNORECASE,
+            )
+            end_re = re.compile(
+                r'<\s*/\s*(think|reflection|thought|internal|analysis)\s*>',
+                re.IGNORECASE,
+            )
 
             for token_text in streamer:
                 full_text += token_text
 
-                # Track if we're inside a reasoning block (simple detection)
                 if request.input_format == "chat" and not request.reasoning:
-                    # Check for start of reasoning tags
-                    if re.search(
-                        r'<\s*(think|reflection|thought|internal|analysis)\s*>',
-                        reasoning_buffer + token_text,
-                        re.IGNORECASE,
-                    ):
-                        in_reasoning_block = True
-                        reasoning_buffer += token_text
-                        continue
 
-                    # Check for end of reasoning tags
-                    if in_reasoning_block:
+                    # ENTER only if we're NOT already inside
+                    if not in_reasoning_block:
+                        if start_re.search(token_text):
+                            print(f"ENTERING REASON: {token_text}")
+                            in_reasoning_block = True
+                            reasoning_buffer = token_text
+                            continue
+
+                    # EXIT only if we ARE inside
+                    else:
                         reasoning_buffer += token_text
-                        if re.search(
-                            r'<\s*/\s*(think|reflection|thought|internal|analysis)\s*>',
-                            reasoning_buffer,
-                            re.IGNORECASE,
-                        ):
+                        if end_re.search(reasoning_buffer):
+                            print(f"EXITING REASON: {token_text}")
                             in_reasoning_block = False
                             reasoning_buffer = ""
                         continue
 
-                # Only send non-reasoning tokens when reasoning is disabled
+                # Only emit visible tokens when not in reasoning
                 if not in_reasoning_block:
                     token_count += 1
                     formatted_chunk = ResponseFormatter.format_stream_chunk(

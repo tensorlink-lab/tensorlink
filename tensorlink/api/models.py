@@ -17,19 +17,20 @@ class JobRequest(BaseModel):
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    # Input fields
     hf_name: str
     message: str
+
+    # Generation params (all optional)
+    max_new_tokens: Optional[int] = None
+    max_length: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    do_sample: Optional[bool] = None
+    num_beams: Optional[int] = None
+    reasoning: Optional[bool] = None
+
     prompt: str = None
     model_type: Optional[str] = "auto"
-
-    # Generation parameters
-    max_length: int = 2048
-    max_new_tokens: int = 2048
-    temperature: float = 0.7
-    do_sample: bool = True
-    num_beams: int = 1
-    reasoning: bool = False
 
     # Chat/history
     history: Optional[List[dict]] = None
