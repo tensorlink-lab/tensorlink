@@ -32,13 +32,22 @@ MODELS = [
     ),
     pytest.param(
         {
-            "name": "HuggingFaceTB/SmolLM-135M",
+            "name": "HuggingFaceTB/SmolLM2-135M",
             "timeout": 120,
             "sleep": 10,
             "parsed": True,
         },
-        id="smollm-135m",
+        id="smollm2-135m",
     ),
+    # pytest.param(
+    #     {
+    #         "name": "BabyLM-community/babylm-baseline-100m-gpt2",
+    #         "timeout": 120,
+    #         "sleep": 10,
+    #         "parsed": True,
+    #     },
+    #     id="babylm-baseline-100m-gpt2",
+    # ),
 ]
 
 
@@ -81,7 +90,6 @@ def test_generate_simple(model_env):
         "hf_name": cfg["name"],
         "message": "Hi.",
         "max_new_tokens": 10,
-        "do_sample": True,
         "num_beams": 2,
         "output_format": "simple",  # Explicitly set to simple
     }
@@ -207,7 +215,6 @@ def test_streaming_generation_openai(model_env):
         "message": "Hi there, tell me something interesting.",
         "max_new_tokens": 10,
         "stream": True,
-        "do_sample": False,
         "num_beams": 1,
         "output_format": "openai",
     }
@@ -273,7 +280,6 @@ def test_streaming_generation_simple(model_env):
         "message": "Hi there, tell me something interesting.",
         "max_new_tokens": 10,
         "stream": True,
-        "do_sample": False,
         "num_beams": 1,
         "output_format": "simple",
     }

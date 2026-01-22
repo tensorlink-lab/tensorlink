@@ -8,8 +8,6 @@ from tensorlink.ml.formatter import (
     ResponseFormatter,
     normalize_generate_args,
     format_chat_prompt,
-    format_stream_chunk,
-    format_stream_final,
     extract_reasoning_and_answer,
 )
 from tensorlink.ml.utils import load_models_cache, save_models_cache
@@ -36,79 +34,6 @@ SUPPORTED_MODELS_PATH = os.path.join(base_dir, "..", "config", "models.json")
 with open(SUPPORTED_MODELS_PATH, "rb") as f:
     MODELS = json.load(f)
     DEFAULT_MODELS = MODELS["DEFAULT_MODELS"]
-
-
-def _format_response(
-    request,
-    clean_output: str,
-    raw_output: str,
-    processing_time: float,
-):
-    """
-    Format the response based on the requested format type.
-    This runs in the validator process after generation completes.
-
-    Args:
-        request: The original generation request
-        clean_output: Cleaned/extracted output text
-        raw_output: Raw model output
-        processing_time: Time taken to process the request
-
-    Returns:
-        Dictionary formatted according to output_format
-    """
-    timestamp = int(time.time())
-    request_id = getattr(request, 'id')
-
-    if request.output_format == "simple":
-        # Minimal response - just the text (no cleaning for simple)
-        return {"response": raw_output}
-
-    elif request.output_format == "openai":
-        # OpenAI-compatible format (always cleaned)
-        return {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": timestamp,
-            "model": request.hf_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": clean_output},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": getattr(request, 'prompt_tokens', -1),
-                "completion_tokens": getattr(request, 'completion_tokens', -1),
-                "total_tokens": getattr(request, 'total_tokens', -1),
-            },
-        }
-
-    else:  # "full" format (default, comprehensive response with all metadata)
-        # For full format, don't clean unless it's openai-style request
-        output_text = raw_output
-        return {
-            "id": request_id,
-            "model": request.hf_name,
-            "response": output_text,
-            "raw_output": raw_output,
-            "created": timestamp,
-            "processing_time": round(processing_time, 3),
-            "generation_params": {
-                "max_length": request.max_length,
-                "max_new_tokens": request.max_new_tokens,
-                "temperature": request.temperature,
-                "do_sample": request.do_sample,
-                "num_beams": request.num_beams,
-            },
-            "metadata": {
-                "has_history": bool(request.history),
-                "history_length": len(request.history) if request.history else 0,
-                "prompt_used": request.prompt is not None,
-                "formatted_as_chat": request.output_format == "openai",
-            },
-        }
 
 
 class RemoteStreamer:
@@ -142,6 +67,29 @@ class RemoteStreamer:
             return token
 
 
+def _supports_reasoning(tokenizer):
+    """
+    Check if a tokenizer supports reasoning mode (enable_thinking parameter).
+
+    Args:
+        tokenizer: HuggingFace tokenizer instance
+
+    Returns:
+        bool: True if tokenizer supports enable_thinking parameter
+    """
+    if not hasattr(tokenizer, 'apply_chat_template'):
+        return False
+
+    try:
+        # Get the signature of apply_chat_template
+        sig = inspect.signature(tokenizer.apply_chat_template)
+
+        # Check if 'enable_thinking' is a parameter
+        return 'enable_thinking' in sig.parameters
+    except Exception:
+        return False
+
+
 def _post_process_output(request, tokenizer, formatted_prompt, text):
     # Remove prompt echo
     if text.startswith(formatted_prompt):
@@ -150,10 +98,18 @@ def _post_process_output(request, tokenizer, formatted_prompt, text):
         text = text.strip()
 
     reasoning_text = None
+
+    # Only extract reasoning if chat format AND reasoning is supported/enabled
     if request.input_format == "chat":
-        reasoning_text, text = extract_reasoning_and_answer(text)
-        if not request.reasoning:
-            reasoning_text = None
+        reasoning_supported = getattr(request, '_reasoning_supported', False)
+
+        # Extract reasoning blocks if the model/tokenizer supports it
+        if reasoning_supported:
+            reasoning_text, text = extract_reasoning_and_answer(text)
+
+            # Only include reasoning in response if explicitly requested
+            if not request.reasoning:
+                reasoning_text = None
 
     return reasoning_text, text
 
@@ -562,14 +518,26 @@ class DistributedValidator(DistributedWorker):
 
         # FORMAT PROMPT
         if request.input_format == "chat":
-            formatted_prompt = format_chat_prompt(
+            formatted_prompt, reasoning_supported = format_chat_prompt(
                 request.hf_name,
                 request.message,
                 request.history,
                 enable_thinking=request.reasoning,
+                tokenizer=tokenizer,
             )
+
+            # Track whether reasoning is actually supported
+            request._reasoning_supported = reasoning_supported
+
+            # Log if reasoning was requested but not supported
+            if request.reasoning and not reasoning_supported:
+                print(
+                    f"Note: Reasoning requested for {request.hf_name} but tokenizer "
+                    f"doesn't support enable_thinking. Using manual prompt formatting."
+                )
         else:
             formatted_prompt = request.message
+            request._reasoning_supported = False
 
         # TOKENIZE
         model_max_length = getattr(tokenizer, "model_max_length", 2048)
@@ -603,6 +571,7 @@ class DistributedValidator(DistributedWorker):
             "formatted_prompt": formatted_prompt,
             "input_ids": input_ids,
             "prompt_tokens": prompt_tokens,
+            "reasoning_supported": getattr(request, '_reasoning_supported', False),
             "args": args,
         }
 
@@ -762,12 +731,14 @@ class DistributedValidator(DistributedWorker):
 
                     if not in_reasoning_block:
                         if start_re.search(token_text):
+                            print(f"ENTERING REASONING: {token_text}")
                             in_reasoning_block = True
                             reasoning_buffer = token_text
                             continue
                     else:
                         reasoning_buffer += token_text
                         if end_re.search(reasoning_buffer):
+                            print(f"EXITING REASONING: {token_text}")
                             in_reasoning_block = False
                             reasoning_buffer = ""
                         continue
@@ -790,9 +761,11 @@ class DistributedValidator(DistributedWorker):
             # ---- Finalize ----
             reasoning_text = None
             cleaned_text = full_text
-
+            print(f"FINAL_TEXT: {cleaned_text}")
             if request.input_format == "chat":
                 reasoning_text, cleaned_text = extract_reasoning_and_answer(full_text)
+                print(f"REASON_TEXT: {cleaned_text}")
+                print(f"FINAL_TEXT: {cleaned_text}")
                 if not request.reasoning:
                     reasoning_text = None
 
@@ -967,7 +940,9 @@ class DistributedValidator(DistributedWorker):
 
             # Load tokenizer
             if model_name not in self.tokenizers:
-                self.tokenizers[model_name] = AutoTokenizer.from_pretrained(model_name)
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                setattr(tokenizer, "supports_reasoning", _supports_reasoning(tokenizer))
+                self.tokenizers[model_name] = tokenizer
 
             setattr(distributed_model, 'tokenizer', self.tokenizers[model_name])
 

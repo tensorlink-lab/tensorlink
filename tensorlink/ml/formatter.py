@@ -158,10 +158,12 @@ def extract_reasoning_and_answer(text: str):
     return reasoning, cleaned or "[No output produced]"
 
 
-def format_chat_prompt(model_name, current_message, history, enable_thinking=True):
+def format_chat_prompt_manual(
+    model_name, current_message, history, enable_thinking=True
+):
     """
-    Format the chat history and current message into a prompt suitable for
-    the specified model.
+    Manually format the chat history and current message into a prompt.
+    This is the fallback for models without native reasoning support.
 
     Args:
         model_name: Name of the model
@@ -177,7 +179,7 @@ def format_chat_prompt(model_name, current_message, history, enable_thinking=Tru
 
         # Modify system prompt to discourage thinking if disabled
         if not enable_thinking:
-            system_prompt += " Provide concise, direct answers without showing your reasoning process."
+            system_prompt += " Provide concise, direct answers without showing your reasoning/thinking process."
 
         formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
 
@@ -231,6 +233,52 @@ def format_chat_prompt(model_name, current_message, history, enable_thinking=Tru
 
         formatted_prompt += f"User: {current_message}\n\nAssistant: "
         return formatted_prompt
+
+
+def format_chat_prompt(
+    model_name, current_message, history, enable_thinking=True, tokenizer=None
+):
+    """
+    Format the chat history and current message into a prompt.
+    Uses tokenizer's apply_chat_template if it supports enable_thinking,
+    otherwise falls back to manual formatting.
+
+    Args:
+        model_name: Name of the model
+        current_message: Current user message
+        history: Conversation history
+        enable_thinking: Whether to allow reasoning/thinking tokens
+        tokenizer: Optional tokenizer instance (if None, uses manual formatting)
+
+    Returns:
+        tuple: (formatted_prompt, reasoning_supported)
+    """
+    supports_reasoning = getattr(tokenizer, "supports_reasoning", False)
+    # Check if tokenizer supports native reasoning
+    if tokenizer and supports_reasoning:
+        # Build messages list
+        messages = []
+        if history and len(history) > 0:
+            messages.extend(history)
+        messages.append({"role": "user", "content": current_message})
+
+        # Use tokenizer's native reasoning support
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+
+        return formatted_prompt, True
+
+    else:
+        # Fall back to manual formatting
+        formatted_prompt = format_chat_prompt_manual(
+            model_name, current_message, history, enable_thinking=enable_thinking
+        )
+
+        return formatted_prompt, False
 
 
 def format_stream_final(request, start_time, prompt_tokens, token_count):
