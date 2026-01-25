@@ -448,12 +448,17 @@ class TensorlinkAPI:
 
         try:
             # Check if there is a public job with this module
-            for module_id, module in self.smart_node.modules.items():
-                if module.get("model_name", "") == model_name:
-                    if module.get("public", False):
-                        status = "loaded"
-                        message = f"Model {model_name} is loaded and ready"
-                        break
+            for job_id in self.smart_node.jobs:
+                job_data = self.smart_node.dht.query(job_id)
+                if (
+                    job_data.get("model_name", "") == model_name
+                    and job_data.get("hosted")
+                    and job_data.get("api")
+                    and job_data.get("public")
+                ):
+                    status = "loaded"
+                    message = f"Model {model_name} is loaded and ready"
+                    break
 
         except Exception as e:
             logging.error(f"Error checking model status: {e}")

@@ -250,9 +250,10 @@ class DistributedModel(nn.Module):
 
     def forward(self, *args, **kwargs):
         """
-        Performs the forward pass through the model.
-        - Splits input into micro-batches and runs them in parallel.
-        - Creates multiple parallel streams of workers for model parallel acceleration
+        Performs the forward pass through the distributed model, sending intermediate
+        forward tensors to downstream workers.
+        - optional: splitting inputs into micro-batches and running them in parallel.
+        - optional: multiple parallel streams of workers for model parallel acceleration
         """
         if not args and "input_ids" in kwargs:
             args = kwargs.pop("input_ids")
@@ -1208,7 +1209,7 @@ class OffloadedModule(nn.Module):
 
         # Relay forward pass to next roles
         self.parent_model.send_request(
-            "send_forward", (self.worker_id, size, shm_name, tag)
+            "send_forward", (self.worker_id, self.module_id, size, shm_name, tag)
         )
 
         # Wait for response, change to appending waiting thread to list in master

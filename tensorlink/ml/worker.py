@@ -187,7 +187,7 @@ class DistributedWorker:
         self.scaler = None
         self.use_amp = False
 
-        self.GC_CHECK_INTERVAL = 1_000
+        self.GC_CHECK_INTERVAL = 2_000
         self.CHECK_COUNTER = 1
 
         # Initialize CUDA streams for overlapping operations
@@ -362,7 +362,7 @@ class DistributedWorker:
         output_bytes = tensor_to_bytes(detached_out)
         size, name = store_in_shared_memory(output_bytes)
 
-        self.send_request("send_forward", (module.host, size, name, key))
+        self.send_request("send_forward", (module.host, module_id, size, name, key))
 
         # Incremental training counter
         if module.training:
@@ -443,7 +443,7 @@ class DistributedWorker:
                 self._send_stream_end(module_id, host_id)
 
         size, name = store_in_shared_memory(output_bytes)
-        self.send_request("send_forward", (host_id, size, name, "generate"))
+        self.send_request("send_forward", (host_id, module_id, size, name, "generate"))
 
         if self.device.type == "cuda":
             torch.cuda.empty_cache()

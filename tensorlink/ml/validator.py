@@ -1,6 +1,3 @@
-import inspect
-import re
-
 from tensorlink.ml.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, OffloadedModule
@@ -10,16 +7,18 @@ from tensorlink.ml.formatter import (
     format_chat_prompt,
     extract_reasoning_and_answer,
 )
-from tensorlink.ml.utils import load_models_cache, save_models_cache
+from tensorlink.ml.utils import load_models_cache, save_models_cache, get_gpu_memory
 from tensorlink.api.models import GenerationRequest
 
 from transformers import AutoTokenizer, TextIteratorStreamer
 from collections import defaultdict
-from threading import Thread
+from threading import Thread, Lock
 import torch
 import logging
+import inspect
 import json
 import time
+import re
 import gc
 import os
 
@@ -127,13 +126,20 @@ class DistributedValidator(DistributedWorker):
 
         self.tokenizers = {}
 
-        # Track models that are in the process of being initialized (job_id)
-        self.models_initializing = set()
+        # Track models that are in the process of being initialized
+        self.models_initializing = set()  # job_id
 
         # Configuration
         self.TRACKING_DAYS = 7  # Track requests for past 7 days
         self.MIN_REQUESTS_THRESHOLD = 10  # Minimum requests to consider auto-loading
         self.MAX_AUTO_MODELS = 10  # Maximum models to auto-load
+
+        # Track reserved host memory during initialization
+        self.host_memory_reserved = 0
+        self.initializing_reservations = {}  # job_id -> reserved_memory
+
+        # Lock for thread-safe memory operations
+        self.memory_lock = Lock()
 
     def _ensure_model_entry(self, model_name: str):
         """Ensure a model has an entry in the cache with proper structure"""
@@ -330,87 +336,107 @@ class DistributedValidator(DistributedWorker):
         if self.models_initializing:
             self._try_finalize_initializing_models()
 
-    def inspect_model(self, model_name: str, job_data: dict, hosted=False) -> dict:
+    def inspect_model(
+        self, model_name: str, job_data: dict, hosted: bool = False
+    ) -> dict:
         """Inspect a model to determine network requirements and store distribution in JSON cache"""
-        parser = ModelParser()
-        model_name: str = job_data.get("model_name", model_name)
-
-        # Get network worker information to assign modules
-        workers = self.send_request("get_workers", None)
-
-        batch_size = job_data.get("batch_size", None)
-
-        if batch_size is None:
-            if job_data.get("training", False):
-                batch_size = 256
-            else:
-                batch_size = 1
-
-        if job_data.get("optimizer") is None:
-            optimizer_type = "adam"
-            optimizer_spec = {}
-        else:
-            optimizer_type = job_data["optimizer"]["type"]
-            optimizer_spec = job_data.get("optimizer")
-
-        # Load HF model, create and save distribution
-        distribution = parser.create_distributed_config(
-            model_name,
-            workers=workers,
-            training=job_data.get("training", False),
-            trusted=False,
-            handle_layers=False,
-            input_obfuscation=False,
-            optimizer_type=optimizer_type,
-            optimizer_spec=optimizer_spec,
-            host_load_small=hosted,
-            host_max_depth=1,
-            host_threshold_mb=75,
-            max_offload_depth=3,
-            batch_size=job_data.get("batch_size", batch_size),
-            max_seq_len=job_data.get("max_seq_len", 4096),
-            model_type=job_data.get("model_type", "chat"),
-        )
-
-        job_data["distribution"] = distribution
-
-        offloaded_count = sum(
-            1
-            for v in distribution["config"].values()
-            if "offloaded" in v.get("type", "")
-        )
-
-        if (
-            len(distribution["config"]) == 0
-            or offloaded_count
-            > 4  # TODO This limit on number of distributions is not ideal
-            or not distribution["success"]
-        ):
-            return {}
-
-        # Store distribution in JSON cache
-        self._ensure_model_entry(model_name)
-        self.model_cache[model_name]["distribution"] = distribution
-        save_models_cache(self.model_cache)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedValidator -> Retrieved HF model: {job_data}",
-                "bright_blue",
-                logging.DEBUG,
-            ),
-        )
-
-        gc.collect()  # Force garbage collection
-
-        # Send out job request
         try:
-            new_job_data = self.send_request("send_job_request", job_data)
-            return new_job_data
+            parser = ModelParser()
+            model_name: str = job_data.get("model_name", model_name)
+
+            # Get network worker information to assign modules
+            workers = self.send_request("get_workers", None)
+
+            batch_size = job_data.get("batch_size", None)
+
+            if batch_size is None:
+                if job_data.get("training", False):
+                    batch_size = 256
+                else:
+                    batch_size = 1
+
+            if job_data.get("optimizer") is None:
+                optimizer_type = "adam"
+                optimizer_spec = {}
+            else:
+                optimizer_type = job_data["optimizer"]["type"]
+                optimizer_spec = job_data.get("optimizer")
+
+            # Get available host memory accounting for concurrent initializations
+            if hosted:
+                available_host_memory = self._get_available_host_memory()
+                host_memory_budget = available_host_memory
+            else:
+                host_memory_budget = 0
+
+            # Load HF model, create and save distribution
+            distribution = parser.create_distributed_config(
+                model_name,
+                workers=workers,
+                training=job_data.get("training", False),
+                trusted=False,
+                input_obfuscation=False,
+                optimizer_type=optimizer_type,
+                optimizer_spec=optimizer_spec,
+                host_max_memory_bytes=host_memory_budget,
+                host_max_depth=1,
+                max_offload_depth=3,
+                batch_size=job_data.get("batch_size", batch_size),
+                max_seq_len=job_data.get("max_seq_len", 4096),
+                model_type=job_data.get("model_type", "chat"),
+            )
+
+            job_data["distribution"] = distribution
+
+            offloaded_count = sum(
+                1
+                for v in distribution["config"].values()
+                if "offloaded" in v.get("type", "")
+            )
+
+            if (
+                len(distribution["config"]) == 0
+                or offloaded_count
+                > 4  # TODO This limit on number of distributions is not ideal
+                or not distribution["success"]
+            ):
+                return {}
+
+            # Reserve the host memory this model will use
+            host_memory_used = distribution.get("host_memory_used", 0)
+            if host_memory_used > 0:
+                self._reserve_host_memory(job_data["id"], host_memory_used)
+
+            # Store distribution in JSON cache
+            self._ensure_model_entry(model_name)
+            self.model_cache[model_name]["distribution"] = distribution
+            save_models_cache(self.model_cache)
+
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> Retrieved HF model: {job_data}, Reserved: {host_memory_used / 1e9:.2f}GB",
+                    "bright_blue",
+                    logging.DEBUG,
+                ),
+            )
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Send out job request
+            try:
+                new_job_data = self.send_request("send_job_request", job_data)
+                return new_job_data
+
+            except Exception as e:
+                self._release_host_memory(job_data["id"])
+                print(str(e))
 
         except Exception as e:
-            print(str(e))
+            self._release_host_memory(job_data["id"])
+            raise
 
     def check_node(self):
         """Check for node requests/updates"""
@@ -421,6 +447,9 @@ class DistributedValidator(DistributedWorker):
                 if self.CHECK_COUNTER % self.GC_CHECK_INTERVAL == 0:
                     # Clean up old request data
                     self._cleanup_old_requests()
+
+                    # Manage any ghost memory caches
+                    self._audit_memory_reservations()
 
                     # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
                     self._manage_auto_loaded_models()
@@ -896,6 +925,7 @@ class DistributedValidator(DistributedWorker):
             logging.error(f"Error initializing hosted job for {model_name}: {str(e)}")
             job_id = job_data.get("id")
             self.models_initializing.discard(job_id)
+            self._release_host_memory(job_id)
             del self.models[job_id]
             if job_id in self.model_state:
                 del self.model_state[job_id]
@@ -935,8 +965,10 @@ class DistributedValidator(DistributedWorker):
             # Distribute the model across workers
             distributed_model.distribute_model(distribution)
             distributed_model.job_id = job_id
-
             model_name = distributed_model.model_name
+
+            # Update available GPU memory
+            self._release_host_memory(job_id)
 
             # Load tokenizer
             if model_name not in self.tokenizers:
@@ -964,6 +996,7 @@ class DistributedValidator(DistributedWorker):
         except Exception as e:
             logging.error(f"Error finalizing hosted job for {model_name}: {str(e)}")
             self.models_initializing.discard(job_id)
+            self._release_host_memory(job_id)
             if job_id in self.models:
                 del self.models[job_id]
             return False
@@ -971,6 +1004,8 @@ class DistributedValidator(DistributedWorker):
     def _remove_hosted_job(self, job_id: str):
         """Remove a hosted job and clean up all associated resources"""
         try:
+            self._release_host_memory(job_id)
+
             # Remove from initializing set if present
             self.models_initializing.discard(job_id)
 
@@ -1048,6 +1083,8 @@ class DistributedValidator(DistributedWorker):
 
             # Force garbage collection to free memory
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             self.send_request(
                 "debug_print",
@@ -1068,6 +1105,65 @@ class DistributedValidator(DistributedWorker):
                     logging.ERROR,
                 ),
             )
+
+    def _reserve_host_memory(self, job_id: str, amount: int):
+        """Reserve host memory for a model being initialized"""
+        with self.memory_lock:
+            self.host_memory_reserved += amount
+            self.initializing_reservations[job_id] = amount
+
+    def _release_host_memory(self, job_id: str):
+        """Release reserved host memory when initialization completes or fails"""
+        with self.memory_lock:
+            if job_id in self.initializing_reservations:
+                reserved = self.initializing_reservations[job_id]
+                self.host_memory_reserved -= reserved
+                del self.initializing_reservations[job_id]
+
+    def _get_available_host_memory(self) -> int:
+        """Get currently available host memory accounting for reservations"""
+        with self.memory_lock:
+            total_memory = get_gpu_memory()
+            return total_memory - self.host_memory_reserved
+
+    def _audit_memory_reservations(self):
+        """
+        Audit memory reservations and clean up any orphaned reservations.
+        Called periodically to prevent memory leaks from edge cases.
+        """
+        with self.memory_lock:
+            # Find job_ids that have reservations but aren't in models or models_initializing
+            orphaned_reservations = []
+
+            for job_id in list(self.initializing_reservations.keys()):
+                if job_id not in self.models and job_id not in self.models_initializing:
+                    orphaned_reservations.append(job_id)
+
+            # Release orphaned reservations
+            for job_id in orphaned_reservations:
+                reserved = self.initializing_reservations[job_id]
+                self.host_memory_reserved -= reserved
+                del self.initializing_reservations[job_id]
+
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Released orphaned reservation: {job_id} ({reserved / 1e9:.2f}GB)",
+                        "yellow",
+                        logging.WARNING,
+                    ),
+                )
+
+            if orphaned_reservations:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Memory audit: Released {len(orphaned_reservations)} orphaned reservations. "
+                        f"Total reserved: {self.host_memory_reserved / 1e9:.2f}GB",
+                        "cyan",
+                        logging.INFO,
+                    ),
+                )
 
     def main_loop(self):
         self.check_node()
