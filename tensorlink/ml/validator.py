@@ -7,7 +7,12 @@ from tensorlink.ml.formatter import (
     format_chat_prompt,
     extract_reasoning_and_answer,
 )
-from tensorlink.ml.utils import load_models_cache, save_models_cache, get_gpu_memory
+from tensorlink.ml.utils import (
+    load_models_cache,
+    save_models_cache,
+    get_gpu_memory,
+    attach_tensor,
+)
 from tensorlink.api.models import GenerationRequest
 
 from transformers import AutoTokenizer, TextIteratorStreamer
@@ -114,9 +119,28 @@ def _post_process_output(request, tokenizer, formatted_prompt, text):
 
 
 class DistributedValidator(DistributedWorker):
-    def __init__(self, node, trusted=False, endpoint=True):
+    """
+    Backend logic for handling Distributed Models, assigning workers, and
+    handling job requests from users. To be run alongside the background
+    ValidatorThread that manages its networking, event loops, connections, etc.
+    Validators do not perform heavy computation by default but can be configured
+    to also host modules via enable_hosting.
+    """
+
+    def __init__(
+        self,
+        node,
+        trusted: bool = False,
+        endpoint: bool = True,
+        enable_hosting: bool = False,
+        max_vram_gb: float = 0,
+        max_module_bytes: int = 0,
+    ):
         super().__init__(node, trusted)
         self.endpoint = endpoint
+        self._hosting_enabled = enable_hosting
+        self._max_vram_bytes = max_vram_gb * 1e9  # Convert to bytes
+        self._max_module_bytes = max_module_bytes
         self.model_cache = load_models_cache()
         self.models = {}  # job_id -> model instance
         self.model_state = (
@@ -379,6 +403,7 @@ class DistributedValidator(DistributedWorker):
                 optimizer_type=optimizer_type,
                 optimizer_spec=optimizer_spec,
                 host_max_memory_bytes=host_memory_budget,
+                host_max_module_bytes=self._max_module_bytes,
                 host_max_depth=1,
                 max_offload_depth=3,
                 batch_size=job_data.get("batch_size", batch_size),
@@ -397,7 +422,7 @@ class DistributedValidator(DistributedWorker):
             if (
                 len(distribution["config"]) == 0
                 or offloaded_count
-                > 4  # TODO This limit on number of distributions is not ideal
+                > 5  # TODO This limit on number of distributions is not ideal
                 or not distribution["success"]
             ):
                 return {}
@@ -651,7 +676,7 @@ class DistributedValidator(DistributedWorker):
         distributed_model = ctx["distributed_model"]
         tokenizer = ctx["tokenizer"]
         formatted_prompt = ctx["formatted_prompt"]
-        input_ids = ctx["input_ids"]
+        input_ids = attach_tensor(ctx["input_ids"], self.device)
         prompt_tokens = ctx["prompt_tokens"]
         args = ctx["args"]
 
@@ -953,6 +978,9 @@ class DistributedValidator(DistributedWorker):
             # Get the DistributedModel instance
             distributed_model = self.models[job_id]
 
+            if not distribution:
+                distribution = distributed_model.config
+
             # Update state
             self.model_state[job_id] = "distributing"
 
@@ -1122,9 +1150,18 @@ class DistributedValidator(DistributedWorker):
 
     def _get_available_host_memory(self) -> int:
         """Get currently available host memory accounting for reservations"""
-        with self.memory_lock:
-            total_memory = get_gpu_memory()
-            return total_memory - self.host_memory_reserved
+        available_memory = 0
+        max_vram_bytes = self._max_vram_bytes
+        if max_vram_bytes <= 0:
+            max_vram_bytes = (
+                1e15  # Set to massive number (1PB) when max vram was not specified
+            )
+
+        if self._hosting_enabled:
+            with self.memory_lock:
+                total_memory = min(get_gpu_memory(), max_vram_bytes)
+                available_memory += total_memory - self.host_memory_reserved
+        return available_memory
 
     def _audit_memory_reservations(self):
         """

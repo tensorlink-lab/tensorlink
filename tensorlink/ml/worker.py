@@ -842,6 +842,7 @@ class DistributedWorker:
             # explicit path provided
             target_module = get_nested_module(base_model, parent_module_path)
             effective_layer_path = parent_module_path
+
         else:
             # parent_module_path is 'model' or empty -> try to find by class name
             effective_layer_path = _find_module_path_by_class(

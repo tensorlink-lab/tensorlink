@@ -18,7 +18,8 @@
       ]
     },
     "ml": {
-      "trusted": false
+      "trusted": false,
+      "max_vram_gb": 0
     }
   }
 }

@@ -15,6 +15,27 @@ from tensorlink.nodes.worker_thread import WorkerThread
 
 @dataclass
 class BaseNodeConfig:
+    """
+    Base configuration shared across all Tensorlink node roles.
+
+    Attributes
+    ----------
+    upnp : bool
+        Whether to attempt UPnP port forwarding.
+    max_connections : int
+        Maximum number of peer connections allowed.
+    on_chain : bool
+        Whether to interact with the on-chain Smartnodes layer.
+    local_test : bool
+        Enables local-only networking for testing.
+    print_level : int
+        Logging verbosity level.
+    priority_nodes : Optional[List[List[str]]]
+        Preferred peers to connect to first.
+    seed_validators : Optional[List[List[str]]]
+        Bootstrap validators for network discovery.
+    """
+
     upnp: bool = True
     max_connections: int = 0
     on_chain: bool = True
@@ -26,12 +47,20 @@ class BaseNodeConfig:
 
 @dataclass
 class WorkerConfig(BaseNodeConfig):
+    """
+    Configuration specific to Worker nodes.
+    """
+
     duplicate: str = ""
     load_previous_state: bool = False
 
 
 @dataclass
 class ValidatorConfig(BaseNodeConfig):
+    """
+    Configuration specific to Validator nodes.
+    """
+
     endpoint: bool = True
     endpoint_url: str = "0.0.0.0"
     endpoint_port: int = 64747
@@ -40,6 +69,10 @@ class ValidatorConfig(BaseNodeConfig):
 
 @dataclass
 class UserConfig(BaseNodeConfig):
+    """
+    Configuration specific to User nodes.
+    """
+
     pass
 
 
@@ -70,30 +103,56 @@ mp.set_start_method("spawn", force=True)
 
 
 class BaseNode:
+    """
+    Base node runner that handles the startup of the P2P node thread
+    alongside a distributed ML process (i.e. DistributedWorker,
+    DistributedValidator, or DistributedModel).
+    """
+
     def __init__(
         self,
         config: BaseNodeConfig,
         trusted: bool = False,
         utilization: bool = True,
     ):
+        """
+        Initialize a BaseNode instance.
+
+        Parameters
+        ----------
+        config : BaseNodeConfig
+            Configuration object for the node role.
+
+        trusted : bool, optional
+            Whether this node is trusted within the network (bypasses some
+            verification or security checks). Default is False.
+
+        utilization : bool, optional
+            If True, runs distributed ML logic in a background thread to allow
+            concurrent network operation. If False, runs synchronously.
+        """
         self.config = config
         self.trusted = trusted
         self.utilization = utilization
 
+        # IPC primitives for communicating with the role process
         self.node_requests = mp.Queue()
         self.node_responses = mp.Queue()
         self.mpc_lock = mp.Lock()
 
+        # Multiprocessing lifecycle handles
         self.node_process = None
         self._stop_event = mp.Event()
 
+        # Install signal handlers and immediately start the node
         self._setup_signal_handlers()
         self.start()
 
     def _setup_signal_handlers(self):
         """
-        Set up signal handlers for graceful shutdown.
-        Uses a multiprocessing Event to signal across processes.
+        Set up OS signal handlers for graceful shutdown.
+
+        Uses a multiprocessing Event to propagate stop signals across processes.
         """
 
         def handler(signum, frame):
@@ -107,38 +166,56 @@ class BaseNode:
             signal.signal(sig, handler)
 
     def start(self):
+        """
+        Spawn the multiprocessing role process.
+        """
         self.node_process = mp.Process(target=self.run_role, daemon=True)
         self.node_process.start()
 
     def cleanup(self):
-        # Process cleanup
+        """
+        Gracefully shut down the role process and release resources.
+        """
         if self.node_process is not None and self.node_process.exitcode is None:
-            # Send a stop request to the role instance
+            # Ask the role to stop cleanly first
             response = self.send_request("stop", (None,), timeout=15)
             if response:
                 self.node_process.join(timeout=15)
 
-            # If the process is still alive, terminate it
+            # Force terminate if still alive
             if self.node_process.is_alive():
                 print("Forcing termination for node process.")
                 self.node_process.terminate()
 
-            # Final join to ensure it's completely shut down
             self.node_process.join()
-            self.node_process = None  # Reset to None after cleanup
+            self.node_process = None
 
     def send_request(self, request_type, args, timeout=5):
         """
-        Sends a request to the roles and waits for the response.
+        Send a request to the role process and wait for a response.
+
+        Parameters
+        ----------
+        request_type : str
+            Type of request to send.
+        args : tuple
+            Arguments to forward to the role.
+        timeout : int, optional
+            Timeout in seconds for request/response.
+
+        Returns
+        -------
+        Any
+            Value returned by the role handler.
         """
         request = {"type": request_type, "args": args}
 
         try:
             self.mpc_lock.acquire(timeout=timeout)
             self.node_requests.put(request)
-            response = self.node_responses.get(
-                timeout=timeout
-            )  # Blocking call, waits for response
+
+            # Blocking wait for response
+            response = self.node_responses.get(timeout=timeout)
 
         except Exception as e:
             print(f"Error sending '{request_type}' request: {e}")
@@ -150,9 +227,18 @@ class BaseNode:
         return response["return"]
 
     def run_role(self):
+        """
+        Entry point for the multiprocessing role process.
+
+        Subclasses must override this to construct and run the appropriate
+        node thread (WorkerThread, ValidatorThread, UserThread).
+        """
         raise NotImplementedError("Subclasses must implement this method")
 
     def connect_node(self, host: str, port: int, node_id: str = None, timeout: int = 5):
+        """
+        Request a connection to another node in the network.
+        """
         if node_id is None:
             node_id = ""
 
@@ -160,12 +246,24 @@ class BaseNode:
 
 
 class Worker(BaseNode):
+    """
+    Tensorlink Worker node runner.
+
+    Workers perform distributed ML execution and communicate with validators
+    to run offloaded modules.
+    """
+
     def __init__(self, config: WorkerConfig, **kwargs):
-        self.mining_active = mp.Value('b', False)
-        self.reserved_memory = mp.Value('d', 0.0)
+        # Shared state for mining / memory tracking
+        self.mining_active = mp.Value("b", False)
+        self.reserved_memory = mp.Value("d", 0.0)
+
         super().__init__(config, **kwargs)
 
     def run_role(self):
+        """
+        Launch the WorkerThread inside the role process.
+        """
         node = WorkerThread(
             self.node_requests,
             self.node_responses,
@@ -177,12 +275,18 @@ class Worker(BaseNode):
         node.activate()
         node.run()
 
+        # Keep process alive while the node thread is running
         while node.is_alive():
             time.sleep(1)
 
     def start(self):
+        """
+        Start the worker role and the DistributedWorker controller.
+        """
         super().start()
+
         distributed_worker = DistributedWorker(self, trusted=self.trusted)
+
         if self.utilization:
             t = threading.Thread(target=distributed_worker.run, daemon=True)
             t.start()
@@ -192,10 +296,45 @@ class Worker(BaseNode):
 
 
 class Validator(BaseNode):
-    def __init__(self, config: ValidatorConfig, **kwargs):
+    """
+    Tensorlink Validator node runner.
+
+    Validators coordinate jobs, verify execution, and optionally host
+    distributed modules.
+    """
+
+    def __init__(
+        self,
+        config: ValidatorConfig,
+        enable_hosting: bool = False,
+        max_vram_gb: float = 0,
+        max_module_bytes: int = 0,
+        **kwargs,
+    ):
+        """
+        Initialize a Validator node.
+
+        Parameters
+        ----------
+        enable_hosting : bool
+            Whether this validator may host modules locally.
+        max_vram_gb : float
+            Maximum VRAM budget for hosted execution.
+        max_module_bytes : int
+            Maximum module size allowed for hosting.
+        """
+        self._enable_hosting = enable_hosting
+        self._max_vram_gb = max_vram_gb
+        self._max_module_bytes = max_module_bytes
+
         super().__init__(config, **kwargs)
 
+        self.config = config
+
     def run_role(self):
+        """
+        Launch the ValidatorThread inside the role process.
+        """
         node = ValidatorThread(
             self.node_requests,
             self.node_responses,
@@ -208,10 +347,22 @@ class Validator(BaseNode):
             time.sleep(1)
 
     def start(self):
+        """
+        Start the validator role and DistributedValidator controller.
+        """
         from tensorlink.ml.validator import DistributedValidator
 
         super().start()
-        distributed_validator = DistributedValidator(self, trusted=self.trusted)
+
+        distributed_validator = DistributedValidator(
+            self,
+            trusted=self.trusted,
+            endpoint=self.config.endpoint,
+            enable_hosting=self._enable_hosting,
+            max_vram_gb=self._max_vram_gb,
+            max_module_bytes=self._max_module_bytes,
+        )
+
         if self.utilization:
             t = threading.Thread(target=distributed_validator.run, daemon=True)
             t.start()
@@ -221,10 +372,20 @@ class Validator(BaseNode):
 
 
 class User(BaseNode):
+    """
+    Tensorlink User node runner.
+
+    Users submit jobs and interact with distributed models but do not
+    perform validation or heavy execution themselves.
+    """
+
     def __init__(self, config: UserConfig, **kwargs):
         super().__init__(config, **kwargs)
 
     def run_role(self):
+        """
+        Launch the UserThread inside the role process.
+        """
         node = UserThread(
             self.node_requests,
             self.node_responses,
@@ -237,7 +398,9 @@ class User(BaseNode):
             time.sleep(1)
 
     def cleanup(self):
-        """Downloads parameters from workers before shutting down"""
+        """
+        Download parameters from workers before shutting down.
+        """
         if hasattr(self, "distributed_model"):
             if self.distributed_model.training:
                 self.distributed_model.parameters(distributed=True, load=False)

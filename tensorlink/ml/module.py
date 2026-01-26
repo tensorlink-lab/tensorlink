@@ -148,7 +148,8 @@ class DistributedModel(nn.Module):
     """
     A modular distributed model that supports offloading submodules
     while handling local operations. This model can be instantiated
-    by either a Worker or a User, where the host is referred to as the 'master' node.
+    by either a Worker or a User, where the host is referred to as
+    the 'master' node.
 
     Features:
     - Handles distributed training across multiple nodes.
@@ -172,7 +173,7 @@ class DistributedModel(nn.Module):
         tokenizer=None,
     ):
         """
-        Args:
+        Parameters:
             model (nn.Module): The base model to distribute.
             n_pipelines (int): Number of parallel pipelines for computation.
             optimizer (Type[optim.Optimizer]): Optimizer class to use.
@@ -841,7 +842,9 @@ class DistributedModel(nn.Module):
 
         parent_module.offloaded_modules = offloaded_modules
 
-        new_forward = generate_new_forward_method(parent_module, offloaded_modules)
+        new_forward = generate_new_forward_method(
+            parent_module, self.model, offloaded_modules
+        )
 
         parent_module.forward = types.MethodType(new_forward, parent_module)
 
@@ -955,17 +958,7 @@ class DistributedModel(nn.Module):
                 "Module path refers to full model; loading directly into root model"
             )
 
-            state_dict = self._load_module_weights(self.model_name, ["model"])
-
-            missing_keys, unexpected_keys = self.model.load_state_dict(
-                state_dict, strict=False
-            )
-
-            if missing_keys:
-                logging.warning(f"Model missing keys: {missing_keys}")
-            if unexpected_keys:
-                logging.warning(f"Model unexpected keys: {unexpected_keys}")
-
+            self.model = self._load_full_model(self.model_name, module_info)
             return
 
         # Navigate to parent
@@ -1002,6 +995,59 @@ class DistributedModel(nn.Module):
         setattr(target, module_name, host_module)
 
         logging.info(f"Successfully loaded host module {module_class}")
+
+    def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
+        """
+        Load a complete model from HuggingFace with optimal memory usage.
+        Uses HF's native loading which is more memory-efficient than manual skeleton+weights.
+        """
+        model_type = module_info.get('model_type', 'chat')
+        num_gpus = torch.cuda.device_count()
+
+        # Force garbage collection before loading
+        load_kwargs = {
+            "low_cpu_mem_usage": True,
+            "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
+        }
+
+        # Only use device_map for multi-GPU
+        if num_gpus > 1:
+            load_kwargs["device_map"] = "auto"
+        else:
+            # For single GPU, load to CPU first then move
+            load_kwargs["device_map"] = "cpu"
+
+        logging.info(f"Loading full model {model_name} with type {model_type}")
+
+        # Load model based on type
+        if model_type in ("causal", "chat"):
+            final_model = AutoModelForCausalLM.from_pretrained(
+                model_name, **load_kwargs
+            )
+        elif model_type == "seq2seq":
+            final_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, **load_kwargs
+            )
+        elif model_type == "vision2text":
+            final_model = AutoModelForVision2Seq.from_pretrained(
+                model_name, **load_kwargs
+            )
+        elif model_type == "audio2text":
+            final_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name, **load_kwargs
+            )
+        else:
+            model_config = AutoConfig.from_pretrained(model_name)
+            final_model = AutoModel.from_pretrained(
+                model_name, config=model_config, **load_kwargs
+            )
+
+        # Move to GPU only after fully loaded (for single GPU)
+        if num_gpus == 1 and self.device.type == "cuda":
+            final_model = final_model.to(self.device)
+
+        logging.info(f"Successfully loaded full model {model_name}")
+        return final_model
 
     def _load_module_weights(
         self, model_name: str, module_paths: List[str]

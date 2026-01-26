@@ -210,10 +210,16 @@ def main():
     # Get node type from config
     node_type = config.get("node", {}).get("type", "worker").lower()
 
-    if node_type not in ["worker", "validator"]:
+    if node_type not in ["worker", "validator", "both"]:
         raise ValueError(
-            f"Invalid node type: {node_type}. Must be 'worker' or 'validator'"
+            f"Invalid node type: {node_type}. Must be 'worker', 'validator', or 'both'"
         )
+
+    max_vram_gb = config.get("ml", {}).get("max_vram_gb", 0)
+    enable_hosting = False
+    if node_type == "both":
+        node_type = "validator"
+        enable_hosting = True
 
     # Parse common config
     trusted = config.get("ml", {}).get("trusted", False)
@@ -241,6 +247,7 @@ def main():
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                # max_vram_gb=max_vram_gb
             ),
             trusted=trusted,
             utilization=True,
@@ -260,6 +267,8 @@ def main():
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                max_vram_gb=max_vram_gb,
+                enable_hosting=enable_hosting,
             ),
             trusted=trusted,
         )

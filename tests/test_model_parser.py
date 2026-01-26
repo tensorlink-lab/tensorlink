@@ -137,19 +137,19 @@ def test_config_combinations():
     test_configs = [
         {
             "input_obfuscation": False,
-            "host_max_memory_bytes": 5e7,
+            "host_max_memory_bytes": 0,
+        },
+        {
+            "input_obfuscation": True,
+            "host_max_memory_bytes": 0,
         },
         {
             "input_obfuscation": False,
             "host_max_memory_bytes": 5e7,
         },
         {
-            "input_obfuscation": False,
-            "host_max_memory_bytes": 5e8,
-        },
-        {
-            "input_obfuscation": False,
-            "host_max_memory_bytes": 5e8,
+            "input_obfuscation": True,
+            "host_max_memory_bytes": 5e7,
         },
     ]
 
@@ -208,7 +208,6 @@ def test_config_combinations():
             results.append(
                 {
                     "input_obfuscation": test_config["input_obfuscation"],
-                    "host_threshold_mb": test_config["host_threshold_mb"],
                     "success": False,
                     "model_memory": "N/A",
                     "components_sum": "N/A",

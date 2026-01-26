@@ -20,6 +20,16 @@ FREE_JOB_MAX_TIME = 60 * 30  # 30 minutes in seconds for a free job
 
 
 class ValidatorThread(Torchnode):
+    """
+    Coordinates connections, job requests, and smart contract updates across
+    the Tensorlink network.
+
+    The ValidatorThread is responsible for:
+    - Discovering and maintaining connections to workers and peers.
+    - Validating job requests and proposals.
+    - Interacting with the underlying smart contract layer (Smartnodes).
+    """
+
     def __init__(
         self,
         request_queue,
@@ -36,6 +46,9 @@ class ValidatorThread(Torchnode):
         priority_nodes: list = None,
         seed_validators: list = None,
     ):
+        """
+        Initialize a Validator P2P Node.
+        """
         super(ValidatorThread, self).__init__(
             request_queue,
             response_queue,

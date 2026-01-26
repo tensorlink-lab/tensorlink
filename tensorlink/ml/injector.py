@@ -564,35 +564,51 @@ def _generate_worker_calls(
     return calls
 
 
+def _analyze_forward(fn):
+    """
+    Extract source, parse AST, extract args, and locate loop node.
+    """
+    source = inspect.getsource(fn)
+    source = textwrap.dedent(source)
+    tree = ast.parse(source)
+
+    arg_extractor = FunctionArgExtractor()
+    arg_extractor.visit(tree)
+
+    loop_finder = LoopFinder()
+    loop_finder.visit(tree)
+
+    return source, tree, arg_extractor, loop_finder
+
+
 def generate_new_forward_method(
-    parent_module, offloaded_modules: List
+    parent_module, base_module, offloaded_modules: List
 ) -> types.FunctionType:
     """
     Generate a new forward method with loop replaced by worker calls.
 
     Args:
         parent_module: The module whose forward pass contains the loop
+        base_module: Base model containing the module
         offloaded_modules: List of OffloadedModule instances to call sequentially
-        original_globals: Global namespace to use for the new function (optional)
 
     Returns:
         New forward function (unbound)
     """
-    # Get original forward source
     original_forward = parent_module.forward
-    source = inspect.getsource(original_forward)
-    source = textwrap.dedent(source)
 
-    # Parse and analyze
-    tree = ast.parse(source)
+    # First attempt: parent forward
+    source, tree, arg_extractor, loop_finder = _analyze_forward(original_forward)
 
-    # Extract function arguments
-    arg_extractor = FunctionArgExtractor()
-    arg_extractor.visit(tree)
-
-    # Find the loop
-    loop_finder = LoopFinder()
-    loop_finder.visit(tree)
+    # Fallback: base forward
+    if not loop_finder.loop_node:
+        try:
+            original_forward = base_module.forward
+            source, tree, arg_extractor, loop_finder = _analyze_forward(
+                original_forward
+            )
+        except Exception:
+            raise ValueError("No suitable loop found in forward pass")
 
     if not loop_finder.loop_node:
         raise ValueError("No suitable loop found in forward pass")
@@ -603,15 +619,13 @@ def generate_new_forward_method(
         loop_analyzer.visit(stmt)
 
     # Analyze variables created BEFORE the loop
-    func_node = tree.body[0]  # The forward function
+    func_node = tree.body[0]
     pre_loop_analyzer = VariableUsageAnalyzer()
     for stmt in func_node.body:
-        # Stop when we reach the loop
         if stmt == loop_finder.loop_node:
             break
         pre_loop_analyzer.visit(stmt)
 
-    # Variables that exist before the loop are those written before it
     pre_loop_vars = pre_loop_analyzer.variables_written
 
     # Extract the layer call to preserve kwargs
@@ -628,7 +642,11 @@ def generate_new_forward_method(
 
     # Generate new forward code
     new_forward_code = _generate_new_forward_source(
-        source, loop_finder.loop_node, layer_call_info, loop_vars, offloaded_modules
+        source,
+        loop_finder.loop_node,
+        layer_call_info,
+        loop_vars,
+        offloaded_modules,
     )
 
     # Prepare namespace
@@ -636,7 +654,7 @@ def generate_new_forward_method(
 
     try:
         exec(new_forward_code, namespace)
-        return namespace['forward']
+        return namespace["forward"]
     except Exception as e:
         print("=" * 80)
         print("ERROR COMPILING NEW FORWARD")

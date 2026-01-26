@@ -33,7 +33,7 @@ MODELS = [
     pytest.param(
         {
             "name": "HuggingFaceTB/SmolLM2-135M",
-            "timeout": 1200,
+            "timeout": 120,
             "sleep": 10,
             "parsed": True,
         },
