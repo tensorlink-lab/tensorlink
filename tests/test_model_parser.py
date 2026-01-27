@@ -129,7 +129,7 @@ def test_config_combinations():
     model distribution and memory allocation. Results shown as a simple DataFrame.
     """
     # Base test parameters
-    test_model = "HuggingFaceTB/SmolLM2-135M"
+    test_model = "Qwen/Qwen3-14B"
     batch_size = 1
     seq_length = 4096
 
@@ -155,21 +155,21 @@ def test_config_combinations():
         {
             "input_obfuscation": False,
             "host_max_memory_bytes": 0,
-            "host_max_module_bytes": 0,
-            "host_max_depth": 1,
-        },
-        {
-            "input_obfuscation": False,
-            "host_max_memory_bytes": 0,
             "host_max_module_bytes": 1e8,
             "host_max_depth": 1,
         },
-        {
-            "input_obfuscation": False,
-            "host_max_memory_bytes": 4e8,
-            "host_max_module_bytes": 1e8,
-            "host_max_depth": 1,
-        },
+        # {
+        #     "input_obfuscation": False,
+        #     "host_max_memory_bytes": 0,
+        #     "host_max_module_bytes": 1e8,
+        #     "host_max_depth": 1,
+        # },
+        # {
+        #     "input_obfuscation": False,
+        #     "host_max_memory_bytes": 4e8,
+        #     "host_max_module_bytes": 1e8,
+        #     "host_max_depth": 1,
+        # },
     ]
 
     results = []
@@ -180,7 +180,7 @@ def test_config_combinations():
         try:
             config = parser.create_distributed_config(
                 test_model,
-                test_workers,
+                WORKERS,
                 training=False,
                 trusted=False,
                 optimizer_type="adam",

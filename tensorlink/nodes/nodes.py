@@ -253,10 +253,10 @@ class Worker(BaseNode):
     to run offloaded modules.
     """
 
-    def __init__(self, config: WorkerConfig, **kwargs):
+    def __init__(self, config: WorkerConfig, max_vram_gb: float = 0, **kwargs):
         # Shared state for mining / memory tracking
         self.mining_active = mp.Value("b", False)
-        self.reserved_memory = mp.Value("d", 0.0)
+        self._max_vram_gb = max_vram_gb
 
         super().__init__(config, **kwargs)
 
@@ -269,7 +269,7 @@ class Worker(BaseNode):
             self.node_responses,
             **vars(self.config),
             mining_active=self.mining_active,
-            reserved_memory=self.reserved_memory,
+            max_vram_gb=self._max_vram_gb,
         )
 
         node.activate()

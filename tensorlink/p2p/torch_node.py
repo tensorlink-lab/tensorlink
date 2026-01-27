@@ -78,6 +78,7 @@ class Torchnode(Smartnode):
         local_test=False,
         priority_nodes: list = None,
         seed_validators: list = None,
+        max_vram_gb: float = 0,
     ):
         super(Torchnode, self).__init__(
             role=role,
@@ -90,7 +91,8 @@ class Torchnode(Smartnode):
         )
 
         # Available GPU mpc estimation
-        self.available_gpu_memory = get_gpu_memory()
+        self._max_vram_gb = max_vram_gb
+        self.available_gpu_memory = get_gpu_memory(self._max_vram_gb)
         self.total_gpu_memory = self.available_gpu_memory
         self.available_ram = psutil.virtual_memory().available
 

@@ -127,9 +127,10 @@ def estimate_memory(
     return total, breakdown
 
 
-def get_gpu_memory():
+def get_gpu_memory(max_vram_gb: float = 0):
     # Check how much available mpc we can allocate to the roles
     memory = 0
+    max_memory_bytes = int(max_vram_gb * 1e9)
 
     if torch.cuda.is_available():
         devices = list(range(torch.cuda.device_count()))
@@ -141,6 +142,9 @@ def get_gpu_memory():
 
     else:
         memory += 4e8
+
+    if max_memory_bytes > 0:
+        memory = min(memory, max_memory_bytes)
 
     return memory
 
