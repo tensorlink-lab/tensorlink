@@ -49,6 +49,7 @@ def uwv_nodes():
         ),
         enable_hosting=True,
         max_vram_gb=0.4,
+        max_module_bytes=int(1e8),
     )
 
     worker = Worker(
@@ -87,8 +88,8 @@ def wwv_nodes():
             load_previous_state=False,
         ),
         enable_hosting=True,
-        max_vram_gb=0,
-        max_module_bytes=int(4e8),
+        max_vram_gb=0.4,
+        max_module_bytes=int(1e8),
     )
 
     worker = Worker(

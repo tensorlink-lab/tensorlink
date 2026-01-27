@@ -835,10 +835,10 @@ class DistributedModel(nn.Module):
         Modify the parent module's forward method to call the offloaded
         layer group instead of looping through individual layers.
         """
-        parent_path = list(grouped_layers.values())[0].get("parent_module_path", "")
-
         assert isinstance(self.model, nn.Module), "Invalid model type"
-        parent_module = get_nested_module(self.model, parent_path)
+        parent_module = self.model
+        if hasattr(parent_module, "model"):
+            parent_module = parent_module.model
 
         parent_module.offloaded_modules = offloaded_modules
 

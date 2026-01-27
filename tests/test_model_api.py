@@ -39,15 +39,6 @@ MODELS = [
         },
         id="smollm2-135m",
     ),
-    # pytest.param(
-    #     {
-    #         "name": "BabyLM-community/babylm-baseline-100m-gpt2",
-    #         "timeout": 120,
-    #         "sleep": 10,
-    #         "parsed": True,
-    #     },
-    #     id="babylm-baseline-100m-gpt2",
-    # ),
 ]
 
 

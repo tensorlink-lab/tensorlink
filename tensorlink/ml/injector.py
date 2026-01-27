@@ -595,23 +595,14 @@ def generate_new_forward_method(
     Returns:
         New forward function (unbound)
     """
-    original_forward = parent_module.forward
+    if hasattr(base_module, "model"):
+        parent_module = base_module.model
+        original_forward = parent_module.forward
+    else:
+        original_forward = parent_module.model.forward
 
     # First attempt: parent forward
     source, tree, arg_extractor, loop_finder = _analyze_forward(original_forward)
-
-    # Fallback: base forward
-    if not loop_finder.loop_node:
-        try:
-            original_forward = base_module.forward
-            source, tree, arg_extractor, loop_finder = _analyze_forward(
-                original_forward
-            )
-        except Exception:
-            raise ValueError("No suitable loop found in forward pass")
-
-    if not loop_finder.loop_node:
-        raise ValueError("No suitable loop found in forward pass")
 
     # Analyze variable usage in loop
     loop_analyzer = VariableUsageAnalyzer()

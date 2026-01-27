@@ -129,27 +129,46 @@ def test_config_combinations():
     model distribution and memory allocation. Results shown as a simple DataFrame.
     """
     # Base test parameters
-    test_model = "Qwen/Qwen2.5-14B-Instruct"
+    test_model = "HuggingFaceTB/SmolLM2-135M"
     batch_size = 1
     seq_length = 4096
 
     # Define test configurations to explore
+    test_workers = {
+        '509d89bf56704c67873c328e4f706a705b2fdc1671ebacab1083c9c6d2df650f': {
+            'id': '509d89bf56704c67873c328e4f706a705b2fdc1671ebacab1083c9c6d2df650f',
+            'gpu_memory': 4e8,
+            'total_gpu_memory': 4e8,
+            'role': 'W',
+            'training': False,
+        },
+        '209d89bf56704c67873c328e4f706a705b2fdc1671ebacab1083c9c6d2df650f': {
+            'id': '209d89bf56704c67873c328e4f706a705b2fdc1671ebacab1083c9c6d2df650f',
+            'gpu_memory': 4e8,
+            'total_gpu_memory': 4e8,
+            'role': 'W',
+            'training': False,
+        },
+    }
+
     test_configs = [
         {
             "input_obfuscation": False,
             "host_max_memory_bytes": 0,
-        },
-        {
-            "input_obfuscation": True,
-            "host_max_memory_bytes": 0,
+            "host_max_module_bytes": 0,
+            "host_max_depth": 1,
         },
         {
             "input_obfuscation": False,
-            "host_max_memory_bytes": 5e7,
+            "host_max_memory_bytes": 0,
+            "host_max_module_bytes": 1e8,
+            "host_max_depth": 1,
         },
         {
-            "input_obfuscation": True,
-            "host_max_memory_bytes": 5e7,
+            "input_obfuscation": False,
+            "host_max_memory_bytes": 4e8,
+            "host_max_module_bytes": 1e8,
+            "host_max_depth": 1,
         },
     ]
 
@@ -161,7 +180,7 @@ def test_config_combinations():
         try:
             config = parser.create_distributed_config(
                 test_model,
-                WORKERS,
+                test_workers,
                 training=False,
                 trusted=False,
                 optimizer_type="adam",

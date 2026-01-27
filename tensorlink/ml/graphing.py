@@ -197,7 +197,7 @@ class ModelParser:
         optimizer_spec: Optional[dict] = None,
         host_max_memory_bytes: int = 0,
         host_max_module_bytes: int = 0,
-        host_max_depth: int = 2,
+        host_max_depth: int = 1,
         max_offload_depth: int = 3,
         max_seq_len: int = 4096,
         batch_size: int = 1,
