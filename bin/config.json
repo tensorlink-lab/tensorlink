@@ -4,10 +4,10 @@
       "type": "worker",
       "mode": "public",
       "endpoint": false,
-      "endpoint_url": "127.0.0.1",
+      "endpoint_url": "0.0.0.0",
       "endpoint_port": 64747,
       "priority_nodes": [],
-      "logging": "INFO"
+      "logging": "ERROR"
     },
     "crypto": {
       "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",

@@ -152,7 +152,6 @@ class Connection(threading.Thread):
         except Exception as e:
             self.main_node.debug_print(
                 f"Connection send error: {e}",
-                colour="bright_red",
                 level=logging.ERROR,
                 tag="Connection",
             )

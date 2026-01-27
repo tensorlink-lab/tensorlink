@@ -152,12 +152,7 @@ class Torchnode(Smartnode):
                 return False
 
         except Exception as e:
-            self.debug_print(
-                f"Error handling data: {e}",
-                colour="bright_red",
-                level=logging.ERROR,
-                tag="Torchnode",
-            )
+            self._log_error(f"Error handling data: {e}", tag="Torchnode")
 
     def _train_updated(self, data: bytes):
         mode = False if data[13:14] == b"0" else True
@@ -173,16 +168,16 @@ class Torchnode(Smartnode):
 
     def _handle_parameters(self, data: bytes):
         module_id = data[10:74].decode()
-        self.debug_print(
-            f"Received Parameters for: {module_id}", colour="blue", tag="Torchnode"
-        )
+        self._log_debug(f"Received Parameters for: {module_id}", tag="Torchnode")
+
         file_name = f"tmp/{module_id}_parameters"
         key = "PREQPREQPREQ" + module_id
         self.memory_manager[key] = file_name
+
         return True
 
     def _handle_parameters_request(self, data: bytes):
-        self.debug_print("RECEIVED PARAMS REQUEST", tag="Torchnode")
+        self._log_debug("RECEIVED PARAMS REQUEST", tag="Torchnode")
 
         # TODO Must ensure requesting node is indeed the master or an overseeing validator
         module_id = data[10:74].decode()
@@ -208,7 +203,6 @@ class Torchnode(Smartnode):
             if response_type == "loaded":
                 self.debug_print(
                     f"Optimizer for module: {module_id} loaded on worker {node.node_id}",
-                    level=logging.INFO,
                     colour="bright_cyan",
                     tag="Torchnode",
                 )
@@ -363,7 +357,7 @@ class Torchnode(Smartnode):
                 self._remove_request(node.node_id, req)
 
             self.debug_print(
-                f"Loading distributed module: {module_id}",
+                f"Loading distributed module: {module_id}, mo",
                 colour="bright_cyan",
                 level=logging.INFO,
                 tag="Torchnode",
@@ -970,6 +964,21 @@ class Torchnode(Smartnode):
         )
 
         print(line("Modules", modules, ANSI.MAGENTA))
+
+        if self.print_level == logging.DEBUG:
+            print(line("Module Info", len(self.modules), ANSI.MAGENTA))
+            for k in list(self.modules)[:10]:
+                print(f"{ANSI.DIM}  └─ {k}{ANSI.RESET}")
+            if len(self.modules) > 10:
+                print(f"{ANSI.DIM}  ... {len(self.modules) - 10} more{ANSI.RESET}")
+
+        # Jobs (if present)
+        jobs = getattr(self, "jobs", {})
+        print(line("Jobs", len(jobs), ANSI.CYAN))
+
+        if self.print_level == logging.DEBUG:
+            for jid in list(jobs)[:10]:
+                print(f"{ANSI.DIM}  └─ {jid}{ANSI.RESET}")
 
         # --- Validator ---
         if self.role.startswith("V"):

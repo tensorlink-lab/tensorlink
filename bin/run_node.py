@@ -1,5 +1,5 @@
 """
-TensorLink node runner.
+Tensorlink node runner.
 Supports both Worker and Validator node types based on config.json
 """
 

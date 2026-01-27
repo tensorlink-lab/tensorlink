@@ -53,12 +53,12 @@ try:
         config = json.load(f)
         if 'config' in config:
             config = config['config']
-        node_type = config.get('node', {}).get('type', 'worker').lower()
-        print(node_type)
+        node_type = config.get('node', {}).get('type', 'worker')
+        print(str(node_type).strip().lower())
 except Exception as e:
-    print('worker', file=sys.stderr)
+    print('worker')
     print(f'Warning: Could not read node type from config.json, defaulting to worker. Error: {e}', file=sys.stderr)
-" 2>&1
+"
 }
 
 # Trap any unexpected errors
