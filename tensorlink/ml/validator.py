@@ -490,7 +490,7 @@ class DistributedValidator(DistributedWorker):
                                 self._remove_hosted_job(job_id)
 
                 if (
-                    self.CHECK_COUNTER % self.GC_CHECK_INTERVAL * 20 == 0
+                    self.CHECK_COUNTER % (self.GC_CHECK_INTERVAL * 20) == 0
                 ):  # less frequent than garbage collection
                     # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
                     self._manage_auto_loaded_models()

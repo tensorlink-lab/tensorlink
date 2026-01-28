@@ -77,7 +77,7 @@ class DHT:
         if self.node.rsa_key_hash not in keys_to_exclude:
             keys_to_exclude.append(self.node.rsa_key_hash)
 
-        self.node.debug_print(f"Querying for {key}", tag="DHT")
+        self.node.debug_print(f"Querying for {key}", tag="DHT", level=self.node.VERBOSE)
 
         closest_node = None
         closest_distance = float("inf")
