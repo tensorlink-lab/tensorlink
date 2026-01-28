@@ -476,9 +476,6 @@ class DistributedValidator(DistributedWorker):
                     # Manage any ghost memory caches
                     self._audit_memory_reservations()
 
-                    # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
-                    self._manage_auto_loaded_models()
-
                     # Check if jobs are still active
                     for job_id, model in self.models.items():
                         model_name = model.model_name
@@ -490,6 +487,10 @@ class DistributedValidator(DistributedWorker):
                                 self._remove_hosted_job(job_id)
 
                     self.CHECK_COUNTER = 1
+
+                if self.CHECK_COUNTER * 10 % self.GC_CHECK_INTERVAL == 0:
+                    # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
+                    self._manage_auto_loaded_models()
 
                 if self.models_initializing:
                     # Only call model management if we have models actively initializing

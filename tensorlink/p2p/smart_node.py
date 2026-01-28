@@ -629,12 +629,7 @@ class Smartnode(threading.Thread):
                 pass
 
             except Exception as e:
-                self._log_error(
-                    f"Listen connection error {e}",
-                    colour="bright_red",
-                    level=logging.CRITICAL,
-                    tag="Smartnode",
-                )
+                self._log_error(f"Listen connection error {e}")
 
             # self.reconnect_nodes()
 

@@ -357,9 +357,8 @@ class Torchnode(Smartnode):
                 self._remove_request(node.node_id, req)
 
             self.debug_print(
-                f"Loading distributed module: {module_id}, mo",
+                f"Loading distributed module: {module_info}",
                 colour="bright_cyan",
-                level=logging.INFO,
                 tag="Torchnode",
             )
 
