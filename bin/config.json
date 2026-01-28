@@ -1,20 +1,20 @@
 {
   "config": {
     "node": {
-      "type": "worker",
+      "type": "validator",
       "mode": "public",
-      "endpoint": false,
+      "endpoint": true,
       "endpoint_url": "0.0.0.0",
       "endpoint_port": 64747,
       "priority_nodes": [],
-      "logging": "ERROR"
+      "logging": "INFO"
     },
     "crypto": {
       "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",
       "mining": false,
       "mining_script": "path/to/mining.executable",
       "seed_validators": [
-        ["smartnodes.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
+        ["smartnodes.ddns.net", 38752, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
       ]
     },
     "ml": {
