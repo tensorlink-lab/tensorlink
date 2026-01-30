@@ -805,6 +805,8 @@ class DistributedWorker:
         logging.info(f"Loading weights for layers {layer_range[0]}-{layer_range[1]}")
         self._load_grouped_layer_weights(model_name, layer_paths, grouped_module)
 
+        grouped_module.to(self.device)
+
         logging.info(f"Successfully loaded {len(layer_paths)} layers with weights")
 
         return grouped_module
