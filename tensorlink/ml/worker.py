@@ -742,7 +742,7 @@ class DistributedWorker:
             (
                 f"Starting gradual move to {device}...",
                 "yellow",
-                logging.INFO,
+                logging.DEBUG,
             ),
         )
 
@@ -753,7 +753,7 @@ class DistributedWorker:
                 (
                     f"Moving layer {idx + 1}/{len(module.layers)} to {device}...",
                     "yellow",
-                    logging.INFO,
+                    logging.DEBUG,
                 ),
             )
 
@@ -764,7 +764,7 @@ class DistributedWorker:
                 (
                     f"  Layer {idx} size: {layer_params / 1024 ** 3:.3f}GB",
                     "cyan",
-                    logging.INFO,
+                    logging.DEBUG,
                 ),
             )
 
@@ -795,7 +795,7 @@ class DistributedWorker:
             (
                 "Moving remaining module components...",
                 "yellow",
-                logging.INFO,
+                logging.DEBUG,
             ),
         )
 
@@ -807,7 +807,7 @@ class DistributedWorker:
                         f"  Moving param: {name}, shape={list(param.shape)}, "
                         f"size={param.numel() * param.element_size() / 1024 ** 2:.2f}MB",
                         "cyan",
-                        logging.INFO,
+                        logging.DEBUG,
                     ),
                 )
 
@@ -827,7 +827,7 @@ class DistributedWorker:
                     f"Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, "
                     f"Max={max_allocated:.2f}GB",
                     "cyan",
-                    logging.INFO,
+                    logging.DEBUG,
                 ),
             )
 
@@ -855,7 +855,7 @@ class DistributedWorker:
                 f"Module [{label}]: "
                 f"Total params={total_params:,}, Size={total_bytes / 1024 ** 3:.2f}GB",
                 "cyan",
-                logging.INFO,
+                logging.DEBUG,
             ),
         )
 
@@ -865,7 +865,7 @@ class DistributedWorker:
                 (
                     f"  {dtype}: {stats['params']:,} params, {stats['bytes'] / 1024 ** 3:.2f}GB",
                     "cyan",
-                    logging.INFO,
+                    logging.DEBUG,
                 ),
             )
 

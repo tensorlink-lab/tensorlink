@@ -46,7 +46,7 @@ from tensorlink.ml.utils import (
     get_nested_module,
     get_optimizer_from_spec,
     optimizer_to_spec,
-    handle_output,
+    handle_output, attach_tensor,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -261,6 +261,9 @@ class DistributedModel(nn.Module):
 
         elif isinstance(args, tuple) and len(args) == 1:
             args = args[0]
+
+        args = attach_tensor(args, self.device)
+        kwargs = attach_tensor(kwargs, self.device)
 
         batch_size = get_batch_size(args)
 
@@ -646,6 +649,21 @@ class DistributedModel(nn.Module):
         # of queues if we wish to perform multiple epochs concurrently
 
     def generate(self, *args, **kwargs):
+        # Attach all input tensors to the model's device
+        if args:
+            args = tuple(attach_tensor(arg, self.device) for arg in args)
+
+        # Move all tensor kwargs to device
+        for key, value in kwargs.items():
+            if isinstance(value, torch.Tensor):
+                kwargs[key] = attach_tensor(value, self.device)
+            # Also handle lists/tuples of tensors (like past_key_values)
+            elif isinstance(value, (list, tuple)):
+                kwargs[key] = type(value)(
+                    attach_tensor(item, self.device) if isinstance(item, torch.Tensor) else item
+                    for item in value
+                )
+
         with _set_micro(self._thread_local, 0):
             return self.model.generate(*args, **kwargs)
 
@@ -1201,12 +1219,20 @@ class OffloadedModule(nn.Module):
             pass
 
     def generate(self, *args, **kwargs):
+        """
+        Send a generate request to an offloaded module on a worker. This method is only called
+        when a worker has an entire model loaded.
+        """
+        # Stream kwargs is used by DistributedModel trigger worker token streaming
         stream = kwargs.get("stream", False)
         if stream:
             kwargs.pop("stream")
 
-        args_bytes = tensor_to_bytes(args)
-        kwargs_bytes = tensor_to_bytes(kwargs)
+        detached_args = detach_tensor(args)
+        detached_kwargs = detach_tensor(kwargs)
+        args_bytes = tensor_to_bytes(detached_args)
+        kwargs_bytes = tensor_to_bytes(detached_kwargs)
+
         request_bytes = self.module_id.encode() + args_bytes + b"::" + kwargs_bytes
         size, shm_name = store_in_shared_memory(request_bytes, encoded=True)
         self.parent_model.send_request(
