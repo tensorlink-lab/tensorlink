@@ -551,17 +551,9 @@ class DistributedWorker:
                 )
 
         except Exception as e:
-            # Make sure skeleton is cleaned up even on error
-            if "CUDA out of memory." in e:
-                raise e
-
-            try:
-                del skeleton_module
-                gc.collect()
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-            except:
-                pass
+            # Make sure skeleton is cleaned up on error
+            del skeleton_module
+            self.cleanup_memory()
 
             logging.error(f"Failed to load model from HuggingFace: {str(e)}")
             raise ValueError(f"Failed to load model from HuggingFace: {str(e)}")
@@ -702,9 +694,6 @@ class DistributedWorker:
         # Convert grouped module to empty tensors on CPU to clear any weight references
         grouped_module = grouped_module.to_empty(device="cpu")
 
-        # Another cleanup pass
-        self.cleanup_memory()
-
         # Now load only the weights for the assigned layers
         self.send_request(
             "debug_print",
@@ -719,7 +708,23 @@ class DistributedWorker:
 
         self.cleanup_memory()
 
-        grouped_module = grouped_module.to(self.device)
+        # Move to device incrementally to avoid memory peaks
+        if self.device.type == "cuda":
+            # Enable expandable segments to reduce fragmentation
+            os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+            torch.cuda.empty_cache()
+
+            # Move parameters one at a time to minimize peak memory
+            with torch.no_grad():
+                for param_name, param in grouped_module.named_parameters():
+                    param.data = param.data.to(self.device)
+                    torch.cuda.empty_cache()
+
+                for buffer_name, buffer in grouped_module.named_buffers():
+                    buffer.data = buffer.data.to(self.device)
+                    torch.cuda.empty_cache()
+        else:
+            grouped_module = grouped_module.to(self.device)
 
         self.send_request(
             "debug_print",
