@@ -984,7 +984,6 @@ class DistributedWorker:
                 )
 
             else:
-                # Fallback: use pytorch_model.bin files
                 self.send_request(
                     "debug_print",
                     (

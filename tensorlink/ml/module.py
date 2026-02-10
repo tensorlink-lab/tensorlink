@@ -632,11 +632,11 @@ class DistributedModel(nn.Module):
             else:
                 raise "Custom models are currently not supported."
 
-        if host_modules:
-            self._load_host_modules(host_modules)
-
         if grouped_layers:
             self._wrap_grouped_layers(grouped_layers)
+
+        if host_modules:
+            self._load_host_modules(host_modules)
 
         assert isinstance(self.model, nn.Module), "Model Distribution Failed!"
 
@@ -650,19 +650,8 @@ class DistributedModel(nn.Module):
 
     def generate(self, *args, **kwargs):
         # Attach all input tensors to the model's device
-        if args:
-            args = tuple(attach_tensor(arg, self.device) for arg in args)
-
-        # Move all tensor kwargs to device
-        for key, value in kwargs.items():
-            if isinstance(value, torch.Tensor):
-                kwargs[key] = attach_tensor(value, self.device)
-            # Also handle lists/tuples of tensors (like past_key_values)
-            elif isinstance(value, (list, tuple)):
-                kwargs[key] = type(value)(
-                    attach_tensor(item, self.device) if isinstance(item, torch.Tensor) else item
-                    for item in value
-                )
+        args = attach_tensor(args, self.device)
+        kwargs = attach_tensor(kwargs, self.device)
 
         with _set_micro(self._thread_local, 0):
             return self.model.generate(*args, **kwargs)
@@ -922,19 +911,30 @@ class DistributedModel(nn.Module):
         )
 
     def _load_model_skeleton(self, model_type: str = "chat"):
-        """Load the HF model structure with empty weights"""
+        """
+        Load the HF model structure with empty weights.
+        """
+        # First, load the config
+        model_config = AutoConfig.from_pretrained(self.model_name)
+
+        # Then create model from config with init_empty_weights
         with init_empty_weights():
             if model_type in ("causal", "chat"):
-                self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                self.model = AutoModelForCausalLM.from_config(model_config)
             elif model_type == "seq2seq":
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+                self.model = AutoModelForSeq2SeqLM.from_config(model_config)
             elif model_type == "vision2text":
-                self.model = AutoModelForVision2Seq.from_pretrained(self.model_name)
+                self.model = AutoModelForVision2Seq.from_config(model_config)
             elif model_type == "audio2text":
-                self.model = AutoModelForSpeechSeq2Seq.from_pretrained(self.model_name)
+                self.model = AutoModelForSpeechSeq2Seq.from_config(model_config)
             else:
-                model_config = AutoConfig.from_pretrained(self.model_name)
                 self.model = AutoModel.from_config(model_config)
+
+        self.model.eval()  # Set to eval mode initially
+
+        # Ensure no cached gradients or cached computations
+        for param in self.model.parameters():
+            param.requires_grad = False
 
     def _load_host_modules(self, host_modules: Dict[str, Dict[str, Any]]):
         """
@@ -1068,82 +1068,130 @@ class DistributedModel(nn.Module):
         return final_model
 
     def _load_module_weights(
-        self, model_name: str, module_paths: List[str]
+        self,
+        model_name: str,
+        layer_paths: List[str],
     ) -> Dict[str, torch.Tensor]:
         """
-        Load weights for specific modules from HuggingFace.
-        Similar to worker's _load_specific_layer_weights but adapted for user side.
+        Load only the weights for specific layers from HuggingFace.
+        Uses safetensors for efficient weight loading without loading entire model.
+
+        If layer_paths contains 'model' or is empty, loads all weights.
         """
         state_dict = {}
 
         try:
-            # Download model files
-            logging.info(f"Downloading weights for {model_name}")
+            # Use snapshot_download for efficient caching
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> Checking cache for {model_name}",
+                    "blue",
+                    logging.DEBUG,
+                ),
+            )
             model_path = snapshot_download(
                 repo_id=model_name,
                 cache_dir=self.hf_cache_dir,
-                allow_patterns=["*.safetensors", "*.bin"],
+                allow_patterns=[
+                    "*.safetensors",
+                    "*.bin",
+                    "*.json",
+                ],
+                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
                 local_files_only=False,
             )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> Model located at: {model_path}",
+                    "blue",
+                    logging.DEBUG,
+                ),
+            )
 
-            # Find safetensors files
+            # Find all safetensors files
             safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
             if safetensor_files:
-                logging.info(f"Found {len(safetensor_files)} safetensors files")
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"DistributedWorker -> Found {len(safetensor_files)} safetensors files",
+                        "blue",
+                        logging.DEBUG,
+                    ),
+                )
+
+                # Load only specific layers
+                layer_path_to_idx = {path: idx for idx, path in enumerate(layer_paths)}
 
                 for shard_path in safetensor_files:
+                    self.send_request(
+                        "debug_print",
+                        (
+                            f"DistributedWorker -> Reading weights from {os.path.basename(shard_path)}",
+                            "blue",
+                            logging.DEBUG,
+                        ),
+                    )
+
                     with safe_open(shard_path, framework="pt", device="cpu") as f:
                         keys_loaded = 0
                         for key in f.keys():
-                            # Check if key matches any module path
-                            for module_path in module_paths:
-                                prefix = module_path + "."
-                                if key.startswith(prefix):
-                                    # Remove the module path prefix
-                                    new_key = key[len(prefix) :]
+                            # Check if key starts with any of our layer paths
+                            for layer_path, layer_idx in layer_path_to_idx.items():
+                                layer_prefix = layer_path + '.'
+                                if key.startswith(layer_prefix):
+                                    # Extract the part after the layer path
+                                    new_key = key[len(layer_prefix):]
+
+                                    if '.' in new_key:
+                                        new_key = new_key.split('.', 1)[1]
+                                    elif len(new_key.split(".")) > 1:
+                                        new_key = key.split('.', 1)[1]
+
                                     state_dict[new_key] = f.get_tensor(key)
                                     keys_loaded += 1
                                     break
 
                         if keys_loaded > 0:
-                            logging.info(
-                                f"Loaded {keys_loaded} tensors from "
-                                f"{os.path.basename(shard_path)}"
+                            self.send_request(
+                                "debug_print",
+                                (
+                                    f"DistributedWorker -> Loaded {keys_loaded} tensors from this shard",
+                                    "blue",
+                                    logging.DEBUG,
+                                ),
                             )
+
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"DistributedWorker -> Total: Loaded {len(state_dict)} weight tensors for {len(layer_paths)} layers",
+                        "blue",
+                        logging.DEBUG,
+                    ),
+                )
+
             else:
-                # Fallback to .bin files
-                logging.info("No safetensors found, trying .bin files")
-                bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
-
-                if not bin_files:
-                    raise ValueError(f"No weight files found in {model_path}")
-
-                for bin_path in bin_files:
-                    shard_dict = torch.load(bin_path, map_location="cpu")
-
-                    # FULL MODEL LOAD (no filtering, no prefix stripping)
-                    if module_paths == ["model"]:
-                        logging.info(
-                            f"Loading full state_dict from {os.path.basename(bin_path)}"
-                        )
-                        state_dict.update(shard_dict)
-                        continue
-
-                    # PARTIAL MODULE LOAD
-                    for key, value in shard_dict.items():
-                        for module_path in module_paths:
-                            prefix = module_path + "."
-                            if key.startswith(prefix):
-                                new_key = key[len(prefix) :]
-                                state_dict[new_key] = value
-                                break
-
-            logging.info(f"Loaded {len(state_dict)} weight tensors for host modules")
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"DistributedWorker -> No safetensors found, trying pytorch_model.bin",
+                        "yellow",
+                        logging.ERROR,
+                    ),
+                )
+                raise ValueError(f"No weight files found in {model_path}")
 
         except Exception as e:
-            logging.error(f"Error loading module weights: {e}")
-            raise
+            logging.error(f"Error loading weights: {e}")
+            raise ValueError(f"Failed to load layer weights: {str(e)}")
 
         return state_dict
 
