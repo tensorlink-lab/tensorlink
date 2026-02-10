@@ -214,7 +214,7 @@ class DistributedModel(nn.Module):
         self.my_modules = set()
 
         # Set device
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Optimizer and scheduler placeholders
         self.optimizer = optimizer
@@ -243,7 +243,7 @@ class DistributedModel(nn.Module):
         self.job_id = None
 
         if verbose:
-            print(f"DistributedModel '{self.name}' initialized on {self.device}")
+            print(f"DistributedModel '{self.name}' initialized on {self.device.type}")
 
         # Initialize model distribution
         if self.node.__class__.__name__ == "User":
@@ -930,6 +930,7 @@ class DistributedModel(nn.Module):
             else:
                 self.model = AutoModel.from_config(model_config)
 
+        self.model = self.model.to_empty(device=self.device)
         self.model.eval()  # Set to eval mode initially
 
         # Ensure no cached gradients or cached computations
@@ -992,7 +993,7 @@ class DistributedModel(nn.Module):
         state_dict = self._load_module_weights(self.model_name, [module_path])
 
         # Convert module to empty weights on CPU first
-        host_module = host_module.to_empty(device="cpu")
+        host_module = host_module.to_empty(device=self.device)
 
         # Load the state dict
         missing_keys, unexpected_keys = host_module.load_state_dict(
@@ -1013,6 +1014,86 @@ class DistributedModel(nn.Module):
         setattr(target, module_name, host_module)
 
         logging.info(f"Successfully loaded host module {module_class}")
+
+    def _load_module_weights(
+        self, model_name: str, module_paths: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Load weights for specific modules from HuggingFace.
+        Similar to worker's _load_specific_layer_weights but adapted for user side.
+        """
+        state_dict = {}
+
+        try:
+            # Download model files
+            logging.info(f"Downloading weights for {model_name}")
+            model_path = snapshot_download(
+                repo_id=model_name,
+                cache_dir=self.hf_cache_dir,
+                allow_patterns=["*.safetensors", "*.bin"],
+                local_files_only=False,
+            )
+
+            # Find safetensors files
+            safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
+            if safetensor_files:
+                logging.info(f"Found {len(safetensor_files)} safetensors files")
+
+                for shard_path in safetensor_files:
+                    with safe_open(shard_path, framework="pt", device="cpu") as f:
+                        keys_loaded = 0
+                        for key in f.keys():
+                            # Check if key matches any module path
+                            for module_path in module_paths:
+                                prefix = module_path + "."
+                                if key.startswith(prefix):
+                                    # Remove the module path prefix
+                                    new_key = key[len(prefix) :]
+                                    state_dict[new_key] = f.get_tensor(key)
+                                    keys_loaded += 1
+                                    break
+
+                        if keys_loaded > 0:
+                            logging.info(
+                                f"Loaded {keys_loaded} tensors from "
+                                f"{os.path.basename(shard_path)}"
+                            )
+            else:
+                # Fallback to .bin files
+                logging.info("No safetensors found, trying .bin files")
+                bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
+
+                if not bin_files:
+                    raise ValueError(f"No weight files found in {model_path}")
+
+                for bin_path in bin_files:
+                    shard_dict = torch.load(bin_path, map_location="cpu")
+
+                    # FULL MODEL LOAD (no filtering, no prefix stripping)
+                    if module_paths == ["model"]:
+                        logging.info(
+                            f"Loading full state_dict from {os.path.basename(bin_path)}"
+                        )
+                        state_dict.update(shard_dict)
+                        continue
+
+                    # PARTIAL MODULE LOAD
+                    for key, value in shard_dict.items():
+                        for module_path in module_paths:
+                            prefix = module_path + "."
+                            if key.startswith(prefix):
+                                new_key = key[len(prefix) :]
+                                state_dict[new_key] = value
+                                break
+
+            logging.info(f"Loaded {len(state_dict)} weight tensors for host modules")
+
+        except Exception as e:
+            logging.error(f"Error loading module weights: {e}")
+            raise
+
+        return state_dict
 
     def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
         """
@@ -1066,134 +1147,6 @@ class DistributedModel(nn.Module):
 
         logging.info(f"Successfully loaded full model {model_name}")
         return final_model
-
-    def _load_module_weights(
-        self,
-        model_name: str,
-        layer_paths: List[str],
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Load only the weights for specific layers from HuggingFace.
-        Uses safetensors for efficient weight loading without loading entire model.
-
-        If layer_paths contains 'model' or is empty, loads all weights.
-        """
-        state_dict = {}
-
-        try:
-            # Use snapshot_download for efficient caching
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Checking cache for {model_name}",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-            model_path = snapshot_download(
-                repo_id=model_name,
-                cache_dir=self.hf_cache_dir,
-                allow_patterns=[
-                    "*.safetensors",
-                    "*.bin",
-                    "*.json",
-                ],
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-                local_files_only=False,
-            )
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Model located at: {model_path}",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            # Find all safetensors files
-            safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-            if safetensor_files:
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> Found {len(safetensor_files)} safetensors files",
-                        "blue",
-                        logging.DEBUG,
-                    ),
-                )
-
-                # Load only specific layers
-                layer_path_to_idx = {path: idx for idx, path in enumerate(layer_paths)}
-
-                for shard_path in safetensor_files:
-                    self.send_request(
-                        "debug_print",
-                        (
-                            f"DistributedWorker -> Reading weights from {os.path.basename(shard_path)}",
-                            "blue",
-                            logging.DEBUG,
-                        ),
-                    )
-
-                    with safe_open(shard_path, framework="pt", device="cpu") as f:
-                        keys_loaded = 0
-                        for key in f.keys():
-                            # Check if key starts with any of our layer paths
-                            for layer_path, layer_idx in layer_path_to_idx.items():
-                                layer_prefix = layer_path + '.'
-                                if key.startswith(layer_prefix):
-                                    # Extract the part after the layer path
-                                    new_key = key[len(layer_prefix):]
-
-                                    if '.' in new_key:
-                                        new_key = new_key.split('.', 1)[1]
-                                    elif len(new_key.split(".")) > 1:
-                                        new_key = key.split('.', 1)[1]
-
-                                    state_dict[new_key] = f.get_tensor(key)
-                                    keys_loaded += 1
-                                    break
-
-                        if keys_loaded > 0:
-                            self.send_request(
-                                "debug_print",
-                                (
-                                    f"DistributedWorker -> Loaded {keys_loaded} tensors from this shard",
-                                    "blue",
-                                    logging.DEBUG,
-                                ),
-                            )
-
-                    if self.device == "cuda":
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> Total: Loaded {len(state_dict)} weight tensors for {len(layer_paths)} layers",
-                        "blue",
-                        logging.DEBUG,
-                    ),
-                )
-
-            else:
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> No safetensors found, trying pytorch_model.bin",
-                        "yellow",
-                        logging.ERROR,
-                    ),
-                )
-                raise ValueError(f"No weight files found in {model_path}")
-
-        except Exception as e:
-            logging.error(f"Error loading weights: {e}")
-            raise ValueError(f"Failed to load layer weights: {str(e)}")
-
-        return state_dict
 
 
 class OffloadedModule(nn.Module):

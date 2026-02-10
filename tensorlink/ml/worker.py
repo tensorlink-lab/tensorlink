@@ -740,7 +740,7 @@ class DistributedWorker:
         self.send_request(
             "debug_print",
             (
-                f"Starting gradual move to {device}...",
+                f"DistributedWorker -> Starting gradual move to {device}...",
                 "yellow",
                 logging.DEBUG,
             ),
@@ -773,7 +773,8 @@ class DistributedWorker:
 
             try:
                 module.layers[idx] = layer.to(device)
-                torch.cuda.synchronize()  # Ensure transfer completes
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()  # Ensure transfer completes
 
                 # Memory after
                 self._debug_memory_state(f"After layer {idx}")
