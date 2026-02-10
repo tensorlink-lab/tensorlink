@@ -6,7 +6,6 @@ import os
 import pickle
 import time
 import glob
-from contextlib import contextmanager
 
 from threading import Thread
 import torch
@@ -203,20 +202,12 @@ class DistributedWorker:
             'HF_HOME', os.path.join(os.path.expanduser('~'), '.cache', 'huggingface')
         )
 
-    @contextmanager
-    def memory_efficient_context(self):
-        """Context manager for memory-efficient operations"""
-        try:
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            gc.collect()
-            yield
-        finally:
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            gc.collect()
+    def cleanup_memory(self):
+        """Aggressively clean up memory"""
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
 
     def setup_cuda_environment(self):
         """Configure optimal CUDA settings for ML workloads"""
@@ -486,8 +477,7 @@ class DistributedWorker:
             raise ValueError("For standard loading, module_id must be provided")
 
         # Clear memory before loading
-        with self.memory_efficient_context():
-            pass
+        self.cleanup_memory()
 
         # Try to load the module based on trusted status
         if self.trusted:
@@ -503,12 +493,9 @@ class DistributedWorker:
             )
 
             # Ensure skeleton cleanup
-            with self.memory_efficient_context():
-                try:
-                    del skeleton_module
-                except:
-                    pass
-
+            del skeleton_module
+            self.cleanup_memory()
+            
         # Cleanup file
         try:
             os.remove(file_name)
@@ -535,6 +522,49 @@ class DistributedWorker:
             self.optimizers[module_id] = optimizer_cls
 
         self.send_request("module_loaded", module_id)
+
+    def _initialize_module_from_config(
+        self,
+        skeleton_module: torch.nn.Module,
+        model_name: str,
+        module_name: str,
+        module_info: Dict[str, Any],
+    ) -> torch.nn.Module:
+        """
+        Load model or specific layers from HuggingFace.
+        Handles both single modules and grouped layer ranges.
+        """
+        try:
+            # Determine if this is a grouped layer load
+            module_type = module_info.get('type', 'offloaded')
+            module_id = module_info.get("module_id")
+
+            if module_type == 'offloaded_group':
+                # Load grouped layers
+                return self._load_grouped_layers(
+                    model_name, skeleton_module, module_id, module_info
+                )
+            else:
+                # Load single module
+                return self._load_single_module(
+                    model_name, skeleton_module, module_info
+                )
+
+        except Exception as e:
+            # Make sure skeleton is cleaned up even on error
+            if "CUDA out of memory." in e:
+                raise e
+
+            try:
+                del skeleton_module
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            except:
+                pass
+
+            logging.error(f"Failed to load model from HuggingFace: {str(e)}")
+            raise ValueError(f"Failed to load model from HuggingFace: {str(e)}")
 
     def _load_grouped_layer_weights(
         self,
@@ -580,7 +610,7 @@ class DistributedWorker:
 
             shard_state_dict = {}
 
-            with safe_open(shard_path, framework="pt", device=str(self.device)) as f:
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     for layer_prefix, local_idx in layer_prefix_to_local_idx.items():
                         full_prefix = layer_prefix + "."
@@ -598,13 +628,11 @@ class DistributedWorker:
                         missing_keys.discard(new_key)
                         break
 
-                # Load this shard into the model
-                if shard_state_dict:
-                    target_module.load_state_dict(shard_state_dict, strict=False)
-
-                # Clear shard from memory
-                with self.memory_efficient_context():
-                    del shard_state_dict
+            # Load this shard into the model
+            if shard_state_dict:
+                target_module.load_state_dict(shard_state_dict, strict=False)
+                del shard_state_dict
+                self.cleanup_memory()
 
         if missing_keys:
             self.send_request(
@@ -625,6 +653,84 @@ class DistributedWorker:
                 logging.DEBUG,
             ),
         )
+
+    def _load_grouped_layers(
+        self,
+        model_name: str,
+        base_model: torch.nn.Module,
+        module_id: str,
+        module_info: Dict[str, Any],
+    ) -> torch.nn.Module:
+        """
+        Load a group of layers as a single module. Uses empty weights initialization
+        and only loads required layer weights.
+        """
+        layer_paths = module_info.get('layer_paths', [])
+        layer_range = module_info.get('layer_range', [])
+        expected_inputs = module_info.get('expected_inputs', [])
+        expected_outputs = module_info.get('expected_outputs', [])
+        loop_body_source = module_info.get('loop_body_source')
+        loop_iterator_name = module_info.get('loop_iterator_name')
+
+        if not layer_paths:
+            raise ValueError("layer_paths must be provided for grouped layer loading")
+
+        self.send_request(
+            "debug_print",
+            (
+                f"DistributedWorker -> Loading grouped layers {layer_range[0]}-{layer_range[1]} from {model_name}",
+                "blue",
+                logging.DEBUG,
+            ),
+        )
+
+        # Create the layer group wrapper with the skeleton's layers
+        # Extract references quickly before cleanup
+        grouped_module = _create_layer_group_wrapper(
+            base_model,
+            layer_paths,
+            expected_inputs,
+            expected_outputs,
+            loop_body_source,
+            loop_iterator_name,
+        )
+
+        # Aggressively cleanup skeleton immediately after extraction
+        del base_model
+        self.cleanup_memory()
+
+        # Convert grouped module to empty tensors on CPU to clear any weight references
+        grouped_module = grouped_module.to_empty(device="cpu")
+
+        # Another cleanup pass
+        self.cleanup_memory()
+
+        # Now load only the weights for the assigned layers
+        self.send_request(
+            "debug_print",
+            (
+                f"DistributedWorker -> Loading weights for layers {layer_range[0]}-{layer_range[1]}",
+                "blue",
+                logging.DEBUG,
+            ),
+        )
+
+        self._load_grouped_layer_weights(model_name, layer_paths, grouped_module)
+
+        self.cleanup_memory()
+
+        grouped_module = grouped_module.to(self.device)
+
+        self.send_request(
+            "debug_print",
+            (
+                f"DistributedWorker -> Successfully loaded {len(layer_paths)} layers with weights",
+                "blue",
+                logging.DEBUG,
+            ),
+        )
+
+        return grouped_module
 
     def _load_specific_layer_weights(
         self,
@@ -758,123 +864,6 @@ class DistributedWorker:
 
         return state_dict
 
-    def _initialize_module_from_config(
-        self,
-        skeleton_module: torch.nn.Module,
-        model_name: str,
-        module_name: str,
-        module_info: Dict[str, Any],
-    ) -> torch.nn.Module:
-        """
-        Load model or specific layers from HuggingFace.
-        Handles both single modules and grouped layer ranges.
-        """
-        try:
-            # Determine if this is a grouped layer load
-            module_type = module_info.get('type', 'offloaded')
-            module_id = module_info.get("module_id")
-
-            if module_type == 'offloaded_group':
-                # Load grouped layers
-                return self._load_grouped_layers(
-                    model_name, skeleton_module, module_id, module_info
-                )
-            else:
-                # Load single module
-                return self._load_single_module(
-                    model_name, skeleton_module, module_info
-                )
-
-        except Exception as e:
-            # Make sure skeleton is cleaned up even on error
-            if "CUDA out of memory." in e:
-                raise e
-
-            try:
-                del skeleton_module
-                gc.collect()
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-            except:
-                pass
-
-            logging.error(f"Failed to load model from HuggingFace: {str(e)}")
-            raise ValueError(f"Failed to load model from HuggingFace: {str(e)}")
-
-    def _load_grouped_layers(
-        self,
-        model_name: str,
-        base_model: torch.nn.Module,
-        module_id: str,
-        module_info: Dict[str, Any],
-    ) -> torch.nn.Module:
-        """
-        Load a group of layers as a single module. Uses empty weights initialization
-        and only loads required layer weights.
-        """
-        layer_paths = module_info.get('layer_paths', [])
-        layer_range = module_info.get('layer_range', [])
-        expected_inputs = module_info.get('expected_inputs', [])
-        expected_outputs = module_info.get('expected_outputs', [])
-        loop_body_source = module_info.get('loop_body_source')
-        loop_iterator_name = module_info.get('loop_iterator_name')
-
-        if not layer_paths:
-            raise ValueError("layer_paths must be provided for grouped layer loading")
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading grouped layers {layer_range[0]}-{layer_range[1]} from {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        # Create the layer group wrapper with the skeleton's layers
-        # Extract references quickly before cleanup
-        grouped_module = _create_layer_group_wrapper(
-            base_model,
-            layer_paths,
-            expected_inputs,
-            expected_outputs,
-            loop_body_source,
-            loop_iterator_name,
-        )
-
-        # Aggressively cleanup skeleton immediately after extraction
-        with self.memory_efficient_context():
-            del base_model
-
-        # Convert grouped module to empty tensors on CPU to clear any weight references
-        grouped_module = grouped_module.to_empty(device="cpu")
-
-        # Another cleanup pass
-        with self.memory_efficient_context():
-            pass
-
-        # Now load only the weights for the assigned layers
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading weights for layers {layer_range[0]}-{layer_range[1]}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-        self._load_grouped_layer_weights(model_name, layer_paths, grouped_module)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded {len(layer_paths)} layers with weights",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        return grouped_module
-
     def _load_single_module(
         self, model_name: str, base_model: torch.nn.Module, module_info: Dict[str, Any]
     ) -> torch.nn.Module:
@@ -909,8 +898,8 @@ class DistributedWorker:
             if module_id in self.modules:
                 del self.modules[module_id]
 
-            with self.memory_efficient_context():
-                del base_model
+            del base_model
+            self.cleanup_memory()
 
             final_model = self._load_full_model(model_name, module_info)
             return final_model
@@ -951,8 +940,8 @@ class DistributedWorker:
             base_model_prefix=base_model_prefix,
         )
 
-        with self.memory_efficient_context():
-            del base_model
+        del base_model
+        self.cleanup_memory()
 
         target_module = target_module.to_empty(device="cpu")
 
@@ -960,6 +949,9 @@ class DistributedWorker:
         missing_keys, unexpected_keys = target_module.load_state_dict(
             state_dict, strict=False
         )
+
+        del state_dict
+        self.cleanup_memory()
 
         if missing_keys:
             self.send_request(
@@ -994,55 +986,56 @@ class DistributedWorker:
         num_gpus = torch.cuda.device_count()
 
         # Force garbage collection before loading
-        with self.memory_efficient_context():
-            load_kwargs = {
-                "low_cpu_mem_usage": True,
-                "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
-            }
+        self.cleanup_memory()
+        
+        load_kwargs = {
+            "low_cpu_mem_usage": True,
+            "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
+        }
 
-            # Only use device_map for multi-GPU
-            if num_gpus > 1:
-                load_kwargs["device_map"] = "auto"
-            else:
-                # For single GPU, load to CPU first then move
-                load_kwargs["device_map"] = "cpu"
+        # Only use device_map for multi-GPU
+        if num_gpus > 1:
+            load_kwargs["device_map"] = "auto"
+        else:
+            # For single GPU, load to CPU first then move
+            load_kwargs["device_map"] = "cpu"
 
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Loading full model {model_name} with type {model_type}",
-                    "blue",
-                    logging.DEBUG,
-                ),
+        self.send_request(
+            "debug_print",
+            (
+                f"DistributedWorker -> Loading full model {model_name} with type {model_type}",
+                "blue",
+                logging.DEBUG,
+            ),
+        )
+
+        # Load model based on type
+        if model_type in ("causal", "chat"):
+            final_model = AutoModelForCausalLM.from_pretrained(
+                model_name, **load_kwargs
             )
-
-            # Load model based on type
-            if model_type in ("causal", "chat"):
-                final_model = AutoModelForCausalLM.from_pretrained(
-                    model_name, **load_kwargs
-                )
-            elif model_type == "seq2seq":
-                final_model = AutoModelForSeq2SeqLM.from_pretrained(
-                    model_name, **load_kwargs
-                )
-            elif model_type == "vision2text":
-                final_model = AutoModelForVision2Seq.from_pretrained(
-                    model_name, **load_kwargs
-                )
-            elif model_type == "audio2text":
-                final_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    model_name, **load_kwargs
-                )
-            else:
-                model_config = AutoConfig.from_pretrained(model_name)
-                final_model = AutoModel.from_pretrained(
-                    model_name, config=model_config, **load_kwargs
-                )
+        elif model_type == "seq2seq":
+            final_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, **load_kwargs
+            )
+        elif model_type == "vision2text":
+            final_model = AutoModelForVision2Seq.from_pretrained(
+                model_name, **load_kwargs
+            )
+        elif model_type == "audio2text":
+            final_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name, **load_kwargs
+            )
+        else:
+            model_config = AutoConfig.from_pretrained(model_name)
+            final_model = AutoModel.from_pretrained(
+                model_name, config=model_config, **load_kwargs
+            )
 
         # Move to GPU only after fully loaded (for single GPU)
         if num_gpus == 1 and self.device.type == "cuda":
-            with self.memory_efficient_context():
-                final_model = final_model.to(self.device)
+            self.cleanup_memory()
+            final_model = final_model.to(self.device)
 
         self.send_request(
             "debug_print",
