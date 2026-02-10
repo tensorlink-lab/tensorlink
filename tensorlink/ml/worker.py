@@ -708,23 +708,7 @@ class DistributedWorker:
 
         self.cleanup_memory()
 
-        # Move to device incrementally to avoid memory peaks
-        if self.device.type == "cuda":
-            # Enable expandable segments to reduce fragmentation
-            os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-            torch.cuda.empty_cache()
-
-            # Move parameters one at a time to minimize peak memory
-            with torch.no_grad():
-                for param_name, param in grouped_module.named_parameters():
-                    param.data = param.data.to(self.device)
-                    torch.cuda.empty_cache()
-
-                for buffer_name, buffer in grouped_module.named_buffers():
-                    buffer.data = buffer.data.to(self.device)
-                    torch.cuda.empty_cache()
-        else:
-            grouped_module = grouped_module.to(self.device)
+        grouped_module = grouped_module.to(self.device)
 
         self.send_request(
             "debug_print",
@@ -736,6 +720,145 @@ class DistributedWorker:
         )
 
         return grouped_module
+
+    def _debug_move_to_device(
+            self, module: torch.nn.Module, device: torch.device
+    ) -> torch.nn.Module:
+        """
+        Move module to device with granular tracking to identify OOM source.
+        Moves each layer individually and tracks memory after each transfer.
+        """
+        self.send_request(
+            "debug_print",
+            (
+                f"Starting gradual move to {device}...",
+                "yellow",
+                logging.INFO,
+            ),
+        )
+
+        # Move each layer individually
+        for idx, layer in enumerate(module.layers):
+            self.send_request(
+                "debug_print",
+                (
+                    f"Moving layer {idx + 1}/{len(module.layers)} to {device}...",
+                    "yellow",
+                    logging.INFO,
+                ),
+            )
+
+            # Track layer size
+            layer_params = sum(p.numel() * p.element_size() for p in layer.parameters())
+            self.send_request(
+                "debug_print",
+                (
+                    f"  Layer {idx} size: {layer_params / 1024 ** 3:.3f}GB",
+                    "cyan",
+                    logging.INFO,
+                ),
+            )
+
+            # Memory before
+            self._debug_memory_state(f"Before layer {idx}")
+
+            try:
+                module.layers[idx] = layer.to(device)
+                torch.cuda.synchronize()  # Ensure transfer completes
+
+                # Memory after
+                self._debug_memory_state(f"After layer {idx}")
+
+            except RuntimeError as e:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"OOM at layer {idx}/{len(module.layers)}: {str(e)}",
+                        "red",
+                        logging.ERROR,
+                    ),
+                )
+                raise
+
+        # Move any remaining module components (non-layer parameters)
+        self.send_request(
+            "debug_print",
+            (
+                "Moving remaining module components...",
+                "yellow",
+                logging.INFO,
+            ),
+        )
+
+        for name, param in module.named_parameters():
+            if not name.startswith('layers.'):
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"  Moving param: {name}, shape={list(param.shape)}, "
+                        f"size={param.numel() * param.element_size() / 1024 ** 2:.2f}MB",
+                        "cyan",
+                        logging.INFO,
+                    ),
+                )
+
+        return module
+
+    def _debug_memory_state(self, label: str) -> None:
+        """Print current GPU memory state."""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(self.device) / 1024 ** 3
+            reserved = torch.cuda.memory_reserved(self.device) / 1024 ** 3
+            max_allocated = torch.cuda.max_memory_allocated(self.device) / 1024 ** 3
+
+            self.send_request(
+                "debug_print",
+                (
+                    f"GPU Memory [{label}]: "
+                    f"Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, "
+                    f"Max={max_allocated:.2f}GB",
+                    "cyan",
+                    logging.INFO,
+                ),
+            )
+
+    def _debug_module_state(self, module: torch.nn.Module, label: str) -> None:
+        """Print module parameter statistics."""
+        total_params = 0
+        total_bytes = 0
+        params_by_dtype = {}
+
+        for name, param in module.named_parameters():
+            num_params = param.numel()
+            num_bytes = num_params * param.element_size()
+            total_params += num_params
+            total_bytes += num_bytes
+
+            dtype_str = str(param.dtype)
+            if dtype_str not in params_by_dtype:
+                params_by_dtype[dtype_str] = {'params': 0, 'bytes': 0}
+            params_by_dtype[dtype_str]['params'] += num_params
+            params_by_dtype[dtype_str]['bytes'] += num_bytes
+
+        self.send_request(
+            "debug_print",
+            (
+                f"Module [{label}]: "
+                f"Total params={total_params:,}, Size={total_bytes / 1024 ** 3:.2f}GB",
+                "cyan",
+                logging.INFO,
+            ),
+        )
+
+        for dtype, stats in params_by_dtype.items():
+            self.send_request(
+                "debug_print",
+                (
+                    f"  {dtype}: {stats['params']:,} params, {stats['bytes'] / 1024 ** 3:.2f}GB",
+                    "cyan",
+                    logging.INFO,
+                ),
+            )
 
     def _load_specific_layer_weights(
         self,
