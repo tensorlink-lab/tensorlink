@@ -499,7 +499,7 @@ class DistributedValidator(DistributedWorker):
                     self.CHECK_COUNTER % (self.GC_CHECK_INTERVAL * 20) == 0
                 ):  # less frequent than garbage collection
                     # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
-                    self._manage_auto_loaded_models()
+                    # self._manage_auto_loaded_models()
                     self.CHECK_COUNTER = 1
 
                 if self.models_initializing:
