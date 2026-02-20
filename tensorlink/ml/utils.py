@@ -4,11 +4,11 @@ from collections import defaultdict
 from typing import Dict
 import time
 import os
-import re
 import inspect
 import torch
 import torch.nn as nn
 from transformers.utils import ModelOutput
+from transformers.cache_utils import DynamicCache
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -178,7 +178,7 @@ def access_module(module: nn.Module, indices: list):
 def detach_tensor(obj, clone: bool = False):
     """
     Recursively detach tensors (and optionally clone them) from GPU to CPU.
-    Supports Tensor, ModelOutput, list, tuple, and dict.
+    Supports Tensor, DynamicCache, ModelOutput, list, tuple, and dict.
     """
     # Case 1: torch.Tensor
     if isinstance(obj, torch.Tensor):
@@ -187,34 +187,48 @@ def detach_tensor(obj, clone: bool = False):
             t = t.clone()
         return t
 
-    # Case 2: ModelOutput (transformers container)
+    # Case 2: DynamicCache
+    elif isinstance(obj, DynamicCache):
+        new_cache = DynamicCache()
+        new_cache.key_cache = [
+            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
+            for t in obj.key_cache
+        ]
+        new_cache.value_cache = [
+            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
+            for t in obj.value_cache
+        ]
+        new_cache._seen_tokens = obj._seen_tokens
+        return new_cache
+
+    # Case 3: ModelOutput (transformers container)
     elif isinstance(obj, ModelOutput):
-        new_out = obj.__class__()  # create same output class
+        new_out = obj.__class__()
         for key, value in obj.items():
-            if isinstance(value, (torch.Tensor, ModelOutput, list, tuple, dict)):
+            if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)):
                 new_out[key] = detach_tensor(value, clone=clone)
             else:
                 new_out[key] = value
         return new_out
 
-    # Case 3: list or tuple
+    # Case 4: list or tuple
     elif isinstance(obj, (list, tuple)):
         new_seq = [
             (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, ModelOutput, list, tuple, dict))
+                if isinstance(v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
                 else v
             )
             for v in obj
         ]
         return type(obj)(new_seq)
 
-    # Case 4: dictionary
+    # Case 5: dictionary
     elif isinstance(obj, dict):
         return {
             k: (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, ModelOutput, list, tuple, dict))
+                if isinstance(v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
                 else v
             )
             for k, v in obj.items()
@@ -225,36 +239,54 @@ def detach_tensor(obj, clone: bool = False):
 
 
 def attach_tensor(tensor, device):
-    if hasattr(tensor, "to"):
-        return tensor.to(device)
+    # Case 1: DynamicCache
+    if isinstance(tensor, DynamicCache):
+        tensor.key_cache = [
+            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            for t in tensor.key_cache
+        ]
+        tensor.value_cache = [
+            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            for t in tensor.value_cache
+        ]
+        return tensor
 
+    # Case 2: torch.Tensor
     elif isinstance(tensor, torch.Tensor):
         return tensor.to(device)
 
+    # Case 3: ModelOutput
     elif isinstance(tensor, ModelOutput):
         for key, value in tensor.items():
-            if isinstance(value, torch.Tensor):
-                tensor[key] = tensor[key].to(device)
-
+            if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)):
+                tensor[key] = attach_tensor(value, device)
         return tensor
 
+    # Case 4: list or tuple
     elif isinstance(tensor, (list, tuple)):
         return type(tensor)(
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            attach_tensor(t, device)
+            if isinstance(t, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
+            else t
             for t in tensor
         )
 
+    # Case 5: dict
     elif isinstance(tensor, dict):
         return {
             key: (
                 attach_tensor(value, device)
-                if isinstance(value, torch.Tensor)
+                if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
                 else value
             )
             for key, value in tensor.items()
         }
+
+    elif hasattr(tensor, "to"):
+        return tensor.to(device)
+
     else:
-        raise TypeError("Unsupported input type")
+        raise TypeError(f"Unsupported input type: {type(tensor)}")
 
 
 def enable_grad(tensor):

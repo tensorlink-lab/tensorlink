@@ -334,8 +334,12 @@ class DistributedWorker:
         kwargs = bytes_to_tensor(kwargs)
 
         # Move tensors to device
-        inp = enable_grad(attach_tensor(args, self.device))
-        kwargs = enable_grad(attach_tensor(kwargs, self.device))
+        inp = attach_tensor(args, self.device)
+        kwargs = attach_tensor(kwargs, self.device)
+
+        if module.training:
+            inp = enable_grad(inp)
+            kwargs = enable_grad(kwargs)
 
         if not isinstance(inp, (list, tuple)):
             inp = (inp,)

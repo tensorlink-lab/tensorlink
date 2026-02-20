@@ -16,7 +16,6 @@ import torch.optim as optim
 import torch.nn as nn
 import threading
 import logging
-import inspect
 import pickle
 import torch
 import types
@@ -29,12 +28,11 @@ import io
 import os
 
 from tensorlink.ml.injector import generate_new_forward_method, get_loop_io_signature
-from tensorlink.ml.optim import DistributedParameter, create_distributed_optimizer
+from tensorlink.ml.optim import create_distributed_optimizer
 from tensorlink.ml.graphing import ModelParser
 from tensorlink.ml.utils import (
     get_gpu_memory,
     get_batch_size,
-    handle_output,
     combine_micro_batches,
     split_micro_batches,
     replace_output_with_custom_grad,
@@ -43,10 +41,10 @@ from tensorlink.ml.utils import (
     bytes_to_tensor,
     tensor_to_bytes,
     enable_grad,
-    get_nested_module,
     get_optimizer_from_spec,
     optimizer_to_spec,
-    handle_output, attach_tensor,
+    handle_output,
+    attach_tensor,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -64,7 +62,6 @@ def contains_offloaded(module: nn.Module):
     exists = False
 
     for child in children:
-        # check if insntance offloadedsubmodule
         if isinstance(child, OffloadedModule):
             return True
         exists = exists or contains_offloaded(child)
@@ -601,6 +598,10 @@ class DistributedModel(nn.Module):
         return key, self.master_node.nodes[key]["mpc"]
 
     def distribute_model(self, config=None, model_type: str = "chat"):
+        """
+        Distributes models according to distribution config. Modules can be offloaded or loaded
+        on host. Offloaded modules can be individual models or a sequential group.
+        """
         # Retrieve model names and assign workers to offload. Contact candidate workers
         # and ensure they are ready to receive the model / train
         if config is None:
@@ -831,11 +832,10 @@ class DistributedModel(nn.Module):
             offloaded_module.spawn_worker(file_name, module_info)
             offloaded_modules.append(offloaded_module)
 
-        self._inject_grouped_layer_forward(grouped_layers, offloaded_modules)
+        self._inject_grouped_layer_forward(offloaded_modules)
 
     def _inject_grouped_layer_forward(
         self,
-        grouped_layers: Dict,
         offloaded_modules: List["OffloadedModule"],
     ):
         """
@@ -930,7 +930,6 @@ class DistributedModel(nn.Module):
             else:
                 self.model = AutoModel.from_config(model_config)
 
-        self.model = self.model.to_empty(device=self.device)
         self.model.eval()  # Set to eval mode initially
 
         # Ensure no cached gradients or cached computations
@@ -1256,7 +1255,7 @@ class OffloadedModule(nn.Module):
                 # Logic here to request another worker take his place
                 waiting = False
 
-        output = enable_grad(bytes_to_tensor(output_bytes))
+        output = bytes_to_tensor(output_bytes)
         return output
 
     def forward(self, *args, **kwargs):
@@ -1301,7 +1300,10 @@ class OffloadedModule(nn.Module):
                 # Logic here to request another worker take his place
                 waiting = False
 
-        output = enable_grad(bytes_to_tensor(output_bytes))
+        output = bytes_to_tensor(output_bytes)
+
+        if self.training:
+            output = enable_grad(output)
 
         self.parent_model.send_request(
             "release_memory", ("forward_queue", self.module_id, key)
