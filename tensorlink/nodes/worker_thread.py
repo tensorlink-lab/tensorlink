@@ -233,20 +233,20 @@ class WorkerThread(Torchnode):
 
     def get_available_gpu_memory(self):
         available_gpu_memory = get_gpu_memory(self._max_vram_gb)
+        reserved_loading_memory = 0
 
         for module_id, module_info in self.modules.items():
             # Account for modules that are not in CUDA and are still initializing
             if module_info.get("status", "loading") == "loading":
-                module_size = module_info["memory"]
-                available_gpu_memory -= module_size
+                reserved_loading_memory += module_info["memory"]
 
-        return available_gpu_memory
+        return max(0, available_gpu_memory - reserved_loading_memory)
 
     def handle_statistics_request(self, callee, additional_context: dict = None):
         """When a validator requests a stats request, return stats"""
         self.available_gpu_memory = self.get_available_gpu_memory()
 
-        # If mining is active, report total GPU memory since we'll stop mining on job acceptance
+        # If mining is active, report total GPU memory since mining will stop on job acceptance
         if self.mining_active is not None and self.mining_active.value:
             self.available_gpu_memory = self.total_gpu_memory
 

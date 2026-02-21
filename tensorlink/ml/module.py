@@ -45,6 +45,7 @@ from tensorlink.ml.utils import (
     optimizer_to_spec,
     handle_output,
     attach_tensor,
+    load_model_skeleton,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -211,7 +212,11 @@ class DistributedModel(nn.Module):
         self.my_modules = set()
 
         # Set device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            device
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
         # Optimizer and scheduler placeholders
         self.optimizer = optimizer
@@ -614,7 +619,7 @@ class DistributedModel(nn.Module):
         self.distributed_graph = config
 
         if self.model_name:
-            self._load_model_skeleton(model_type)
+            self.model = load_model_skeleton(self.model_name, model_type)
 
         grouped_layers = {}
         host_modules = {}
@@ -910,32 +915,6 @@ class DistributedModel(nn.Module):
             self, optimizer_type, **kwargs
         )
 
-    def _load_model_skeleton(self, model_type: str = "chat"):
-        """
-        Load the HF model structure with empty weights.
-        """
-        # First, load the config
-        model_config = AutoConfig.from_pretrained(self.model_name)
-
-        # Then create model from config with init_empty_weights
-        with init_empty_weights():
-            if model_type in ("causal", "chat"):
-                self.model = AutoModelForCausalLM.from_config(model_config)
-            elif model_type == "seq2seq":
-                self.model = AutoModelForSeq2SeqLM.from_config(model_config)
-            elif model_type == "vision2text":
-                self.model = AutoModelForVision2Seq.from_config(model_config)
-            elif model_type == "audio2text":
-                self.model = AutoModelForSpeechSeq2Seq.from_config(model_config)
-            else:
-                self.model = AutoModel.from_config(model_config)
-
-        self.model.eval()  # Set to eval mode initially
-
-        # Ensure no cached gradients or cached computations
-        for param in self.model.parameters():
-            param.requires_grad = False
-
     def _load_host_modules(self, host_modules: Dict[str, Dict[str, Any]]):
         """
         Load weights for modules that will be hosted locally
@@ -967,7 +946,13 @@ class DistributedModel(nn.Module):
         target = self.model
 
         # Handle 'model' prefix
-        if module_path_list[0] == "model" and not hasattr(self.model, "model"):
+        if module_path_list[0] == "model" and (
+            not hasattr(self.model, "model")
+            or (
+                len(module_path_list) > 1
+                and not hasattr(self.model.model, module_path_list[1])
+            )
+        ):
             module_path_list.pop(0)
 
         # Special case: entire model
@@ -1174,6 +1159,7 @@ class OffloadedModule(nn.Module):
 
         self.is_layer_group = False
         self.layer_range = None
+        self.training = self.parent_model.training
 
     def children(self):
         # Print the offloaded module and the original model name
@@ -1300,7 +1286,7 @@ class OffloadedModule(nn.Module):
                 # Logic here to request another worker take his place
                 waiting = False
 
-        output = bytes_to_tensor(output_bytes)
+        output = attach_tensor(bytes_to_tensor(output_bytes), self.parent_model.device)
 
         if self.training:
             output = enable_grad(output)

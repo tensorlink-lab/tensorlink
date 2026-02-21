@@ -7,8 +7,17 @@ import os
 import inspect
 import torch
 import torch.nn as nn
+from accelerate import init_empty_weights
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoModelForSeq2SeqLM,
+    AutoModelForSpeechSeq2Seq,
+)
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -205,7 +214,9 @@ def detach_tensor(obj, clone: bool = False):
     elif isinstance(obj, ModelOutput):
         new_out = obj.__class__()
         for key, value in obj.items():
-            if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)):
+            if isinstance(
+                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+            ):
                 new_out[key] = detach_tensor(value, clone=clone)
             else:
                 new_out[key] = value
@@ -216,7 +227,9 @@ def detach_tensor(obj, clone: bool = False):
         new_seq = [
             (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
+                if isinstance(
+                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else v
             )
             for v in obj
@@ -228,7 +241,9 @@ def detach_tensor(obj, clone: bool = False):
         return {
             k: (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
+                if isinstance(
+                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else v
             )
             for k, v in obj.items()
@@ -258,16 +273,22 @@ def attach_tensor(tensor, device):
     # Case 3: ModelOutput
     elif isinstance(tensor, ModelOutput):
         for key, value in tensor.items():
-            if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)):
+            if isinstance(
+                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+            ):
                 tensor[key] = attach_tensor(value, device)
         return tensor
 
     # Case 4: list or tuple
     elif isinstance(tensor, (list, tuple)):
         return type(tensor)(
-            attach_tensor(t, device)
-            if isinstance(t, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
-            else t
+            (
+                attach_tensor(t, device)
+                if isinstance(
+                    t, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
+                else t
+            )
             for t in tensor
         )
 
@@ -276,7 +297,9 @@ def attach_tensor(tensor, device):
         return {
             key: (
                 attach_tensor(value, device)
-                if isinstance(value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict))
+                if isinstance(
+                    value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else value
             )
             for key, value in tensor.items()
@@ -1110,3 +1133,32 @@ def optimizer_to_spec(optimizer_cls):
 
     optimizer_spec["type"] = optimizer_spec["class_path"].rsplit(".", 1)[-1]
     return optimizer_spec
+
+
+def load_model_skeleton(model_name: str, model_type: str = "chat"):
+    """
+    Load the HF model structure with empty weights.
+    """
+    # First, load the config
+    model_config = AutoConfig.from_pretrained(model_name)
+
+    # Then create model from config with init_empty_weights
+    with init_empty_weights():
+        if model_type in ("causal", "chat"):
+            skeleton_model = AutoModelForCausalLM.from_config(model_config)
+        elif model_type == "seq2seq":
+            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
+        elif model_type == "vision2text":
+            skeleton_model = AutoModelForVision2Seq.from_config(model_config)
+        elif model_type == "audio2text":
+            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
+        else:
+            skeleton_model = AutoModel.from_config(model_config)
+
+    skeleton_model.eval()  # Set to eval mode initially
+
+    # Ensure no cached gradients or cached computations
+    for param in skeleton_model.parameters():
+        param.requires_grad = False
+
+    return skeleton_model

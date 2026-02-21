@@ -502,9 +502,8 @@ class DistributedValidator(DistributedWorker):
                     # self._manage_auto_loaded_models()
                     self.CHECK_COUNTER = 1
 
-                if self.models_initializing:
-                    # Only call model management if we have models actively initializing
-                    self._try_finalize_initializing_models()
+                # Only call model management if we have models actively initializing
+                self._try_finalize_initializing_models()
 
             if self.CHECK_COUNTER % self.GC_CHECK_INTERVAL // 5 == 0:
                 # Get job data for inspection to see if we can accommodate the model
@@ -526,7 +525,7 @@ class DistributedValidator(DistributedWorker):
                         )
 
                         # Try to finalize if already initializing
-                        if can_allocate and job_id in self.models_initializing:
+                        if can_allocate:
                             self._finalize_hosted_job(job_id)
 
                     else:

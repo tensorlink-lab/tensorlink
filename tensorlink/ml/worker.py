@@ -10,7 +10,6 @@ import glob
 from threading import Thread
 import torch
 import torch.amp as amp
-from accelerate import init_empty_weights
 from typing import Optional, List, Dict, Any
 from transformers import (
     AutoConfig,
@@ -34,6 +33,7 @@ from tensorlink.ml.utils import (
     enable_grad,
     get_nested_module,
     get_optimizer_from_spec,
+    load_model_skeleton,
 )
 from tensorlink.ml.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
@@ -118,35 +118,6 @@ def normalize_past_key_values(pkv):
 
     # enforce tuple-of-tuples
     return tuple(tuple(layer) for layer in pkv)
-
-
-def _load_model_skeleton(model_name: str, module_id: str, model_type: str = "chat"):
-    """
-    Load the HF model structure with empty weights.
-    """
-    # First, load the config
-    model_config = AutoConfig.from_pretrained(model_name)
-
-    # Then create model from config with init_empty_weights
-    with init_empty_weights():
-        if model_type in ("causal", "chat"):
-            skeleton_model = AutoModelForCausalLM.from_config(model_config)
-        elif model_type == "seq2seq":
-            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
-        elif model_type == "vision2text":
-            skeleton_model = AutoModelForVision2Seq.from_config(model_config)
-        elif model_type == "audio2text":
-            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
-        else:
-            skeleton_model = AutoModel.from_config(model_config)
-
-    skeleton_model.eval()  # Set to eval mode initially
-
-    # Ensure no cached gradients or cached computations
-    for param in skeleton_model.parameters():
-        param.requires_grad = False
-
-    return skeleton_model
 
 
 class TensorlinkWorkerStreamer(BaseStreamer):
@@ -496,7 +467,7 @@ class DistributedWorker:
 
         # Else try Hugging Face for model info
         else:
-            skeleton_module = _load_model_skeleton(model_name, module_id)
+            skeleton_module = load_model_skeleton(model_name)
             module = self._initialize_module_from_config(
                 skeleton_module, model_name, module_name, module_info
             )
@@ -504,7 +475,7 @@ class DistributedWorker:
             # Ensure skeleton cleanup
             del skeleton_module
             self.cleanup_memory()
-            
+
         # Cleanup file
         try:
             os.remove(file_name)
@@ -735,7 +706,7 @@ class DistributedWorker:
         return grouped_module
 
     def _debug_move_to_device(
-            self, module: torch.nn.Module, device: torch.device
+        self, module: torch.nn.Module, device: torch.device
     ) -> torch.nn.Module:
         """
         Move module to device with granular tracking to identify OOM source.
@@ -821,9 +792,9 @@ class DistributedWorker:
     def _debug_memory_state(self, label: str) -> None:
         """Print current GPU memory state."""
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(self.device) / 1024 ** 3
-            reserved = torch.cuda.memory_reserved(self.device) / 1024 ** 3
-            max_allocated = torch.cuda.max_memory_allocated(self.device) / 1024 ** 3
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated(self.device) / 1024**3
 
             self.send_request(
                 "debug_print",
@@ -1047,15 +1018,25 @@ class DistributedWorker:
 
         # Extract the specific module with empty weights
         if parent_module_path and parent_module_path != "model":
-            target_module = get_nested_module(base_model, parent_module_path)
-            effective_layer_path = parent_module_path
+            try:
+                target_module = get_nested_module(base_model, parent_module_path)
+                effective_layer_path = parent_module_path
+            except (ValueError, AttributeError):
+                # Fall through to class-based lookup
+                effective_layer_path = _find_module_path_by_class(
+                    base_model, module_class_name
+                )
+                if effective_layer_path is None:
+                    target_module = base_model
+                    effective_layer_path = parent_module_path or "model"
+                else:
+                    target_module = get_nested_module(base_model, effective_layer_path)
         else:
             # parent_module_path is 'model' or empty -> try to find by class name
             effective_layer_path = _find_module_path_by_class(
                 base_model, module_class_name
             )
             if effective_layer_path is None:
-                # if not found, as a safe fallback return the root module but warn the caller
                 target_module = base_model
                 effective_layer_path = parent_module_path or "model"
             else:
@@ -1128,7 +1109,7 @@ class DistributedWorker:
 
         # Force garbage collection before loading
         self.cleanup_memory()
-        
+
         load_kwargs = {
             "low_cpu_mem_usage": True,
             "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
@@ -1261,7 +1242,11 @@ class DistributedWorker:
 
             self.send_request(
                 "debug_print",
-                ("DistributedWorker -> Optimizer zeroed.", "bright_blue", logging.DEBUG),
+                (
+                    "DistributedWorker -> Optimizer zeroed.",
+                    "bright_blue",
+                    logging.DEBUG,
+                ),
             )
             self.send_request("optimizer_response", (module_id, "zeroed"))
 

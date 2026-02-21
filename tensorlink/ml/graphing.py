@@ -1,7 +1,5 @@
-from tensorlink.ml.utils import estimate_memory
+from tensorlink.ml.utils import estimate_memory, load_model_skeleton
 from tensorlink.ml.injector import find_loop_in_module_hierarchy
-from transformers import AutoModel, AutoConfig
-from accelerate import init_empty_weights
 from collections import defaultdict
 from typing import Union, Optional, Dict, List, Any
 import torch.nn as nn
@@ -150,12 +148,83 @@ def _is_loop_iterable_module(module: nn.Module, module_path: str) -> bool:
         return False
 
 
+def _normalize_module_path(module_path: str, root_model: nn.Module) -> str:
+    """
+    Verify path resolves on root_model, and if not, try trimming the leading
+    'model.' prefix iteratively until it resolves, or we run out of options.
+    """
+    parts = module_path.split(".")
+
+    for start in range(len(parts)):
+        try:
+            target = root_model
+            for attr in parts[start:]:
+                target = getattr(target, attr)
+            # It resolved — reconstruct canonical path
+            # Always re-anchor to 'model.' prefix
+            suffix = ".".join(parts[start:])
+            return f"model.{suffix}" if not suffix.startswith("model") else suffix
+        except AttributeError:
+            continue
+
+    return module_path  # fallback: return as-is
+
+
+def _log_assignment_summary(config: dict, workers_state: dict):
+    """
+    Log a summary of the final assignment after configuration is complete.
+    """
+    print("\n" + "=" * 80)
+    print("ASSIGNMENT SUMMARY:")
+    print("=" * 80)
+
+    # Group by worker
+    worker_assignments = defaultdict(list)
+    for module_path, module_config in config.items():
+        if "offloaded" in module_config.get("type", ""):
+            worker_id = module_config["assigned_workers"][0]
+            worker_assignments[worker_id].append(
+                {
+                    "path": module_path,
+                    "memory": module_config.get("memory", 0),
+                    "module_type": module_config.get("module", "Unknown"),
+                }
+            )
+
+    # Print per-worker assignments
+    for worker_id in sorted(worker_assignments.keys()):
+        assignments = worker_assignments[worker_id]
+        total_memory = sum(a["memory"] for a in assignments)
+
+        print(f"\n{worker_id}:")
+        print(f"  Total Memory: {total_memory / 1e6:.2f}MB")
+        print(f"  Remaining: {workers_state[worker_id]['gpu_memory'] / 1e6:.2f}MB")
+        print(f"  Modules ({len(assignments)}):")
+
+        for assignment in assignments:
+            print(f"    • {assignment['path']}")
+            print(
+                f"      [{assignment['module_type']}] - {assignment['memory'] / 1e6:.2f}MB"
+            )
+
+    # Print unassigned modules if any
+    unassigned = [
+        path for path, cfg in config.items() if cfg.get("type") == "unassigned"
+    ]
+    if unassigned:
+        print(f"\n⚠ UNASSIGNED MODULES ({len(unassigned)}):")
+        for path in unassigned:
+            print(f"  • {path}")
+
+    print("=" * 80 + "\n")
+
+
 class ModelParser:
     """
     Parses a PyTorch model and constructs a distributed execution configuration
     for Tensorlink by analyzing module structure, memory requirements, and
     forward-pass behavior. It will assign individual models, modules, or groups
-    of sequential models in the model
+    of sequential layers in the model
 
     The ModelParser is responsible for:
     - Walking the module hierarchy.
@@ -320,9 +389,7 @@ class ModelParser:
 
         if isinstance(model, str):
             self.model_name = model
-            model_config = AutoConfig.from_pretrained(model)
-            with init_empty_weights():
-                model = AutoModel.from_config(model_config)
+            model = load_model_skeleton(self.model_name, model_type)
 
         workers_state = {
             wid: {"gpu_memory": w["gpu_memory"], "original_memory": w["gpu_memory"]}
@@ -350,6 +417,7 @@ class ModelParser:
         try:
             config, _, _ = self._recurse_module(
                 module=model,
+                root_module=None,
                 module_path="model",
                 workers_state=workers_state,
                 training=training,
@@ -370,7 +438,7 @@ class ModelParser:
 
             # Log final assignment summary
             if self.verbose:
-                self._log_assignment_summary(config, workers_state)
+                _log_assignment_summary(config, workers_state)
 
         except AssignmentError as e:
             success = False
@@ -390,6 +458,7 @@ class ModelParser:
         training: bool,
         trusted: bool,
         input_obfuscation: bool,
+        root_module: nn.Module = None,
         last_worker: Optional[str] = None,
         depth: int = 0,
         optimizer_type="adam",
@@ -406,6 +475,9 @@ class ModelParser:
         config = {}
 
         indent = "  " * depth
+
+        if root_module is None:
+            root_module = module
 
         # Log current module being processed
         if self.verbose:
@@ -504,13 +576,13 @@ class ModelParser:
                     self.assigned_memory = prev_assigned
                     raise
 
-        # Check if module is loop-iterable BEFORE trying to assign
+        # Check if module is loop-iterable before trying to assign
         is_loop_iterable = _is_loop_iterable_module(module, module_path)
 
         if is_loop_iterable and depth > 0:
             if self.verbose:
                 print(f"{indent}  Module is loop-iterable, will recurse into children")
-            # Don't try to assign, just skip to recursion
+            # Don't try to assign, skip to recursion
             assigned_worker = None
         else:
             assigned_worker = self._try_assign_worker(
@@ -588,12 +660,14 @@ class ModelParser:
         last_successful_worker = last_worker
 
         for child_name, child_module in children:
-            child_path = f"{module_path}.{child_name}"
+            raw_child_path = f"{module_path}.{child_name}"
+            child_path = _normalize_module_path(raw_child_path, root_module)
 
             try:
                 child_config, child_last_worker, obfuscation_layer_assigned = (
                     self._recurse_module(
                         module=child_module,
+                        root_module=root_module,
                         module_path=child_path,
                         workers_state=workers_state,
                         training=training,
@@ -668,54 +742,6 @@ class ModelParser:
                 return worker_id
 
         return None
-
-    def _log_assignment_summary(self, config: dict, workers_state: dict):
-        """
-        Log a summary of the final assignment after configuration is complete.
-        """
-        print("\n" + "=" * 80)
-        print("ASSIGNMENT SUMMARY:")
-        print("=" * 80)
-
-        # Group by worker
-        worker_assignments = defaultdict(list)
-        for module_path, module_config in config.items():
-            if "offloaded" in module_config.get("type", ""):
-                worker_id = module_config["assigned_workers"][0]
-                worker_assignments[worker_id].append(
-                    {
-                        "path": module_path,
-                        "memory": module_config.get("memory", 0),
-                        "module_type": module_config.get("module", "Unknown"),
-                    }
-                )
-
-        # Print per-worker assignments
-        for worker_id in sorted(worker_assignments.keys()):
-            assignments = worker_assignments[worker_id]
-            total_memory = sum(a["memory"] for a in assignments)
-
-            print(f"\n{worker_id}:")
-            print(f"  Total Memory: {total_memory / 1e6:.2f}MB")
-            print(f"  Remaining: {workers_state[worker_id]['gpu_memory'] / 1e6:.2f}MB")
-            print(f"  Modules ({len(assignments)}):")
-
-            for assignment in assignments:
-                print(f"    • {assignment['path']}")
-                print(
-                    f"      [{assignment['module_type']}] - {assignment['memory'] / 1e6:.2f}MB"
-                )
-
-        # Print unassigned modules if any
-        unassigned = [
-            path for path, cfg in config.items() if cfg.get("type") == "unassigned"
-        ]
-        if unassigned:
-            print(f"\n⚠ UNASSIGNED MODULES ({len(unassigned)}):")
-            for path in unassigned:
-                print(f"  • {path}")
-
-        print("=" * 80 + "\n")
 
     def get_module_path_info(self, module_path: str) -> dict:
         """

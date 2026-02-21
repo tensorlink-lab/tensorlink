@@ -397,7 +397,6 @@ class UserThread(Torchnode):
             raise "Validator not a seed validator"
 
         message = b"JOB-REQ" + json.dumps(job_info).encode()
-        print(f'STORING: {validator.node_id}, {job_info["id"]}')
         self._store_request(validator.node_id, job_info["id"])
         self.send_to_node(validator, message)
         start_time = time.time()

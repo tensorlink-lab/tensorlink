@@ -8,7 +8,6 @@ from tensorlink.nodes import (
     ValidatorConfig,
 )
 
-import logging
 import time
 import pytest
 import os
@@ -16,7 +15,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-PRINT_LEVEL = logging.DEBUG
+PRINT_LEVEL = 5  # Custom logging print level for VERBOSE
 ON_CHAIN = False
 LOCAL = True
 UPNP = False
