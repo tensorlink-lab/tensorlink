@@ -590,7 +590,13 @@ class DistributedWorker:
                     for layer_prefix, local_idx in layer_prefix_to_local_idx.items():
                         full_prefix = layer_prefix + "."
                         if not key.startswith(full_prefix):
-                            continue
+                            if not key.startswith(full_prefix.split(".", 1)[-1]):
+                                if not key.startswith(full_prefix.split(".", 2)[-1]):
+                                    continue
+                                else:
+                                    full_prefix = full_prefix.split(".", 2)[-1]
+                            else:
+                                full_prefix = full_prefix.split(".", 1)[-1]
 
                         # Strip "model.layers.XX."
                         subkey = key[len(full_prefix) :]
