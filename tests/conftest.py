@@ -48,7 +48,7 @@ def uwv_nodes():
             load_previous_state=False,
         ),
         enable_hosting=True,
-        max_vram_gb=MAX_MEMORY_GB,
+        max_memory_gb=MAX_MEMORY_GB,
         max_module_bytes=int(1e8),
     )
 
@@ -89,7 +89,7 @@ def wwv_nodes():
             load_previous_state=False,
         ),
         enable_hosting=True,
-        max_vram_gb=0,
+        max_memory_gb=0,
         max_module_bytes=int(1e6),
     )
 

@@ -226,7 +226,7 @@ def main():
             f"Invalid node type: {node_type}. Must be 'worker', 'validator', or 'both'"
         )
 
-    max_vram_gb = config.get("ml", {}).get("max_vram_gb", 0)
+    max_memory_gb = config.get("ml", {}).get("max_memory_gb", 0)
     max_module_bytes = config.get("ml", {}).get("max_module_bytes", 1e8)
     enable_hosting = True
 
@@ -256,10 +256,10 @@ def main():
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,
             utilization=True,
-            max_vram_gb=max_vram_gb,
         )
         run_worker_loop(worker, config)
 
@@ -278,7 +278,7 @@ def main():
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
             ),
             trusted=trusted,
-            max_vram_gb=max_vram_gb,
+            max_memory_gb=max_memory_gb,
             max_module_bytes=int(max_module_bytes),
             enable_hosting=enable_hosting,
         )

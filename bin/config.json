@@ -19,7 +19,7 @@
     },
     "ml": {
       "trusted": false,
-      "max_vram_gb": 0,
+      "max_memory_gb": 0,
       "max_module_bytes": 2e8
     }
   }

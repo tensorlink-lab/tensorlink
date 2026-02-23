@@ -313,7 +313,7 @@ class Validator(BaseNode):
         self,
         config: ValidatorConfig,
         enable_hosting: bool = False,
-        max_vram_gb: float = 0,
+        max_memory_gb: float = 0,
         max_module_bytes: int = 0,
         **kwargs,
     ):
@@ -324,13 +324,13 @@ class Validator(BaseNode):
         ----------
         enable_hosting : bool
             Whether this validator may host modules locally.
-        max_vram_gb : float
+        max_memory_gb : float
             Maximum VRAM budget for hosted execution.
         max_module_bytes : int
             Maximum module size allowed for hosting.
         """
         self._enable_hosting = enable_hosting
-        self._max_vram_gb = max_vram_gb
+        self._max_vram_gb = max_memory_gb
         self._max_module_bytes = max_module_bytes
 
         super().__init__(config, **kwargs)
