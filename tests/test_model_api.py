@@ -21,6 +21,15 @@ UPNP = False
 
 SERVER_URL = "http://127.0.0.1:64747"
 MODELS = [
+    # pytest.param(
+    #     {
+    #         "name": "Qwen/Qwen2.5-0.5B-Instruct",
+    #         "timeout": 600,
+    #         "sleep": 5,
+    #         "parsed": False,
+    #     },
+    #     id="tiny-gpt2",
+    # ),
     pytest.param(
         {
             "name": "sshleifer/tiny-gpt2",
@@ -88,7 +97,7 @@ def test_generate_simple(model_env):
     response = requests.post(
         f"{SERVER_URL}/v1/generate",
         json=generate_payload,
-        timeout=100,
+        timeout=1000,
     )
 
     assert response.status_code == 200

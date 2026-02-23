@@ -29,7 +29,7 @@ class WorkerThread(Torchnode):
         on_chain=False,
         local_test=False,
         mining_active=None,
-        max_vram_gb=0,
+        max_memory_gb=0,
         duplicate="",
         load_previous_state=False,
         priority_nodes: list = None,
@@ -45,7 +45,7 @@ class WorkerThread(Torchnode):
             local_test=local_test,
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
-            max_vram_gb=max_vram_gb,
+            max_memory_gb=max_memory_gb,
         )
 
         self.training = False
@@ -232,7 +232,7 @@ class WorkerThread(Torchnode):
     #         proof["output"] = handle_output(self.model(dummy_input)).sum()
 
     def get_available_gpu_memory(self):
-        available_gpu_memory = get_gpu_memory(self._max_vram_gb)
+        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
         reserved_loading_memory = 0
 
         for module_id, module_info in self.modules.items():

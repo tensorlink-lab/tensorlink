@@ -426,7 +426,7 @@ class DistributedValidator(DistributedWorker):
             if (
                 len(distribution["config"]) == 0
                 or offloaded_count
-                > 5  # TODO This limit on number of distributions is not ideal
+                > 6  # TODO This limit on number of distributions is not ideal
                 or not distribution["success"]
             ):
                 return {}

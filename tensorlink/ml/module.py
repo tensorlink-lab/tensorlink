@@ -46,6 +46,7 @@ from tensorlink.ml.utils import (
     handle_output,
     attach_tensor,
     load_model_skeleton,
+    get_nested_module,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -796,8 +797,7 @@ class DistributedModel(nn.Module):
         if module_path_list[0] == "model" and not hasattr(self.model, "model"):
             module_path_list.pop(0)
 
-        for attr in module_path_list[:-1]:
-            target = getattr(target, attr)
+        target = get_nested_module(target, ".".join(module_path_list[:-1]))
 
         setattr(target, module_path_list[-1], offloaded_module)
 

@@ -19,6 +19,7 @@ PRINT_LEVEL = 5  # Custom logging print level for VERBOSE
 ON_CHAIN = False
 LOCAL = True
 UPNP = False
+MAX_MEMORY_GB = 0.4
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +48,7 @@ def uwv_nodes():
             load_previous_state=False,
         ),
         enable_hosting=True,
-        max_vram_gb=0.4,
+        max_vram_gb=MAX_MEMORY_GB,
         max_module_bytes=int(1e8),
     )
 
@@ -58,6 +59,7 @@ def uwv_nodes():
             local_test=LOCAL,
             print_level=PRINT_LEVEL,
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         )
     )
 
@@ -87,8 +89,8 @@ def wwv_nodes():
             load_previous_state=False,
         ),
         enable_hosting=True,
-        max_vram_gb=0.4,
-        max_module_bytes=int(1e8),
+        max_vram_gb=0,
+        max_module_bytes=int(1e6),
     )
 
     worker = Worker(
@@ -98,6 +100,7 @@ def wwv_nodes():
             local_test=LOCAL,
             print_level=PRINT_LEVEL,
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         )
     )
 
@@ -109,6 +112,7 @@ def wwv_nodes():
             print_level=PRINT_LEVEL,
             load_previous_state=False,
             duplicate="1",
+            max_memory_gb=MAX_MEMORY_GB,
         )
     )
 

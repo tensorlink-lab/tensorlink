@@ -1017,22 +1017,8 @@ class DistributedWorker:
             return final_model
 
         # Extract the specific module with empty weights
-        if parent_module_path and parent_module_path != "model":
-            try:
-                target_module = get_nested_module(base_model, parent_module_path)
-                effective_layer_path = parent_module_path
-            except (ValueError, AttributeError):
-                # Fall through to class-based lookup
-                effective_layer_path = _find_module_path_by_class(
-                    base_model, module_class_name
-                )
-                if effective_layer_path is None:
-                    target_module = base_model
-                    effective_layer_path = parent_module_path or "model"
-                else:
-                    target_module = get_nested_module(base_model, effective_layer_path)
-        else:
-            # parent_module_path is 'model' or empty -> try to find by class name
+        try:
+            # Fall through to class-based lookup
             effective_layer_path = _find_module_path_by_class(
                 base_model, module_class_name
             )
@@ -1041,6 +1027,10 @@ class DistributedWorker:
                 effective_layer_path = parent_module_path or "model"
             else:
                 target_module = get_nested_module(base_model, effective_layer_path)
+
+        except Exception as e:
+            target_module = get_nested_module(base_model, module_info["module_path"])
+            effective_layer_path = module_info["module_path"]
 
         # Get name of model for loading weights
         base_model_prefix = getattr(base_model, "base_model_prefix", None)

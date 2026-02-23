@@ -1,3 +1,5 @@
+import json
+
 from tensorlink.ml.utils import estimate_memory, load_model_skeleton
 from tensorlink.ml.injector import find_loop_in_module_hierarchy
 from collections import defaultdict
@@ -146,28 +148,6 @@ def _is_loop_iterable_module(module: nn.Module, module_path: str) -> bool:
         if isinstance(module, nn.ModuleList):
             return True
         return False
-
-
-def _normalize_module_path(module_path: str, root_model: nn.Module) -> str:
-    """
-    Verify path resolves on root_model, and if not, try trimming the leading
-    'model.' prefix iteratively until it resolves, or we run out of options.
-    """
-    parts = module_path.split(".")
-
-    for start in range(len(parts)):
-        try:
-            target = root_model
-            for attr in parts[start:]:
-                target = getattr(target, attr)
-            # It resolved — reconstruct canonical path
-            # Always re-anchor to 'model.' prefix
-            suffix = ".".join(parts[start:])
-            return f"model.{suffix}" if not suffix.startswith("model") else suffix
-        except AttributeError:
-            continue
-
-    return module_path  # fallback: return as-is
 
 
 def _log_assignment_summary(config: dict, workers_state: dict):
@@ -415,6 +395,24 @@ class ModelParser:
         )
 
         try:
+            # We must detect any tied embedding weights here and force them
+            # to host loading if so
+            tied_embed_path = None
+            tied_lm_head_path = None
+
+            if hasattr(model, "get_output_embeddings") and hasattr(
+                model, "get_input_embeddings"
+            ):
+                out = model.get_output_embeddings()
+                inp = model.get_input_embeddings()
+                if out is not None and inp is not None:
+                    if out.weight.data_ptr() == inp.weight.data_ptr():
+                        for name, mod in model.named_modules():
+                            if mod is inp:
+                                tied_embed_path = f"model.{name}"
+                            if mod is out:
+                                tied_lm_head_path = f"model.{name}"
+
             config, _, _ = self._recurse_module(
                 module=model,
                 root_module=None,
@@ -432,9 +430,13 @@ class ModelParser:
                 max_seq_len=max_seq_len,
                 batch_size=batch_size,
                 model_type=model_type,
+                tied_embed_path=tied_embed_path,
+                tied_lm_head_path=tied_lm_head_path,
             )
 
             config = _group_sequential_layers(config)
+
+            print(json.dumps(config, indent=4))
 
             # Log final assignment summary
             if self.verbose:
@@ -471,6 +473,8 @@ class ModelParser:
         model_type: str = "chat",
         count_activations: bool = True,
         obfuscation_layer_assigned: bool = False,
+        tied_embed_path: Optional[str] = None,
+        tied_lm_head_path: Optional[str] = None,
     ):
         config = {}
 
@@ -526,6 +530,12 @@ class ModelParser:
                     f"input_obfuscation=True requires host_max_memory_bytes > 0 to keep "
                     f"the input transformation layer on the host."
                 )
+
+        # Force host loading for tied embedding to avoid weight duplication across workers
+        force_host = force_host or (
+            (tied_embed_path and module_path == tied_embed_path)
+            or (tied_lm_head_path and module_path == tied_lm_head_path)
+        )
 
         # Local host module if we have the memory OR input obfuscation is enabled
         if (
@@ -660,8 +670,7 @@ class ModelParser:
         last_successful_worker = last_worker
 
         for child_name, child_module in children:
-            raw_child_path = f"{module_path}.{child_name}"
-            child_path = _normalize_module_path(raw_child_path, root_module)
+            child_path = f"{module_path}.{child_name}"
 
             try:
                 child_config, child_last_worker, obfuscation_layer_assigned = (
@@ -684,6 +693,8 @@ class ModelParser:
                         batch_size=batch_size,
                         count_activations=False,
                         obfuscation_layer_assigned=obfuscation_layer_assigned,
+                        tied_embed_path=tied_embed_path,
+                        tied_lm_head_path=tied_lm_head_path,
                     )
                 )
 

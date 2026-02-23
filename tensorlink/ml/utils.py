@@ -5,6 +5,7 @@ from typing import Dict
 import time
 import os
 import inspect
+import psutil
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
@@ -123,26 +124,35 @@ def estimate_memory(
     return total, breakdown
 
 
-def get_gpu_memory(max_vram_gb: float = 0):
-    # Check how much available mpc we can allocate to the roles
-    memory = 0
-    max_memory_bytes = int(max_vram_gb * 1e9)
+def get_gpu_memory(max_vram_gb: float | None = None):
+    """
+    Returns available memory in bytes.
+    - Uses total free CUDA VRAM if available.
+    - Falls back to available system RAM if CUDA is not available.
+    - If max_vram_gb is provided, caps the returned memory.
+    """
 
+    # Determine max memory cap
+    max_memory_bytes = None
+    if max_vram_gb is not None and max_vram_gb > 0:
+        max_memory_bytes = int(max_vram_gb * 1e9)
+
+    # Case 1: CUDA available
     if torch.cuda.is_available():
-        devices = list(range(torch.cuda.device_count()))
-
-        for device in devices:
-            torch.cuda.set_device(device)
-            free, total = torch.cuda.memory.mem_get_info(device)
+        memory = 0
+        for device in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(device)
             memory += free
 
+    # Case 2: Fallback to system RAM
     else:
-        memory += 4e8
+        memory = psutil.virtual_memory().available
 
-    if max_memory_bytes > 0:
+    # Apply cap if specified
+    if max_memory_bytes is not None:
         memory = min(memory, max_memory_bytes)
 
-    return memory
+    return int(memory)
 
 
 def find_module(module: nn.Module, target_name: str, ids: list = []):
@@ -1086,12 +1096,15 @@ def get_nested_module(
     parts = path.split('.')
     current = model
 
-    if parts[0] == "model":
-        if not hasattr(model, "model"):
-            parts = parts[1:]
+    for i in range(len(parts)):
+        part = parts[i]
 
-    # Skip 'model' prefix if present (first attribute is always the model itself)
-    for part in parts:
+        if part == "model":
+            if not hasattr(current, "model") or (
+                len(parts) > i + 1 and not hasattr(current.model, parts[i + 1])
+            ):
+                continue
+
         if part.isdigit():
             # Handle list/ModuleList indexing
             current = current[int(part)]
