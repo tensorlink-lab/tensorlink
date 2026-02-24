@@ -436,8 +436,6 @@ class ModelParser:
 
             config = _group_sequential_layers(config)
 
-            print(json.dumps(config, indent=4))
-
             # Log final assignment summary
             if self.verbose:
                 _log_assignment_summary(config, workers_state)
@@ -537,6 +535,7 @@ class ModelParser:
             or (tied_lm_head_path and module_path == tied_lm_head_path)
         )
 
+
         # Local host module if we have the memory OR input obfuscation is enabled
         if (
             host_max_memory_bytes
@@ -553,6 +552,7 @@ class ModelParser:
                 # Don't force it if it truly won't fit
                 force_host = False
             else:
+                # Check if this is a tied module
                 prev_assigned = self.assigned_memory
                 try:
                     self.assigned_memory += memory
@@ -575,6 +575,9 @@ class ModelParser:
                             True if input_obfuscation and depth == 0 else False
                         ),
                     }
+
+                    if module_path == tied_lm_head_path and tied_embed_path:
+                        config[module_path]["tied_to"] = tied_embed_path
 
                     if self.verbose:
                         why = "obfuscation boundary" if force_host else "host budget"
@@ -617,6 +620,10 @@ class ModelParser:
                 "batch_size": batch_size,
                 "model_type": model_type,
             }
+
+            # Check if this is a tied module
+            if module_path == tied_lm_head_path and tied_embed_path:
+                config[module_path]["tied_to"] = tied_embed_path
 
             self.assigned_workers[assigned_worker].append(
                 {

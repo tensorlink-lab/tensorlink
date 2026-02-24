@@ -925,22 +925,38 @@ class DistributedWorker:
                     with safe_open(shard_path, framework="pt", device="cpu") as f:
                         keys_loaded = 0
                         for key in f.keys():
-                            # Check if key starts with any of our layer paths
                             for layer_path, layer_idx in layer_path_to_idx.items():
                                 layer_prefix = layer_path + '.'
-                                if key.startswith(layer_prefix):
-                                    # Extract the part after the layer path
-                                    new_key = key[len(layer_prefix) :]
 
-                                    if single and '.' in new_key:
-                                        # For single modules, remove one more level
-                                        new_key = new_key.split('.', 1)[1]
-                                    elif len(new_key.split(".")) > 1:
-                                        new_key = key.split('.', 1)[1]
+                                # Try matching with progressively shorter prefixes if not initially found
+                                matched_prefix = None
+                                trimmed_key = layer_prefix
+                                for _ in range(2):
+                                    if not key.startswith(layer_prefix):
+                                        trimmed_key = trimmed_key.split("model.", 1)[-1]
 
-                                    state_dict[new_key] = f.get_tensor(key)
-                                    keys_loaded += 1
-                                    break
+                                        if not key.startswith(trimmed_key):
+                                            continue
+                                        else:
+                                            matched_prefix = trimmed_key
+
+                                if not key.startswith(layer_prefix):
+                                    if matched_prefix is None:
+                                        continue
+                                    else:
+                                        layer_prefix = matched_prefix
+
+                                # Extract the part after the matched prefix
+                                new_key = key[len(layer_prefix):]
+
+                                if single and '.' in new_key:
+                                    new_key = new_key.split('.', 1)[1]
+                                elif len(new_key.split(".")) > 1:
+                                    new_key = key.split('.', 1)[1]
+
+                                state_dict[new_key] = f.get_tensor(key)
+                                keys_loaded += 1
+                                break
 
                         if keys_loaded > 0:
                             self.send_request(
@@ -1050,6 +1066,9 @@ class DistributedWorker:
                 logging.DEBUG,
             ),
         )
+
+        if module_info.get("tied_to"):
+            effective_layer_path = module_info["tied_to"]
 
         state_dict = self._load_specific_layer_weights(
             model_name,
