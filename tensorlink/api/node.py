@@ -14,7 +14,6 @@ import logging
 import uvicorn
 import asyncio
 import random
-import queue
 import time
 
 
@@ -300,7 +299,11 @@ class TensorlinkAPI:
             """List all currently loaded models"""
             try:
                 public_models = set(
-                    a.get("model_name", "") if a.get("public", False) else None
+                    (
+                        a.get("model_name", "")
+                        if a.get("public", False) and a.get("", "")
+                        else None
+                    )
                     for a in self.smart_node.modules.values()
                 )
 
@@ -473,6 +476,7 @@ class TensorlinkAPI:
                     and job_data.get("hosted")
                     and job_data.get("api")
                     and job_data.get("public")
+                    and job_data.get("active")
                 ):
                     status = "loaded"
                     message = f"Model {model_name} is loaded and ready"

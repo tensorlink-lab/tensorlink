@@ -548,7 +548,9 @@ class ValidatorThread(Torchnode):
                     if not api_request.processing and api_request.hf_name == model_name:
                         api_request.processing = True
                         api_request = self.endpoint_requests["incoming"].pop(i)
-                        self.response_queue.put({"status": "SUCCESS", "return": api_request})
+                        self.response_queue.put(
+                            {"status": "SUCCESS", "return": api_request}
+                        )
                         return
 
             self.response_queue.put({"status": "SUCCESS", "return": None})
@@ -574,7 +576,9 @@ class ValidatorThread(Torchnode):
             self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        self.response_queue.put({"status": "FAILURE", "error": "Invalid request format"})
+        self.response_queue.put(
+            {"status": "FAILURE", "error": "Invalid request format"}
+        )
 
     def _handle_job_req(self, data: bytes, node: Connection):
         """

@@ -947,7 +947,7 @@ class DistributedWorker:
                                         layer_prefix = matched_prefix
 
                                 # Extract the part after the matched prefix
-                                new_key = key[len(layer_prefix):]
+                                new_key = key[len(layer_prefix) :]
 
                                 if single and '.' in new_key:
                                     new_key = new_key.split('.', 1)[1]

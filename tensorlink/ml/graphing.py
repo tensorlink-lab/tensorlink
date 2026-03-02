@@ -246,7 +246,7 @@ class ModelParser:
         optimizer_spec: Optional[dict] = None,
         host_max_memory_bytes: int = 0,
         host_max_module_bytes: int = 0,
-        host_max_depth: int = 1,
+        host_max_depth: int = 2,
         max_offload_depth: int = 3,
         max_seq_len: int = 4096,
         batch_size: int = 1,
@@ -534,7 +534,6 @@ class ModelParser:
             (tied_embed_path and module_path == tied_embed_path)
             or (tied_lm_head_path and module_path == tied_lm_head_path)
         )
-
 
         # Local host module if we have the memory OR input obfuscation is enabled
         if (
