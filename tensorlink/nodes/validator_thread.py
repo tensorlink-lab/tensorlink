@@ -533,36 +533,48 @@ class ValidatorThread(Torchnode):
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""
-        # Case 1: ML process is checking for incoming requests
+        # Case 1: ML process polling for incoming requests
         if len(request) == 2:
             model_name, model_id = request
 
             if self.endpoint_requests["incoming"]:
                 for i, api_request in enumerate(self.endpoint_requests["incoming"]):
+                    # Skip cancelled requests and clean them up
+                    if getattr(api_request, 'cancelled', False):
+                        self.endpoint_requests["incoming"].pop(i)
+                        self.response_queue.put({"status": "SUCCESS", "return": None})
+                        return
+
                     if not api_request.processing and api_request.hf_name == model_name:
                         api_request.processing = True
                         api_request = self.endpoint_requests["incoming"].pop(i)
-                        self.response_queue.put(
-                            {"status": "SUCCESS", "return": api_request}
-                        )
+                        self.response_queue.put({"status": "SUCCESS", "return": api_request})
                         return
 
-            # No matching request found
             self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Case 2: ML process is returning completed result
+        # Case 2: ML process returning completed result
         elif len(request) == 1:
             response = request[0]
-            if response.processing:
-                self.endpoint_requests["outgoing"].append(response)
+
+            if getattr(response, 'cancelled', False):
+                # Client already gone, drop result
                 self.response_queue.put({"status": "SUCCESS", "return": None})
+                return
+
+            if response.processing and self.endpoint:
+                if response.stream:
+                    # Streaming is already handled token-by-token via send_token_to_stream
+                    pass
+                else:
+                    # Resolve the waiting Future directly
+                    self.endpoint.resolve_pending_request(response)
+
+            self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Invalid request format
-        self.response_queue.put(
-            {"status": "FAILURE", "error": "Invalid request format"}
-        )
+        self.response_queue.put({"status": "FAILURE", "error": "Invalid request format"})
 
     def _handle_job_req(self, data: bytes, node: Connection):
         """
