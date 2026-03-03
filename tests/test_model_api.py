@@ -34,7 +34,7 @@ MODELS = [
         {
             "name": "sshleifer/tiny-gpt2",
             "timeout": 60,
-            "sleep": 5,
+            "sleep": 10,
             "parsed": False,
         },
         id="tiny-gpt2",
@@ -59,10 +59,7 @@ def model_env(request, connected_wwv_nodes):
     cfg = request.param
     worker, worker2, validator, _ = connected_wwv_nodes
 
-    payload = {
-        "hf_name": cfg["name"],
-        "model_type": "causal",
-    }
+    payload = {"hf_name": cfg["name"], "model_type": "causal", "time": 300}
 
     response = requests.post(
         url=f"{SERVER_URL}/request-model",

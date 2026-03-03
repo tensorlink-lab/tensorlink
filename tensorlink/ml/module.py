@@ -209,7 +209,7 @@ class DistributedModel(nn.Module):
         self.n_datalines = 1  # Default data pipeline setting
 
         # Distributed graph and parameters
-        self.config = config
+        self.config = config if config else {}
         self.distributed_graph: Dict[str, Any] = {}
         self.parameters_storage: Dict[str, torch.Tensor] = {}
         self.my_modules = set()
