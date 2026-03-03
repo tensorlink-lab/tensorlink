@@ -466,11 +466,11 @@ class DistributedValidator(DistributedWorker):
 
             except Exception as e:
                 self._release_host_memory(job_data["id"])
-                print(str(e))
+                raise e
 
         except Exception as e:
             self._release_host_memory(job_data["id"])
-            raise
+            raise e
 
     def check_node(self):
         """Check for node requests/updates"""
@@ -945,8 +945,8 @@ class DistributedValidator(DistributedWorker):
                 model_name,
                 node=self.node,
                 training=False,
+                config=job_data.get("distribution"),
             )
-            distributed_model.config = job_data.get("distribution")
 
             self.models[job_id] = distributed_model
 

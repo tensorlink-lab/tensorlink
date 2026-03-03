@@ -170,6 +170,7 @@ class DistributedModel(nn.Module):
         training: bool = True,
         verbose: bool = False,
         tokenizer=None,
+        config: dict = None,
     ):
         """
         Parameters:
@@ -184,6 +185,7 @@ class DistributedModel(nn.Module):
             node (Optional[Any]): Pre-existing node instance for networking.
             verbose (bool): Enables debug messages if True.
             tokenizer: can be specified for inference
+            config (dict): Optional tensorlink model distribution configuration
         """
         super().__init__()
 
@@ -207,7 +209,7 @@ class DistributedModel(nn.Module):
         self.n_datalines = 1  # Default data pipeline setting
 
         # Distributed graph and parameters
-        self.config = {}
+        self.config = config
         self.distributed_graph: Dict[str, Any] = {}
         self.parameters_storage: Dict[str, torch.Tensor] = {}
         self.my_modules = set()
@@ -615,7 +617,7 @@ class DistributedModel(nn.Module):
 
         config = (
             config | self.config
-        )  # Update config with any modules we host on our this device
+        )  # Update config with any modules we host on device
 
         self.distributed_graph = config
 
@@ -921,12 +923,34 @@ class DistributedModel(nn.Module):
         """
         logging.info(f"Loading {len(host_modules)} host modules")
 
+        # Separate tied and untied modules
+        untied = {}
+        tied = {}
         for module_id, module_info in host_modules.items():
+            if module_info.get("tied_to"):
+                tied[module_id] = module_info
+            else:
+                untied[module_id] = module_info
+
+        # Load untied modules first so their weights are available for tying
+        for module_id, module_info in untied.items():
             try:
                 self._load_single_host_module(module_id, module_info)
             except Exception as e:
                 logging.error(f"Failed to load host module {module_id}: {e}")
                 raise
+
+        # Now resolve tied modules — share the tensor directly, no weight download needed
+        for module_id, module_info in tied.items():
+            try:
+                self._load_tied_host_module(module_id, module_info)
+            except Exception as e:
+                logging.error(f"Failed to load tied host module {module_id}: {e}")
+                raise
+
+        if hasattr(self.model, "tie_weights"):
+            logging.info("Re-tying weights after host module loading")
+            self.model.tie_weights()
 
     def _load_single_host_module(self, module_id: str, module_info: Dict[str, Any]):
         """
@@ -1028,15 +1052,22 @@ class DistributedModel(nn.Module):
                     with safe_open(shard_path, framework="pt", device="cpu") as f:
                         keys_loaded = 0
                         for key in f.keys():
-                            # Check if key matches any module path
                             for module_path in module_paths:
-                                prefix = module_path + "."
-                                if key.startswith(prefix):
-                                    # Remove the module path prefix
-                                    new_key = key[len(prefix) :]
-                                    state_dict[new_key] = f.get_tensor(key)
-                                    keys_loaded += 1
-                                    break
+                                # Try the path as-is, and also strip one leading "model." for better coverage
+                                candidates = [module_path]
+                                if module_path.startswith("model."):
+                                    candidates.append(module_path[len("model.") :])
+
+                                for candidate in candidates:
+                                    prefix = candidate + "."
+                                    if key.startswith(prefix):
+                                        new_key = key[len(prefix) :]
+                                        state_dict[new_key] = f.get_tensor(key)
+                                        keys_loaded += 1
+                                        break
+                                else:
+                                    continue
+                                break
 
                         if keys_loaded > 0:
                             logging.info(
@@ -1078,6 +1109,55 @@ class DistributedModel(nn.Module):
             raise
 
         return state_dict
+
+    def _load_tied_host_module(self, module_id: str, module_info: Dict[str, Any]):
+        """
+        Resolve a tied module by pointing its weight parameter directly
+        at the already-loaded source module's weight.
+        """
+        module_path = module_info.get("module_path")
+        tied_to_path = module_info.get("tied_to")
+
+        if not module_path or not tied_to_path:
+            logging.warning(
+                f"Tied module {module_id} missing module_path or tied_to, skipping"
+            )
+            return
+
+        logging.info(f"Tying {module_path} -> {tied_to_path}")
+
+        # Resolve the source (anchor) module
+        source_module = get_nested_module(self.model, tied_to_path)
+        if source_module is None:
+            raise RuntimeError(
+                f"Cannot resolve tied_to path '{tied_to_path}' — "
+                f"ensure it is loaded before tied modules."
+            )
+
+        # Resolve the target module
+        target_module = get_nested_module(self.model, module_path)
+        if target_module is None:
+            raise RuntimeError(f"Cannot resolve module_path '{module_path}' for tying.")
+
+        # Share the weight tensor — standard HF tie_weights() pattern
+        if not hasattr(source_module, "weight"):
+            raise RuntimeError(
+                f"Source module at '{tied_to_path}' has no 'weight' attribute to tie."
+            )
+
+        # Move source weight to correct device first if needed
+        source_weight = source_module.weight.to(self.device)
+        source_module.weight = nn.Parameter(
+            source_weight, requires_grad=source_module.weight.requires_grad
+        )
+
+        # Tie: assign the same Parameter object — not a copy
+        target_module.weight = source_module.weight
+
+        logging.info(
+            f"Successfully tied {module_path}.weight -> {tied_to_path}.weight "
+            f"(shape={source_module.weight.shape})"
+        )
 
     def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
         """

@@ -16,7 +16,7 @@ import time
 import os
 
 
-FREE_JOB_MAX_TIME = 60 * 30  # 30 minutes in seconds for a free job
+FREE_JOB_MAX_TIME = 60 * 60  # 60 minutes in seconds for a free job
 
 
 class ValidatorThread(Torchnode):
@@ -516,9 +516,9 @@ class ValidatorThread(Torchnode):
             self.rate_limiter.record_attempt(requesters_ip)
 
         if job_info.get("payment", 0) == 0:
-            _time = FREE_JOB_MAX_TIME
+            _time = min(job_info.get("time", FREE_JOB_MAX_TIME), FREE_JOB_MAX_TIME)
         else:
-            _time = job_info.get("time")
+            _time = job_info.get("time", FREE_JOB_MAX_TIME)
 
         job_data = job_info
 
