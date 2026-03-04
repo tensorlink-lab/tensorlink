@@ -482,15 +482,6 @@ class DistributedWorker:
         except:
             pass
 
-        # # Apply model optimizations
-        # if self.device.type == "cuda":
-        #     # Try converting to faster kernel implementations when possible
-        #     if hasattr(module, 'to_bettertransformer'):
-        #         try:
-        #             module = module.to_bettertransformer()
-        #         except:
-        #             pass
-
         # Initialize storage structures
         module.intermediates = {}
         module.host = module_info.get('host')
@@ -699,6 +690,8 @@ class DistributedWorker:
         self.cleanup_memory()
 
         self._debug_move_to_device(grouped_module, device=self.device)
+
+        self._apply_required_buffers(grouped_module, module_info)
 
         self.send_request(
             "debug_print",
@@ -1087,6 +1080,8 @@ class DistributedWorker:
             state_dict, strict=False
         )
 
+        self._apply_required_buffers(target_module, module_info)
+
         del state_dict
         self.cleanup_memory()
 
@@ -1183,6 +1178,82 @@ class DistributedWorker:
             ),
         )
         return final_model
+
+    def _apply_required_buffers(
+        self,
+        module: torch.nn.Module,
+        module_info: Dict[str, Any],
+    ) -> None:
+        """
+        Apply buffers that cannot be recovered from safetensors weights alone.
+        Handles three cases:
+          1. Buffer already exists on module (overwrite with correct values)
+          2. Buffer missing (register it)
+          3. Nested buffer path (navigate to submodule)
+        """
+        required_buffers = module_info.get("required_buffers", {})
+        if not required_buffers:
+            return
+
+        for key, buf_spec in required_buffers.items():
+            try:
+                # Reconstruct tensor
+                tensor = bytes_to_tensor(buf_spec.encode())
+
+                # Navigate to the correct submodule if key contains "."
+                parts = key.rsplit(".", 1)
+                if len(parts) == 2:
+                    submodule_path, buf_name = parts
+                    try:
+                        target = get_nested_module(module, submodule_path)
+                    except Exception:
+                        # Submodule doesn't exist — skip gracefully
+                        self.send_request(
+                            "debug_print",
+                            (
+                                f"Buffer submodule not found: {submodule_path}, skipping {key}",
+                                "yellow",
+                                logging.WARNING,
+                            ),
+                        )
+                        continue
+                else:
+                    target = module
+                    buf_name = key
+
+                # Apply: prefer re-registering to preserve correct buffer semantics
+                if hasattr(target, buf_name) and buf_name in dict(
+                    target.named_buffers(recurse=False)
+                ):
+                    # Buffer exists — just update data in-place
+                    existing = getattr(target, buf_name)
+                    if existing.shape == tensor.shape:
+                        existing.copy_(tensor)
+                    else:
+                        # Shape mismatch (e.g. seq_len changed) — re-register
+                        target.register_buffer(buf_name, tensor)
+                else:
+                    # Buffer not registered — register it now
+                    target.register_buffer(buf_name, tensor)
+
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Applied buffer {key}",
+                        "cyan",
+                        logging.DEBUG,
+                    ),
+                )
+
+            except Exception as e:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Failed to apply buffer {key}: {e}",
+                        "red",
+                        logging.ERROR,
+                    ),
+                )
 
     def process_state_update(self, module_id, state_update):
         """Process optimizer state updates"""

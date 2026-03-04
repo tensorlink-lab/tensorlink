@@ -250,25 +250,14 @@ class LayerGroupModule(torch.nn.Module):
             )
 
         func_lines.append("")
-        func_lines.append("    # Return outputs as a dictionary")
-        if len(self.output_vars) == 0:
-            if debug:
-                func_lines.append(
-                    "    print('[LayerGroupModule] Returning empty dict')"
-                )
-            func_lines.append(f"    return {{}}")
-        else:
-            # Build a dictionary with all output variables
-            output_items = [f"'{var}': {var}" for var in sorted(self.output_vars)]
-            if debug:
-                func_lines.append(
-                    f"    print(f'[LayerGroupModule] Returning {len(self.output_vars)} outputs')"
-                )
-                for var in sorted(self.output_vars):
-                    func_lines.append(
-                        f"    print(f'[LayerGroupModule] Output {var}: {{type({var})}}{{f\" shape={{list({var}.shape)}}\" if hasattr({var}, \"shape\") else \"\"}}')"
-                    )
-            func_lines.append(f"    return {{{', '.join(output_items)}}}")
+        func_lines.append(
+            "    # Return all inputs plus computed outputs (outputs take priority)"
+        )
+        func_lines.append("    _output = {}")
+        func_lines.append("    _output.update(kwargs)")
+        for var in sorted(self.output_vars):
+            func_lines.append(f"    _output['{var}'] = {var}")
+        func_lines.append("    return _output")
 
         forward_source = '\n'.join(func_lines)
 
@@ -527,39 +516,42 @@ def _generate_worker_calls(
 
     for idx, offloaded_module in enumerate(offloaded_modules):
         layer_range = getattr(offloaded_module, 'layer_range', 'unknown')
-
-        # Comment
         calls.append(f"{indent}# Worker {idx}: layers {layer_range}")
 
         # Build the call
-        call_str = f"{indent}_worker_output = self.offloaded_modules[{idx}]("
-
-        # Add all input variables as keyword arguments
+        call_str = f"{indent}_worker_output_{idx} = self.offloaded_modules[{idx}]("
         arg_parts = []
         for var in all_inputs:
             arg_parts.append(f"{indent}    {var}={var}")
-
-        # Add keyword arguments from original call that aren't already in inputs
-        for kw_arg, kw_value in layer_call_info['kwargs'].items():
+        for kw_arg, kw_value in layer_call_info.get('kwargs', {}).items():
             if kw_arg not in all_inputs:
                 arg_parts.append(f"{indent}    {kw_arg}={kw_value}")
-
-        # Add **kwargs if present in original
-        if layer_call_info['has_var_kwargs']:
+        if layer_call_info.get('has_var_kwargs'):
             arg_parts.append(f"{indent}    **flash_attn_kwargs")
 
         if arg_parts:
             call_str += "\n" + ",\n".join(arg_parts) + f"\n{indent}"
-
         call_str += ")"
         calls.append(call_str)
 
-        # Unpack the dictionary output
-        if all_outputs:
-            for var in all_outputs:
-                calls.append(f"{indent}{var} = _worker_output.get('{var}', {var})")
+        # Unpack explicitly computed output vars first
+        for var in all_outputs:
+            calls.append(
+                f"{indent}if isinstance(_worker_output_{idx}, dict) and '{var}' in _worker_output_{idx}:"
+            )
+            calls.append(f"{indent}    {var} = _worker_output_{idx}['{var}']")
 
-        calls.append("")
+        # update ANY input variable that appears in the
+        # worker output dict — catches in-place mutations like
+        # past_key_values that the AST analyzer missed entirely.
+        calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
+        for var in all_inputs:
+            calls.append(
+                f"{indent}    if '{var}' in _worker_output_{idx} and _worker_output_{idx}['{var}'] is not None:"
+            )
+            calls.append(f"{indent}        {var} = _worker_output_{idx}['{var}']")
+
+        calls.append(f"{indent}")
 
     return calls
 

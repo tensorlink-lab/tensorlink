@@ -19,6 +19,7 @@ class GenerationRequest(BaseModel):
 
     hf_name: str
     message: str
+    cancelled: bool = False
 
     # Generation params (all optional)
     max_new_tokens: Optional[int] = None

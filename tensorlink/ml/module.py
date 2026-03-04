@@ -8,7 +8,8 @@ from transformers import (
     AutoModelForVision2Seq,
     AutoModelForSpeechSeq2Seq,
 )
-from typing import Generator, List, Optional, Type, Dict, Any, Union
+from transformers.cache_utils import DynamicCache, Cache
+from typing import Generator, List, Optional, Type, Dict, Any, Union, Tuple
 from huggingface_hub import snapshot_download
 from contextlib import contextmanager
 from safetensors import safe_open
@@ -141,6 +142,42 @@ class CustomAutogradRouter(torch.autograd.Function):
 
         # Return gradients for model and output_tensor
         return None, grad_input
+
+
+def _collect_buffers(buffer_map, module_path, module_info):
+    """
+    Collect all buffers that belong to a given module path,
+    including buffers from submodules. Returns flat dict with
+    relative key paths suitable for load_state_dict / manual assignment.
+    """
+    collected = {}
+    candidates = [module_path]
+
+    if module_path.startswith("model."):
+        candidates.append(module_path[len("model.") :])
+
+        # For layer groups, also include submodule paths
+    layer_paths = module_info.get("layer_paths", [])
+
+    for buf_module_path, buffers in buffer_map.items():
+        for candidate in candidates + layer_paths:
+            if (
+                candidate == ""
+                or buf_module_path == candidate
+                or buf_module_path.startswith(candidate + ".")
+            ):
+                # Compute relative key
+                if candidate == "" or buf_module_path == candidate:
+                    rel_prefix = ""
+                else:
+                    rel_prefix = buf_module_path[len(candidate) + 1 :] + "."
+
+                for buf_name, buf_tensor in buffers.items():
+                    full_key = rel_prefix + buf_name
+                    collected[full_key] = buf_tensor
+                break
+
+    return collected
 
 
 class DistributedModel(nn.Module):
@@ -626,8 +663,17 @@ class DistributedModel(nn.Module):
 
         grouped_layers = {}
         host_modules = {}
+        buffer_map = self._discover_buffers_via_forward()
 
         for module_id, module_info in config.items():
+            module_path = module_info.get("module_path", "")
+            module_buffers = _collect_buffers(buffer_map, module_path, module_info)
+            if module_buffers:
+                # Serialize tensors to lists for JSON-safe transport
+                module_info["required_buffers"] = {
+                    k: tensor_to_bytes(v).decode() for k, v in module_buffers.items()
+                }
+
             if self.model_name:
                 module_type = module_info.get('type', 'offloaded')
 
@@ -1015,6 +1061,8 @@ class DistributedModel(nn.Module):
                 f"Host module {module_path} - Unexpected keys: {unexpected_keys}"
             )
 
+        self._apply_required_buffers(host_module, module_info)
+
         # Move to device
         host_module = host_module.to(self.device)
 
@@ -1212,6 +1260,165 @@ class DistributedModel(nn.Module):
         logging.info(f"Successfully loaded full model {model_name}")
         return final_model
 
+    def _discover_buffers_via_forward(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Run a single dummy forward through the FULL skeleton model (before any
+        module replacement) with hooks to capture which buffers are accessed
+        by which module path.
+
+        Returns: Dict mapping module_path -> {buf_name: tensor}
+
+        Requires the full model to be loaded on CPU — only viable if host has
+        enough RAM (e.g. 128GB). Must be called BEFORE distribute_model()
+        replaces modules with OffloadedModules.
+        """
+        assert isinstance(self.model, nn.Module), "Must be called before distribution"
+
+        # Temporarily materialize the full model off meta for the forward pass
+        # This is the expensive step — requires full model RAM
+        logging.info("Materializing full model for buffer discovery...")
+
+        # Load real weights into skeleton so forward produces valid buffers
+        full_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+        full_model.eval()
+
+        buffer_map: Dict[str, Dict[str, torch.Tensor]] = {}
+        # module_path -> {relative_buf_name -> tensor}
+
+        hooks = []
+
+        def make_pre_forward_hook(module_path: str):
+            """Capture buffer state BEFORE forward — catches all registered buffers."""
+
+            def hook(module, args, kwargs):
+                buffers = {}
+                # recurse=False — only this module's own buffers
+                for buf_name, buf in module.named_buffers(recurse=False):
+                    if buf is not None and buf.device.type != "meta":
+                        buffers[buf_name] = buf.detach().cpu().clone()
+
+                if buffers:
+                    if module_path not in buffer_map:
+                        buffer_map[module_path] = {}
+                    buffer_map[module_path].update(buffers)
+
+            return hook
+
+        def make_post_forward_hook(module_path: str):
+            """Capture buffer state AFTER forward — catches lazily created buffers
+            like cos_cached/sin_cached that only exist after first compute."""
+
+            def hook(module, args, kwargs, output):
+                buffers = {}
+                for buf_name, buf in module.named_buffers(recurse=False):
+                    if buf is not None and buf.device.type != "meta":
+                        # Only store if not already captured pre-forward,
+                        # or if it changed (lazy init case)
+                        existing = buffer_map.get(module_path, {}).get(buf_name)
+                        if existing is None or not torch.equal(existing, buf.cpu()):
+                            buffers[buf_name] = buf.detach().cpu().clone()
+
+                if buffers:
+                    if module_path not in buffer_map:
+                        buffer_map[module_path] = {}
+                    buffer_map[module_path].update(buffers)
+
+            return hook
+
+        # Register hooks on every module
+        for name, module in full_model.named_modules():
+            hooks.append(
+                module.register_forward_pre_hook(
+                    make_pre_forward_hook(name), with_kwargs=True
+                )
+            )
+            hooks.append(
+                module.register_forward_hook(
+                    make_post_forward_hook(name), with_kwargs=True
+                )
+            )
+
+        # Run minimal dummy forward — just 4 tokens, no grad
+        try:
+            logging.info("Running dummy forward for buffer discovery...")
+            dummy_input = torch.zeros(1, 2, dtype=torch.long)
+            with torch.no_grad():
+                full_model(dummy_input)
+            logging.info(
+                f"Buffer discovery complete: found buffers in {len(buffer_map)} modules"
+            )
+        except Exception as e:
+            logging.error(f"Buffer discovery forward failed: {e}")
+            raise
+        finally:
+            for hook in hooks:
+                hook.remove()
+            # Free the full model immediately — we only needed it for this pass
+            del full_model
+            gc.collect()
+
+        return buffer_map
+
+    def _apply_required_buffers(
+        self,
+        module: torch.nn.Module,
+        module_info: Dict[str, Any],
+    ) -> None:
+        """
+        Apply buffers that cannot be recovered from safetensors weights alone.
+        Mirrors DistributedWorker._apply_required_buffers for host-side modules.
+
+        Handles three cases:
+          1. Buffer already exists on module (overwrite with correct values)
+          2. Buffer missing (register it)
+          3. Nested buffer path (navigate to submodule)
+        """
+        required_buffers = module_info.get("required_buffers", {})
+        if not required_buffers:
+            return
+
+        for key, buf_spec in required_buffers.items():
+            try:
+                # Reconstruct tensor from serialized bytes
+                tensor = bytes_to_tensor(buf_spec.encode())
+
+                # Navigate to the correct submodule if key contains "."
+                parts = key.rsplit(".", 1)
+                if len(parts) == 2:
+                    submodule_path, buf_name = parts
+                    try:
+                        target = get_nested_module(module, submodule_path)
+                    except Exception:
+                        logging.warning(
+                            f"Buffer submodule not found: {submodule_path}, skipping {key}"
+                        )
+                        continue
+                else:
+                    target = module
+                    buf_name = key
+
+                # Apply: prefer re-registering to preserve correct buffer semantics
+                existing_buffers = dict(target.named_buffers(recurse=False))
+                if hasattr(target, buf_name) and buf_name in existing_buffers:
+                    existing = getattr(target, buf_name)
+                    if existing.shape == tensor.shape:
+                        existing.copy_(tensor)
+                    else:
+                        # Shape mismatch (e.g. seq_len changed) — re-register
+                        target.register_buffer(buf_name, tensor)
+                else:
+                    target.register_buffer(buf_name, tensor)
+
+                logging.debug(f"Applied buffer {key} to host module")
+
+            except Exception as e:
+                logging.error(f"Failed to apply buffer {key} to host module: {e}")
+
 
 class OffloadedModule(nn.Module):
     """
@@ -1328,7 +1535,6 @@ class OffloadedModule(nn.Module):
         start_time = time.time()
         n_batch = self.parent_model.model.n_batch
         n_micro = getattr(self.parent_model._thread_local, "micro", None)
-
         tag = [n_batch, n_micro, self.module_id]
 
         # Store the intermediate tensor for backwards pass

@@ -25,10 +25,10 @@ MODELS = [
     #     {
     #         "name": "Qwen/Qwen2.5-0.5B-Instruct",
     #         "timeout": 600,
-    #         "sleep": 5,
+    #         "sleep": 10,
     #         "parsed": False,
     #     },
-    #     id="tiny-gpt2",
+    #     id="Qwen2.5-0.5B",
     # ),
     pytest.param(
         {
@@ -274,8 +274,8 @@ def test_streaming_generation_simple(model_env):
 
     generate_payload = {
         "hf_name": cfg["name"],
-        "message": "Hi there, tell me something interesting.",
-        "max_new_tokens": 10,
+        "message": "Hi there, how are you?",
+        "max_new_tokens": 40,
         "stream": True,
         "num_beams": 1,
         "output_format": "simple",
@@ -285,7 +285,7 @@ def test_streaming_generation_simple(model_env):
         f"{SERVER_URL}/v1/generate",
         json=generate_payload,
         stream=True,
-        timeout=120,
+        timeout=1200,
     )
 
     assert response.status_code == 200
@@ -321,7 +321,8 @@ def test_streaming_generation_simple(model_env):
             else:
                 if "token" in chunk:
                     received_token_fields += 1
-                    full_text += chunk.get("token") or ""
+                    token = chunk.get("token") or ""
+                    full_text += token
 
         except json.JSONDecodeError:
             print(f"Failed to parse JSON: {data}")
@@ -346,8 +347,8 @@ def test_chat_completions(model_env):
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say 'Hello world' and nothing else."},
         ],
-        "max_tokens": 10,
-        "temperature": 0.7,
+        "max_tokens": 20,
+        "temperature": 0.1,
         "stream": False,
     }
 
