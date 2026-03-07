@@ -180,6 +180,60 @@ def _collect_buffers(buffer_map, module_path, module_info):
     return collected
 
 
+def _apply_required_buffers(
+    module: torch.nn.Module, module_info: Dict[str, Any]
+) -> None:
+    """
+    Apply buffers that cannot be recovered from safetensors weights alone.
+    Mirrors DistributedWorker._apply_required_buffers for host-side modules.
+
+    Handles three cases:
+      1. Buffer already exists on module (overwrite with correct values)
+      2. Buffer missing (register it)
+      3. Nested buffer path (navigate to submodule)
+    """
+    required_buffers = module_info.get("required_buffers", {})
+    if not required_buffers:
+        return
+
+    for key, buf_spec in required_buffers.items():
+        try:
+            # Reconstruct tensor from serialized bytes
+            tensor = bytes_to_tensor(buf_spec.encode())
+
+            # Navigate to the correct submodule if key contains "."
+            parts = key.rsplit(".", 1)
+            if len(parts) == 2:
+                submodule_path, buf_name = parts
+                try:
+                    target = get_nested_module(module, submodule_path)
+                except Exception:
+                    logging.warning(
+                        f"Buffer submodule not found: {submodule_path}, skipping {key}"
+                    )
+                    continue
+            else:
+                target = module
+                buf_name = key
+
+            # Apply: prefer re-registering to preserve correct buffer semantics
+            existing_buffers = dict(target.named_buffers(recurse=False))
+            if hasattr(target, buf_name) and buf_name in existing_buffers:
+                existing = getattr(target, buf_name)
+                if existing.shape == tensor.shape:
+                    existing.copy_(tensor)
+                else:
+                    # Shape mismatch (e.g. seq_len changed) — re-register
+                    target.register_buffer(buf_name, tensor)
+            else:
+                target.register_buffer(buf_name, tensor)
+
+            logging.debug(f"Applied buffer {key} to host module")
+
+        except Exception as e:
+            logging.error(f"Failed to apply buffer {key} to host module: {e}")
+
+
 class DistributedModel(nn.Module):
     """
     A modular distributed model that supports offloading submodules
@@ -670,9 +724,12 @@ class DistributedModel(nn.Module):
             module_buffers = _collect_buffers(buffer_map, module_path, module_info)
             if module_buffers:
                 # Serialize tensors to lists for JSON-safe transport
-                module_info["required_buffers"] = {
-                    k: tensor_to_bytes(v).decode() for k, v in module_buffers.items()
-                }
+                try:
+                    module_info["required_buffers"] = {
+                        k: tensor_to_bytes(v) for k, v in module_buffers.items()
+                    }
+                except Exception as e:
+                    print(str(e))
 
             if self.model_name:
                 module_type = module_info.get('type', 'offloaded')
@@ -1061,7 +1118,7 @@ class DistributedModel(nn.Module):
                 f"Host module {module_path} - Unexpected keys: {unexpected_keys}"
             )
 
-        self._apply_required_buffers(host_module, module_info)
+        _apply_required_buffers(host_module, module_info)
 
         # Move to device
         host_module = host_module.to(self.device)
@@ -1364,61 +1421,6 @@ class DistributedModel(nn.Module):
 
         return buffer_map
 
-    def _apply_required_buffers(
-        self,
-        module: torch.nn.Module,
-        module_info: Dict[str, Any],
-    ) -> None:
-        """
-        Apply buffers that cannot be recovered from safetensors weights alone.
-        Mirrors DistributedWorker._apply_required_buffers for host-side modules.
-
-        Handles three cases:
-          1. Buffer already exists on module (overwrite with correct values)
-          2. Buffer missing (register it)
-          3. Nested buffer path (navigate to submodule)
-        """
-        required_buffers = module_info.get("required_buffers", {})
-        if not required_buffers:
-            return
-
-        for key, buf_spec in required_buffers.items():
-            try:
-                # Reconstruct tensor from serialized bytes
-                tensor = bytes_to_tensor(buf_spec.encode())
-
-                # Navigate to the correct submodule if key contains "."
-                parts = key.rsplit(".", 1)
-                if len(parts) == 2:
-                    submodule_path, buf_name = parts
-                    try:
-                        target = get_nested_module(module, submodule_path)
-                    except Exception:
-                        logging.warning(
-                            f"Buffer submodule not found: {submodule_path}, skipping {key}"
-                        )
-                        continue
-                else:
-                    target = module
-                    buf_name = key
-
-                # Apply: prefer re-registering to preserve correct buffer semantics
-                existing_buffers = dict(target.named_buffers(recurse=False))
-                if hasattr(target, buf_name) and buf_name in existing_buffers:
-                    existing = getattr(target, buf_name)
-                    if existing.shape == tensor.shape:
-                        existing.copy_(tensor)
-                    else:
-                        # Shape mismatch (e.g. seq_len changed) — re-register
-                        target.register_buffer(buf_name, tensor)
-                else:
-                    target.register_buffer(buf_name, tensor)
-
-                logging.debug(f"Applied buffer {key} to host module")
-
-            except Exception as e:
-                logging.error(f"Failed to apply buffer {key} to host module: {e}")
-
 
 class OffloadedModule(nn.Module):
     """
@@ -1547,7 +1549,7 @@ class OffloadedModule(nn.Module):
         detached_args = detach_tensor(args, clone=True)
         args_bytes = tensor_to_bytes(detached_args)
         kwargs_bytes = tensor_to_bytes(kwargs)
-        forward_bytes = args_bytes + b"|" + kwargs_bytes
+        forward_bytes = len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
 
         size, shm_name = store_in_shared_memory(forward_bytes, encoded=True)
 
@@ -1571,8 +1573,8 @@ class OffloadedModule(nn.Module):
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
                 waiting = False
-
-        output = attach_tensor(bytes_to_tensor(output_bytes), self.parent_model.device)
+        output = bytes_to_tensor(output_bytes)
+        output = attach_tensor(output, self.parent_model.device)
 
         if self.training:
             output = enable_grad(output)

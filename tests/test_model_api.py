@@ -23,12 +23,12 @@ SERVER_URL = "http://127.0.0.1:64747"
 MODELS = [
     # pytest.param(
     #     {
-    #         "name": "Qwen/Qwen2.5-0.5B-Instruct",
+    #         "name": "Qwen/Qwen2.5-1.5B-Instruct",
     #         "timeout": 600,
-    #         "sleep": 10,
+    #         "sleep": 20,
     #         "parsed": False,
     #     },
-    #     id="Qwen2.5-0.5B",
+    #     id="Qwen2.5-1.5B",
     # ),
     pytest.param(
         {
@@ -323,6 +323,7 @@ def test_streaming_generation_simple(model_env):
                     received_token_fields += 1
                     token = chunk.get("token") or ""
                     full_text += token
+                    print(f"TOKEN: {token}")
 
         except json.JSONDecodeError:
             print(f"Failed to parse JSON: {data}")

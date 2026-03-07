@@ -299,10 +299,12 @@ class DistributedWorker:
         module = self.modules[module_id]
 
         # Get data from shared memory
-        tensor_bytes = get_from_shared_memory(size, name, encoded=True)
-        args, kwargs = tensor_bytes.split(b"|")
-        args = bytes_to_tensor(args)
-        kwargs = bytes_to_tensor(kwargs)
+        data = get_from_shared_memory(size, name, encoded=True)
+        args_len = int.from_bytes(data[:8], "big")
+        args_bytes = data[8 : 8 + args_len]
+        kwargs_bytes = data[8 + args_len :]
+        args = bytes_to_tensor(args_bytes)
+        kwargs = bytes_to_tensor(kwargs_bytes)
 
         # Move tensors to device
         inp = attach_tensor(args, self.device)
@@ -1192,13 +1194,13 @@ class DistributedWorker:
           3. Nested buffer path (navigate to submodule)
         """
         required_buffers = module_info.get("required_buffers", {})
-        if not required_buffers:
+        if not required_buffers or required_buffers == b"{}":
             return
 
         for key, buf_spec in required_buffers.items():
             try:
                 # Reconstruct tensor
-                tensor = bytes_to_tensor(buf_spec.encode())
+                tensor = bytes_to_tensor(buf_spec)
 
                 # Navigate to the correct submodule if key contains "."
                 parts = key.rsplit(".", 1)

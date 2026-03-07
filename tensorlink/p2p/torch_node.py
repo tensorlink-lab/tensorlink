@@ -335,17 +335,31 @@ class Torchnode(Smartnode):
         """
         module_id = data[6:70].decode()
         file_name = module_id + self.rsa_key_hash
-        if os.path.exists(file_name):
-            try:
-                with open(file_name, "rb") as f:
-                    module_info = json.load(f)
-            except json.JSONDecodeError:
-                module_info = json.loads(data[70:])
+        with open(file_name, "rb") as f:
+            buffer = f.read()
+            offset = 0
 
-            os.remove(file_name)
+            info_len = int.from_bytes(buffer[offset : offset + 8], "big")
+            offset += 8
 
-        else:
-            module_info = json.loads(data[70:])
+            module_info = json.loads(buffer[offset : offset + info_len])
+            offset += info_len
+
+            buf_len = int.from_bytes(buffer[offset : offset + 8], "big")
+            offset += 8
+
+            buffers_meta = json.loads(buffer[offset : offset + buf_len])
+            offset += buf_len
+
+            buffers = {}
+            for name, meta in buffers_meta.items():
+                start = offset + meta["offset"]
+                end = start + meta["length"]
+                buffers[name] = buffer[start:end]
+
+            module_info["required_buffers"] = buffers
+
+        os.remove(file_name)
 
         request_to_remove = []
 
@@ -595,6 +609,7 @@ class Torchnode(Smartnode):
                         return_val["module_id"] = module_id
 
                     del module["mem_info"]
+                    break
 
                 # "termination" is added to module info when the job is closing
                 elif "termination" in module:
@@ -872,9 +887,40 @@ class Torchnode(Smartnode):
         )
         self._store_request(node.node_id, "MODULE" + module_id)
         self.state_updates[module_id] = []
+
+        # Extract buffers before JSON serialization
+        required_buffers = module_info.pop("required_buffers", {})
+        buffer_meta = {}
+        buffer_blobs = []
+        offset = 0
+
+        if required_buffers:
+            for name, blob in required_buffers.items():
+                if not isinstance(blob, (bytes, bytearray, memoryview)):
+                    raise TypeError("Buffers must be serialized bytes.")
+
+                length = len(blob)
+                buffer_meta[name] = {
+                    "offset": offset,
+                    "length": length,
+                }
+                buffer_blobs.append(blob)
+                offset += length
+
         module_info_bytes = json.dumps(module_info).encode()
+        buffers_bytes = json.dumps(buffer_meta).encode()
+
+        # Pack: 4-byte json len | json | 4-byte buffers len | buffers
+        header = (
+            len(module_info_bytes).to_bytes(8, "big")
+            + module_info_bytes
+            + len(buffers_bytes).to_bytes(8, "big")
+            + buffers_bytes
+        )
+        payload = b"".join(buffer_blobs)
+
         self.send_to_node_from_file(
-            node, file_name, b"MODULE" + module_id.encode() + module_info_bytes
+            node, file_name, b"MODULE" + module_id.encode() + header + payload
         )
 
     def _store_request(self, node_id: str, key: str):

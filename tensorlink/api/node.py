@@ -298,13 +298,13 @@ class TensorlinkAPI:
         def list_available_models():
             """List all currently loaded models"""
             try:
+                jobs = [self.smart_node.dht.query(a) for a in self.smart_node.jobs]
                 public_models = set(
-                    (
-                        a.get("model_name", "")
-                        if a.get("public", False) and a.get("", "")
-                        else None
-                    )
-                    for a in self.smart_node.modules.values()
+                    [
+                        j.get("model_name")
+                        for j in jobs
+                        if isinstance(j, dict) and j.get("public") and j.get("active")
+                    ]
                 )
 
                 return {
