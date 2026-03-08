@@ -402,6 +402,14 @@ class DistributedWorker:
             ):
                 with torch.no_grad():
                     output = module.generate(**kwargs)
+
+                output_bytes = tensor_to_bytes(detach_tensor(output))
+
+                size, name = store_in_shared_memory(output_bytes)
+                self.send_request(
+                    "send_forward", (host_id, module_id, size, name, "generate")
+                )
+
             else:
                 streamer = TensorlinkWorkerStreamer(
                     send_token=lambda token: self._send_token(
@@ -409,6 +417,7 @@ class DistributedWorker:
                     ),
                     send_end=lambda: self._send_stream_end(module_id, host_id),
                 )
+
                 kwargs["streamer"] = streamer
 
                 def _run_generate():
@@ -418,8 +427,7 @@ class DistributedWorker:
                 gen_thread = Thread(target=_run_generate, daemon=True)
                 gen_thread.start()
                 gen_thread.join()
-
-            output_bytes = tensor_to_bytes(detach_tensor(output))
+                return
 
         except Exception as e:
             output_bytes = json.dumps({"error": str(e)}).encode()

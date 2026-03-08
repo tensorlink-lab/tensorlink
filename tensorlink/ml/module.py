@@ -1573,6 +1573,7 @@ class OffloadedModule(nn.Module):
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
                 waiting = False
+
         output = bytes_to_tensor(output_bytes)
         output = attach_tensor(output, self.parent_model.device)
 
