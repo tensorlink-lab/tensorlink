@@ -68,8 +68,12 @@ class Connection(threading.Thread):
         self.COMPR_CHAR = 0x02.to_bytes(16, "big")  # Compression marker
 
         # Potential for optimizing data transmission
-        # self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)  # 4MB receive buffer
-        # self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)  # 4MB send buffer
+        self.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024
+        )  # 4MB receive buffer
+        self.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024
+        )  # 4MB send buffer
 
         # Start connection monitoring
         self.monitor_thread = threading.Thread(target=self.monitor_connection)
@@ -152,7 +156,6 @@ class Connection(threading.Thread):
         except Exception as e:
             self.main_node.debug_print(
                 f"Connection send error: {e}",
-                colour="bright_red",
                 level=logging.ERROR,
                 tag="Connection",
             )

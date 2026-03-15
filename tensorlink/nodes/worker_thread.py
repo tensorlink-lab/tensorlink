@@ -5,7 +5,6 @@ from tensorlink.nodes.keeper import Keeper
 
 import torch.nn as nn
 from dotenv import get_key
-import psutil
 import hashlib
 import json
 import logging
@@ -30,7 +29,7 @@ class WorkerThread(Torchnode):
         on_chain=False,
         local_test=False,
         mining_active=None,
-        reserved_memory=None,
+        max_memory_gb=0,
         duplicate="",
         load_previous_state=False,
         priority_nodes: list = None,
@@ -46,6 +45,7 @@ class WorkerThread(Torchnode):
             local_test=local_test,
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
         )
 
         self.training = False
@@ -60,38 +60,8 @@ class WorkerThread(Torchnode):
             level=logging.INFO,
             tag="Worker",
         )
-        self.available_gpu_memory = get_gpu_memory()
-        self.total_gpu_memory = self.available_gpu_memory
-        self.available_ram = psutil.virtual_memory().available
+
         self.mining_active = mining_active
-        self.reserved_memory = reserved_memory
-
-        if self.on_chain:
-            self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
-            if not self.public_key:
-                self.debug_print(
-                    "Public key not found in .env file, using donation wallet...",
-                    tag="Worker",
-                )
-                self.public_key = "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336"
-
-            self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
-
-        should_bootstrap = bool(self._priority_nodes) or self.on_chain
-        if should_bootstrap:
-            attempts = 0
-            while attempts < 3 and len(self.validators) == 0:
-                self.bootstrap()
-
-                if len(self.nodes) == 0:
-                    time.sleep(3)
-                    attempts += 1
-        else:
-            self.debug_print(
-                "Skipping bootstrap (no priority nodes and not on-chain).",
-                tag="Worker",
-                level=logging.INFO,
-            )
 
         # Finally, load up previous saved state if any
         if on_chain or load_previous_state:
@@ -203,17 +173,49 @@ class WorkerThread(Torchnode):
     def run(self):
         # Accept users and back-check history
         # Get proposees from SC and send our state to them
-        super().run()
+        try:
+            super().run()
+            if self.on_chain:
+                self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
+                if not self.public_key:
+                    self.debug_print(
+                        "Public key not found in .env file, using donation wallet...",
+                        tag="Worker",
+                    )
+                    self.public_key = "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336"
 
-        counter = 0
-        while not self.terminate_flag.is_set():
-            if counter % 180 == 0:
-                self.keeper.clean_node()
-                self.clean_port_mappings()
-                self.print_status()
+                self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
 
-            time.sleep(1)
-            counter += 1
+            should_bootstrap = bool(self._priority_nodes) or self.on_chain
+            if should_bootstrap:
+                attempts = 0
+                while attempts < 3 and len(self.validators) == 0:
+                    self.bootstrap()
+
+                    if len(self.nodes) == 0:
+                        time.sleep(3)
+                        attempts += 1
+            else:
+                self.debug_print(
+                    "Skipping bootstrap (no priority nodes and not on-chain).",
+                    tag="Worker",
+                    level=logging.INFO,
+                )
+
+            counter = 0
+            while not self.terminate_flag.is_set():
+                if counter % 180 == 0:
+                    self.keeper.clean_node()
+                    self.clean_port_mappings()
+                    self.print_ui_status()
+
+                time.sleep(1)
+                counter += 1
+        except KeyboardInterrupt:
+            self.terminate_flag.set()
+
+        finally:
+            self.stop()
 
     def load_distributed_module(self, module: nn.Module, graph: dict = None):
         pass
@@ -230,21 +232,21 @@ class WorkerThread(Torchnode):
     #         proof["output"] = handle_output(self.model(dummy_input)).sum()
 
     def get_available_gpu_memory(self):
-        available_gpu_memory = get_gpu_memory()
+        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        reserved_loading_memory = 0
 
         for module_id, module_info in self.modules.items():
             # Account for modules that are not in CUDA and are still initializing
             if module_info.get("status", "loading") == "loading":
-                module_size = module_info["memory"]
-                available_gpu_memory -= module_size
+                reserved_loading_memory += module_info["memory"]
 
-        return available_gpu_memory
+        return max(0, available_gpu_memory - reserved_loading_memory)
 
     def handle_statistics_request(self, callee, additional_context: dict = None):
         """When a validator requests a stats request, return stats"""
         self.available_gpu_memory = self.get_available_gpu_memory()
 
-        # If mining is active, report total GPU memory since we'll stop mining on job acceptance
+        # If mining is active, report total GPU memory since mining will stop on job acceptance
         if self.mining_active is not None and self.mining_active.value:
             self.available_gpu_memory = self.total_gpu_memory
 
@@ -267,7 +269,3 @@ class WorkerThread(Torchnode):
 
     def activate(self):
         self.training = True
-
-    def print_status(self):
-        self.print_base_status()
-        print("=============================================\n")

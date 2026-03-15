@@ -4,11 +4,21 @@ from collections import defaultdict
 from typing import Dict
 import time
 import os
-import re
-import inspect
+from safetensors.torch import save as st_save_bytes, load as st_load_bytes
+import psutil
 import torch
 import torch.nn as nn
+from accelerate import init_empty_weights
 from transformers.utils import ModelOutput
+from transformers.cache_utils import DynamicCache
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForVision2Seq,
+    AutoModelForSeq2SeqLM,
+    AutoModelForSpeechSeq2Seq,
+)
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -34,7 +44,7 @@ def estimate_memory(
     recursive: bool = True,
     count_activations: bool = True,
 ) -> tuple[float, dict]:
-    """Estimate memory with better control over what's counted."""
+    """Estimate GPU memory required for a model."""
 
     dtype_size = torch.tensor([], dtype=dtype).element_size()
 
@@ -46,9 +56,10 @@ def estimate_memory(
         "kv_cache": 0,
     }
 
-    # Parameters, only count at this level if not recursive
+    # ---- parameters ----
     if recursive:
         param_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
+        param_bytes += sum(b.numel() * b.element_size() for b in module.buffers())
     else:
         param_bytes = sum(
             p.numel() * p.element_size() for p in module.parameters(recurse=False)
@@ -59,22 +70,16 @@ def estimate_memory(
 
     breakdown["parameters"] = param_bytes
 
+    # ---- training extras ----
     if training:
         breakdown["gradients"] = param_bytes
-        param_numel = sum(p.numel() for p in module.parameters())
-
         if optimizer_type.lower() in {"adam", "adamw"}:
-            # exp_avg + exp_avg_sq
-            opt_bytes = 2 * param_bytes * (4 / dtype_size)
-
+            breakdown["optimizer"] = 2 * param_bytes * (4 / dtype_size)
         else:
-            opt_bytes = param_numel * dtype_size
+            breakdown["optimizer"] = param_bytes
 
-        breakdown["optimizer"] = opt_bytes
-
-    # Only count activations if requested
+    # ---- activations ----
     if count_activations:
-        # Try to infer hidden size from the module
         if hasattr(module, "config"):
             hidden_size = module.config.hidden_size
         elif hasattr(module, "hidden_size"):
@@ -84,27 +89,16 @@ def estimate_memory(
         elif hasattr(module, "d_model"):
             hidden_size = module.d_model
         else:
-            # Estimate from parameter count
-            if recursive:
-                total_params = sum(p.numel() for p in module.parameters())
-            else:
-                total_params = sum(p.numel() for p in module.parameters(recurse=False))
+            total_params = sum(p.numel() for p in module.parameters())
+            hidden_size = max(256, min(int((total_params / 12) ** 0.5), 8192))
 
-            if total_params > 0:
-                # Rough heuristic: for transformer layers, params ≈ 12 * hidden_size^2
-                hidden_size = max(128, min(int((total_params / 12) ** 0.5), 8192))
-            else:
-                # Absolute last resort for modules with no parameters
-                hidden_size = 512
-
-        # More conservative activation multiplier
         activation_multiplier = 4 if not training else 7
 
         breakdown["activations"] = (
             batch_size * seq_length * hidden_size * dtype_size * activation_multiplier
         )
 
-        if include_kv_cache and hasattr(module, 'config') and not training:
+        if include_kv_cache and hasattr(module, "config") and not training:
             num_layers = module.config.num_hidden_layers
             num_heads = getattr(
                 module.config,
@@ -123,26 +117,42 @@ def estimate_memory(
                 * dtype_size
             )
 
-    total = sum(breakdown.values()) * 1.30  # add 30% overhead
+    # ---- overhead ----
+    OVERHEAD = 1.20
+    total = sum(breakdown.values()) * OVERHEAD
+
     return total, breakdown
 
 
-def get_gpu_memory():
-    # Check how much available mpc we can allocate to the roles
-    memory = 0
+def get_gpu_memory(max_vram_gb: float | None = None):
+    """
+    Returns available memory in bytes.
+    - Uses total free CUDA VRAM if available.
+    - Falls back to available system RAM if CUDA is not available.
+    - If max_vram_gb is provided, caps the returned memory.
+    """
 
+    # Determine max memory cap
+    max_memory_bytes = None
+    if max_vram_gb is not None and max_vram_gb > 0:
+        max_memory_bytes = int(max_vram_gb * 1e9)
+
+    # Case 1: CUDA available
     if torch.cuda.is_available():
-        devices = list(range(torch.cuda.device_count()))
-
-        for device in devices:
-            torch.cuda.set_device(device)
-            free, total = torch.cuda.memory.mem_get_info(device)
+        memory = 0
+        for device in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(device)
             memory += free
 
+    # Case 2: Fallback to system RAM
     else:
-        memory += 4e8
+        memory = psutil.virtual_memory().available
 
-    return memory
+    # Apply cap if specified
+    if max_memory_bytes is not None:
+        memory = min(memory, max_memory_bytes)
+
+    return int(memory)
 
 
 def find_module(module: nn.Module, target_name: str, ids: list = []):
@@ -187,7 +197,7 @@ def access_module(module: nn.Module, indices: list):
 def detach_tensor(obj, clone: bool = False):
     """
     Recursively detach tensors (and optionally clone them) from GPU to CPU.
-    Supports Tensor, ModelOutput, list, tuple, and dict.
+    Supports Tensor, DynamicCache, ModelOutput, list, tuple, and dict.
     """
     # Case 1: torch.Tensor
     if isinstance(obj, torch.Tensor):
@@ -196,34 +206,54 @@ def detach_tensor(obj, clone: bool = False):
             t = t.clone()
         return t
 
-    # Case 2: ModelOutput (transformers container)
+    # Case 2: DynamicCache
+    elif isinstance(obj, DynamicCache):
+        new_cache = DynamicCache()
+        new_cache.key_cache = [
+            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
+            for t in obj.key_cache
+        ]
+        new_cache.value_cache = [
+            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
+            for t in obj.value_cache
+        ]
+        new_cache._seen_tokens = obj._seen_tokens
+        return new_cache
+
+    # Case 3: ModelOutput (transformers container)
     elif isinstance(obj, ModelOutput):
-        new_out = obj.__class__()  # create same output class
+        new_out = obj.__class__()
         for key, value in obj.items():
-            if isinstance(value, (torch.Tensor, ModelOutput, list, tuple, dict)):
+            if isinstance(
+                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+            ):
                 new_out[key] = detach_tensor(value, clone=clone)
             else:
                 new_out[key] = value
         return new_out
 
-    # Case 3: list or tuple
+    # Case 4: list or tuple
     elif isinstance(obj, (list, tuple)):
         new_seq = [
             (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, ModelOutput, list, tuple, dict))
+                if isinstance(
+                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else v
             )
             for v in obj
         ]
         return type(obj)(new_seq)
 
-    # Case 4: dictionary
+    # Case 5: dictionary
     elif isinstance(obj, dict):
         return {
             k: (
                 detach_tensor(v, clone=clone)
-                if isinstance(v, (torch.Tensor, ModelOutput, list, tuple, dict))
+                if isinstance(
+                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else v
             )
             for k, v in obj.items()
@@ -234,36 +264,62 @@ def detach_tensor(obj, clone: bool = False):
 
 
 def attach_tensor(tensor, device):
-    if hasattr(tensor, "to"):
-        return tensor.to(device)
+    # Case 1: DynamicCache
+    if isinstance(tensor, DynamicCache):
+        tensor.key_cache = [
+            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            for t in tensor.key_cache
+        ]
+        tensor.value_cache = [
+            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            for t in tensor.value_cache
+        ]
+        return tensor
 
+    # Case 2: torch.Tensor
     elif isinstance(tensor, torch.Tensor):
         return tensor.to(device)
 
+    # Case 3: ModelOutput
     elif isinstance(tensor, ModelOutput):
         for key, value in tensor.items():
-            if isinstance(value, torch.Tensor):
-                tensor[key] = tensor[key].to(device)
-
+            if isinstance(
+                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+            ):
+                tensor[key] = attach_tensor(value, device)
         return tensor
 
+    # Case 4: list or tuple
     elif isinstance(tensor, (list, tuple)):
         return type(tensor)(
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
+            (
+                attach_tensor(t, device)
+                if isinstance(
+                    t, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
+                else t
+            )
             for t in tensor
         )
 
+    # Case 5: dict
     elif isinstance(tensor, dict):
         return {
             key: (
                 attach_tensor(value, device)
-                if isinstance(value, torch.Tensor)
+                if isinstance(
+                    value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
+                )
                 else value
             )
             for key, value in tensor.items()
         }
+
+    elif hasattr(tensor, "to"):
+        return tensor.to(device)
+
     else:
-        raise TypeError("Unsupported input type")
+        raise TypeError(f"Unsupported input type: {type(tensor)}")
 
 
 def enable_grad(tensor):
@@ -510,359 +566,98 @@ def get_batch_size(inputs):
         raise ValueError("Unsupported input type")
 
 
-def tensor_to_bytes(tensor):
-    """Serialize tensor or tensor-like structures into bytes, including dtype."""
+def tensor_to_bytes(obj):
+    """
+    Safe serialization: safetensors for tensors, JSON for structure.
+    No pickle, no arbitrary code execution.
+    """
+    # Flatten the object into a tensor map + structure skeleton
+    tensor_map = {}
+    counter = [0]
 
-    def _serialize(obj):
-        if isinstance(obj, (int, float, str, bool, type(None))):
-            return obj
-
-        elif isinstance(obj, torch.Tensor):
+    def _extract_tensors(o):
+        """Replace tensors with placeholder keys, collect into tensor_map"""
+        if isinstance(o, torch.Tensor):
+            key = f"__tensor_{counter[0]}__"
+            counter[0] += 1
+            # safetensors requires contiguous float tensors on CPU
+            tensor_map[key] = o.detach().cpu().contiguous().clone()
             return {
-                "__serialized__": True,
-                "module": obj.__class__.__module__,
-                "class": obj.__class__.__name__,
-                "dtype": str(obj.dtype),  # Save dtype as string
-                "data": obj.tolist(),
+                "__tensor_ref__": key,
+                "dtype": str(o.dtype),
+                "shape": list(o.shape),
             }
-
-        elif hasattr(obj, "__class__") and obj.__class__.__name__ == "BatchEncoding":
+        elif isinstance(o, dict):
+            return {k: _extract_tensors(v) for k, v in o.items()}
+        elif isinstance(o, (list, tuple)):
+            result = [_extract_tensors(v) for v in o]
+            return (
+                {"__tuple__": True, "data": result} if isinstance(o, tuple) else result
+            )
+        elif isinstance(o, (int, float, bool, str, type(None))):
+            return o
+        elif hasattr(o, '__class__') and o.__class__.__name__ == 'DynamicCache':
+            # Serialize DynamicCache as its key/value tensor lists
             return {
-                "__serialized__": True,
-                "module": obj.__class__.__module__,
-                "class": obj.__class__.__name__,
-                "data": {k: _serialize(v) for k, v in obj.items()},
+                "__dynamic_cache__": True,
+                "key_cache": _extract_tensors(o.key_cache),
+                "value_cache": _extract_tensors(o.value_cache),
             }
+        else:
+            return None  # drop unserializable objects safely
 
-        # Handle tokenizers (like Qwen2TokenizerFast)
-        elif (
-            hasattr(obj, "vocab_size")
-            and hasattr(obj, "special_tokens")
-            and hasattr(obj, "get_vocab")
-        ):
-            # Extract essential tokenizer metadata
-            tokenizer_data = {
-                "name_or_path": getattr(obj, "name_or_path", None),
-                "vocab_size": getattr(obj, "vocab_size", None),
-                "model_max_length": getattr(obj, "model_max_length", None),
-                "is_fast": getattr(obj, "is_fast", None),
-                "padding_side": getattr(obj, "padding_side", None),
-                "truncation_side": getattr(obj, "truncation_side", None),
-                "special_tokens": {
-                    k: _serialize(v)
-                    for k, v in getattr(obj, "special_tokens", {}).items()
-                },
-                "added_tokens": [],  # We'll store essential info about added tokens
-                "class_name": obj.__class__.__name__,
-                "module_name": obj.__class__.__module__,
-            }
+    structure = _extract_tensors(obj)
+    structure_bytes = json.dumps(structure).encode("utf-8")
 
-            # Capture essential added token info
-            if hasattr(obj, "added_tokens_decoder") and getattr(
-                obj, "added_tokens_decoder", None
-            ):
-                for token_id, token in obj.added_tokens_decoder.items():
-                    if hasattr(token, "content"):
-                        tokenizer_data["added_tokens"].append(
-                            {
-                                "id": token_id,
-                                "content": token.content,
-                                "special": getattr(token, "special", False),
-                            }
-                        )
+    # Pack: 4-byte length prefix for structure, then safetensors blob
+    if tensor_map:
+        tensor_bytes = st_save_bytes(tensor_map)
+    else:
+        tensor_bytes = b""
 
-            return {
-                "__serialized__": True,
-                "module": "tokenizers",
-                "class": "Tokenizer",
-                "is_tokenizer": True,
-                "data": tokenizer_data,
-            }
-
-        # Handle stopping criteria objects that may contain tokenizers
-        elif hasattr(obj, "__class__") and "StoppingCriteria" in obj.__class__.__name__:
-            serialized_data = {
-                "__serialized__": True,
-                "module": obj.__class__.__module__,
-                "class": obj.__class__.__name__,
-                "is_stopping_criteria": True,
-                "data": {},
-            }
-
-            # Special handling for StringStoppingCriteria which requires tokenizer
-            if obj.__class__.__name__ == "StringStoppingCriteria" and hasattr(
-                obj, "tokenizer"
-            ):
-                serialized_data["data"]["tokenizer"] = _serialize(obj.tokenizer)
-
-            # Serialize all attributes that can be serialized
-            for attr_name in dir(obj):
-                # Skip private attributes and methods
-                if attr_name.startswith("_") or callable(getattr(obj, attr_name)):
-                    continue
-
-                try:
-                    attr_value = getattr(obj, attr_name)
-                    serialized_data["data"][attr_name] = _serialize(attr_value)
-                except (ValueError, TypeError):
-                    # If we can't serialize an attribute, log it but continue
-                    serialized_data["data"][
-                        attr_name
-                    ] = f"UNSERIALIZABLE_OBJECT_{type(attr_value).__name__}"
-
-            return serialized_data
-
-        elif hasattr(obj, "__dict__"):
-            try:
-                return {
-                    "__serialized__": True,
-                    "module": obj.__class__.__module__,
-                    "class": obj.__class__.__name__,
-                    "is_object": True,
-                    "data": _serialize(obj.__dict__),
-                }
-            except (ValueError, TypeError):
-                pass
-
-        elif isinstance(obj, dict):
-            return {k: _serialize(v) for k, v in obj.items()}
-
-        elif isinstance(obj, list):
-            return [_serialize(v) for v in obj]
-
-        elif isinstance(obj, tuple):
-            return {
-                "__serialized__": True,
-                "type": "tuple",
-                "data": [_serialize(v) for v in obj],
-            }
-
-        # Return a placeholder for unsupported types
-        return f"UNSERIALIZABLE_OBJECT_{type(obj).__name__}"
-
-    return json.dumps(_serialize(tensor)).encode("utf-8")
+    structure_len = len(structure_bytes).to_bytes(4, "big")
+    return structure_len + structure_bytes + tensor_bytes
 
 
-def bytes_to_tensor(tensor_data):
-    """Deserialize bytes or JSON-like dicts/lists into tensors, tokenizers, and other objects."""
-    if isinstance(tensor_data, bytes):
-        tensor_data = json.loads(tensor_data)
+def bytes_to_tensor(data: bytes):
+    """
+    Safe deserialization matching tensor_to_bytes.
+    """
+    structure_len = int.from_bytes(data[:4], "big")
+    structure_bytes = data[4 : 4 + structure_len]
+    tensor_bytes = data[4 + structure_len :]
 
-    def _deserialize(obj):
-        if isinstance(obj, (int, float, str, bool, type(None))):
-            return obj
+    structure = json.loads(structure_bytes.decode("utf-8"))
 
-        # Handle strings that represent unserializable objects
-        if isinstance(obj, str) and obj.startswith("UNSERIALIZABLE_OBJECT_"):
-            # Return None or a placeholder for unserializable objects
-            return None
+    # Load tensors from safetensors blob
+    tensor_map = {}
+    if tensor_bytes:
+        tensor_map = st_load_bytes(tensor_bytes)
 
-        if isinstance(obj, list):
-            return [_deserialize(v) for v in obj]
+    def _restore(o):
+        if isinstance(o, dict):
+            if "__tensor_ref__" in o:
+                t = tensor_map[o["__tensor_ref__"]]
+                # Restore original dtype
+                dtype = getattr(torch, o["dtype"].replace("torch.", ""))
+                return t.to(dtype=dtype)
+            elif o.get("__dynamic_cache__"):
+                from transformers import DynamicCache
 
-        if (
-            isinstance(obj, dict)
-            and obj.get("__serialized__")
-            and obj.get("type") == "tuple"
-        ):
-            return tuple(_deserialize(v) for v in obj["data"])
+                cache = DynamicCache()
+                cache.key_cache = _restore(o["key_cache"])
+                cache.value_cache = _restore(o["value_cache"])
+                return cache
+            elif o.get("__tuple__"):
+                return tuple(_restore(v) for v in o["data"])
+            else:
+                return {k: _restore(v) for k, v in o.items()}
+        elif isinstance(o, list):
+            return [_restore(v) for v in o]
+        else:
+            return o
 
-        if isinstance(obj, dict):
-            # Special handling for tokenizer metadata
-            if obj.get("__tokenizer_metadata__"):
-                try:
-                    # Import the tokenizer class from transformers
-                    from transformers import AutoTokenizer
-
-                    # Get the name or path to load from
-                    name_or_path = obj.get("name_or_path")
-                    if not name_or_path:
-                        # If no name_or_path, return the metadata as is
-                        return obj
-
-                    # Safely load the tokenizer using AutoTokenizer
-                    tokenizer = AutoTokenizer.from_pretrained(name_or_path)
-                    return tokenizer
-                except (ImportError, Exception) as e:
-                    # Fall back to just returning the metadata
-                    return obj
-
-            # Handle serialized objects
-            elif obj.get("__serialized__"):
-                module_name = obj.get("module")
-                cls_name = obj.get("class")
-                data = obj.get("data")
-
-                # Handle tensors
-                if cls_name == "Tensor" or cls_name.endswith("Tensor"):
-                    dtype_str = obj["dtype"]
-                    if "." in dtype_str:
-                        dtype_str = dtype_str.split(".")[
-                            -1
-                        ]  # Remove 'torch.' if present
-                    return torch.tensor(data, dtype=getattr(torch, dtype_str))
-
-                # Handle BatchEncoding objects
-                elif cls_name == "BatchEncoding":
-                    from transformers import BatchEncoding
-
-                    return BatchEncoding({k: _deserialize(v) for k, v in data.items()})
-
-                # Handle stopping criteria objects
-                elif obj.get("is_stopping_criteria"):
-                    try:
-                        # First, deserialize all the data to handle nested objects like tokenizers
-                        deserialized_data = {
-                            k: _deserialize(v) for k, v in data.items()
-                        }
-
-                        # Try to import the stopping criteria class
-                        module_parts = module_name.split(".")
-                        criteria_module = __import__(module_parts[0])
-                        for part in module_parts[1:]:
-                            try:
-                                criteria_module = getattr(criteria_module, part)
-                            except AttributeError:
-                                # If module path is invalid, just return the deserialized data
-                                return deserialized_data
-
-                        try:
-                            criteria_class = getattr(criteria_module, cls_name)
-                        except AttributeError:
-                            # If class doesn't exist, return the data
-                            return deserialized_data
-
-                        # Special handling for StringStoppingCriteria which needs tokenizer
-                        if cls_name == "StringStoppingCriteria":
-                            # Extract tokenizer and stop_string
-                            tokenizer = deserialized_data.get("tokenizer")
-                            stop_string = deserialized_data.get("stop_string", "")
-
-                            if tokenizer is None:
-                                # Fall back to dictionary since we can't instantiate without tokenizer
-                                return deserialized_data
-
-                            try:
-                                # Create the criteria with tokenizer and stop_string
-                                criteria_instance = criteria_class(
-                                    tokenizer, stop_string
-                                )
-
-                                # Set any additional attributes
-                                for attr_name, attr_value in deserialized_data.items():
-                                    if attr_name not in ["tokenizer", "stop_string"]:
-                                        try:
-                                            setattr(
-                                                criteria_instance, attr_name, attr_value
-                                            )
-                                        except (AttributeError, TypeError):
-                                            pass
-
-                                return criteria_instance
-                            except Exception:
-                                # If instantiation fails for any reason, return the data
-                                return deserialized_data
-                        else:
-                            # For other stopping criteria, try constructor with deserialized data
-                            try:
-                                sig = inspect.signature(criteria_class.__init__)
-                                param_names = list(sig.parameters.keys())[
-                                    1:
-                                ]  # Skip 'self'
-
-                                # Prepare constructor arguments
-                                kwargs = {}
-                                for param in param_names:
-                                    if param in deserialized_data:
-                                        kwargs[param] = deserialized_data[param]
-
-                                # Create the instance
-                                criteria_instance = criteria_class(**kwargs)
-
-                                # Set any remaining attributes that weren't in the constructor
-                                for attr_name, attr_value in deserialized_data.items():
-                                    if (
-                                        attr_name not in param_names
-                                        and not attr_name.startswith("_")
-                                    ):
-                                        try:
-                                            setattr(
-                                                criteria_instance, attr_name, attr_value
-                                            )
-                                        except (AttributeError, TypeError):
-                                            pass
-
-                                return criteria_instance
-                            except Exception:
-                                # If instantiation fails, return the data
-                                return deserialized_data
-                    except Exception:
-                        # Fall back to a dictionary if reconstruction fails
-                        return {k: _deserialize(v) for k, v in data.items()}
-
-                elif obj.get("is_object"):
-                    try:
-                        import importlib
-
-                        # Dynamically import the module and get the class
-                        module = importlib.import_module(module_name)
-                        cls = getattr(module, cls_name)
-
-                        # Try to create an instance
-                        try:
-                            # First try with no arguments
-                            instance = cls()
-                        except TypeError:
-                            # If that fails, try with deserialized data as kwargs
-                            try:
-                                sig = inspect.signature(cls.__init__)
-                                param_names = list(sig.parameters.keys())[
-                                    1:
-                                ]  # Skip 'self'
-
-                                # Prepare constructor arguments from data
-                                deserialized_data = _deserialize(data)
-                                kwargs = {}
-                                for param in param_names:
-                                    if param in deserialized_data:
-                                        kwargs[param] = deserialized_data[param]
-
-                                instance = cls(**kwargs)
-
-                            except Exception:
-                                # Last resort: return deserialized data as dict
-                                return _deserialize(data)
-
-                        # Set all attributes from the data
-                        deserialized_data = _deserialize(data)
-                        if isinstance(deserialized_data, dict):
-                            for attr_name, attr_value in deserialized_data.items():
-                                try:
-                                    setattr(instance, attr_name, attr_value)
-                                except (AttributeError, TypeError):
-                                    # Skip attributes that can't be set
-                                    pass
-
-                        return instance
-
-                    except (ImportError, AttributeError) as e:
-                        # If we can't import the class, return deserialized data as dict
-                        return _deserialize(data)
-                    except Exception as e:
-                        # For any other error, return deserialized data
-                        return _deserialize(data)
-
-                # For other serialized objects, return dictionary representation
-                return {
-                    k: _deserialize(v) for k, v in data.items() if k != "__serialized__"
-                }
-
-            # Handle regular dictionaries
-            return {k: _deserialize(v) for k, v in obj.items()}
-
-        return obj
-
-    return _deserialize(tensor_data)
+    return _restore(structure)
 
 
 def load_models_cache():
@@ -1040,12 +835,15 @@ def get_nested_module(
     parts = path.split('.')
     current = model
 
-    if parts[0] == "model":
-        if not hasattr(model, "model"):
-            parts = parts[1:]
+    for i in range(len(parts)):
+        part = parts[i]
 
-    # Skip 'model' prefix if present (first attribute is always the model itself)
-    for part in parts:
+        if part == "model":
+            if not hasattr(current, "model") or (
+                len(parts) > i + 1 and not hasattr(current.model, parts[i + 1])
+            ):
+                continue
+
         if part.isdigit():
             # Handle list/ModuleList indexing
             current = current[int(part)]
@@ -1087,3 +885,32 @@ def optimizer_to_spec(optimizer_cls):
 
     optimizer_spec["type"] = optimizer_spec["class_path"].rsplit(".", 1)[-1]
     return optimizer_spec
+
+
+def load_model_skeleton(model_name: str, model_type: str = "chat"):
+    """
+    Load the HF model structure with empty weights.
+    """
+    # First, load the config
+    model_config = AutoConfig.from_pretrained(model_name)
+
+    # Then create model from config with init_empty_weights
+    with init_empty_weights():
+        if model_type in ("causal", "chat"):
+            skeleton_model = AutoModelForCausalLM.from_config(model_config)
+        elif model_type == "seq2seq":
+            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
+        elif model_type == "vision2text":
+            skeleton_model = AutoModelForVision2Seq.from_config(model_config)
+        elif model_type == "audio2text":
+            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
+        else:
+            skeleton_model = AutoModel.from_config(model_config)
+
+    skeleton_model.eval()  # Set to eval mode initially
+
+    # Ensure no cached gradients or cached computations
+    for param in skeleton_model.parameters():
+        param.requires_grad = False
+
+    return skeleton_model

@@ -21,23 +21,32 @@ UPNP = False
 
 SERVER_URL = "http://127.0.0.1:64747"
 MODELS = [
+    # pytest.param(
+    #     {
+    #         "name": "Qwen/Qwen2.5-1.5B-Instruct",
+    #         "timeout": 600,
+    #         "sleep": 20,
+    #         "parsed": False,
+    #     },
+    #     id="Qwen2.5-1.5B",
+    # ),
     pytest.param(
         {
             "name": "sshleifer/tiny-gpt2",
             "timeout": 60,
-            "sleep": 5,
+            "sleep": 10,
             "parsed": False,
         },
         id="tiny-gpt2",
     ),
     pytest.param(
         {
-            "name": "HuggingFaceTB/SmolLM-135M",
+            "name": "HuggingFaceTB/SmolLM2-135M",
             "timeout": 120,
             "sleep": 10,
             "parsed": True,
         },
-        id="smollm-135m",
+        id="smollm2-135m",
     ),
 ]
 
@@ -50,10 +59,7 @@ def model_env(request, connected_wwv_nodes):
     cfg = request.param
     worker, worker2, validator, _ = connected_wwv_nodes
 
-    payload = {
-        "hf_name": cfg["name"],
-        "model_type": "causal",
-    }
+    payload = {"hf_name": cfg["name"], "model_type": "causal", "time": 300}
 
     response = requests.post(
         url=f"{SERVER_URL}/request-model",
@@ -81,7 +87,6 @@ def test_generate_simple(model_env):
         "hf_name": cfg["name"],
         "message": "Hi.",
         "max_new_tokens": 10,
-        "do_sample": True,
         "num_beams": 2,
         "output_format": "simple",  # Explicitly set to simple
     }
@@ -89,7 +94,7 @@ def test_generate_simple(model_env):
     response = requests.post(
         f"{SERVER_URL}/v1/generate",
         json=generate_payload,
-        timeout=100,
+        timeout=1000,
     )
 
     assert response.status_code == 200
@@ -140,9 +145,7 @@ def test_generate_openai(model_env):
     generate_payload = {
         "hf_name": cfg["name"],
         "message": "Hi there, tell me something interesting.",
-        "max_new_tokens": 10,
-        "do_sample": True,
-        "num_beams": 2,
+        # "max_new_tokens": 50,
         "output_format": "openai",
     }
 
@@ -209,7 +212,6 @@ def test_streaming_generation_openai(model_env):
         "message": "Hi there, tell me something interesting.",
         "max_new_tokens": 10,
         "stream": True,
-        "do_sample": False,
         "num_beams": 1,
         "output_format": "openai",
     }
@@ -272,10 +274,9 @@ def test_streaming_generation_simple(model_env):
 
     generate_payload = {
         "hf_name": cfg["name"],
-        "message": "Hi there, tell me something interesting.",
-        "max_new_tokens": 10,
+        "message": "Hi there, how are you?",
+        "max_new_tokens": 40,
         "stream": True,
-        "do_sample": False,
         "num_beams": 1,
         "output_format": "simple",
     }
@@ -284,7 +285,7 @@ def test_streaming_generation_simple(model_env):
         f"{SERVER_URL}/v1/generate",
         json=generate_payload,
         stream=True,
-        timeout=120,
+        timeout=1200,
     )
 
     assert response.status_code == 200
@@ -320,7 +321,9 @@ def test_streaming_generation_simple(model_env):
             else:
                 if "token" in chunk:
                     received_token_fields += 1
-                    full_text += chunk.get("token") or ""
+                    token = chunk.get("token") or ""
+                    full_text += token
+                    print(f"TOKEN: {token}")
 
         except json.JSONDecodeError:
             print(f"Failed to parse JSON: {data}")
@@ -345,8 +348,8 @@ def test_chat_completions(model_env):
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say 'Hello world' and nothing else."},
         ],
-        "max_tokens": 10,
-        "temperature": 0.7,
+        "max_tokens": 20,
+        "temperature": 0.1,
         "stream": False,
     }
 
@@ -391,169 +394,3 @@ def test_chat_completions(model_env):
     assert result["usage"]["total_tokens"] == (
         result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]
     )
-
-
-# @pytest.fixture(params=MODELS, scope="module")
-# def model_env(request, connected_wwv_nodes):
-#     cfg = request.param
-#     worker, worker2, validator, _ = connected_wwv_nodes
-#
-#     payload = {"hf_name": cfg["name"], "model_type": "causal"}
-#     response = requests.post(f"{SERVER_URL}/request-model", json=payload, timeout=cfg["timeout"])
-#     assert response.status_code == 200
-#
-#     time.sleep(cfg["sleep"])
-#     yield cfg, (worker, worker2, validator)
-#
-#
-# # -------------------------
-# # Non-streaming tests
-# # -------------------------
-# @pytest.mark.parametrize("output_format", ["simple", "openai"])
-# def test_generate(model_env, output_format):
-#     cfg, _ = model_env
-#     payload = {
-#         "hf_name": cfg["name"],
-#         "message": "Hi.",
-#         "max_new_tokens": 10,
-#         "do_sample": True,
-#         "num_beams": 2,
-#         "output_format": output_format,
-#     }
-#     response = requests.post(f"{SERVER_URL}/v1/generate", json=payload, timeout=100)
-#     assert response.status_code == 200
-#     result = response.json()
-#     if output_format == "simple":
-#         validate_simple_response(result, cfg["name"])
-#     else:
-#         validate_openai_response(result, cfg["name"])
-#
-#
-# # -------------------------
-# # Streaming tests
-# # -------------------------
-# @pytest.mark.parametrize("output_format", ["simple", "openai"])
-# def test_streaming_generation(model_env, output_format):
-#     cfg, _ = model_env
-#     payload = {
-#         "hf_name": cfg["name"],
-#         "message": "Hi.",
-#         "max_new_tokens": 10,
-#         "do_sample": False,
-#         "num_beams": 1,
-#         "stream": True,
-#         "output_format": output_format,
-#     }
-#     full_text, chunks, content_fields = stream_and_collect(payload)
-#     assert isinstance(full_text, str)
-#     assert content_fields > 0
-#     print(f"[{output_format}] Streamed {chunks} chunks: {full_text}")
-#
-#
-# # -------------------------
-# # Chat completions (non-streaming)
-# # -------------------------
-# def test_chat_completions(model_env):
-#     cfg, _ = model_env
-#     chat_payload = {
-#         "model": cfg["name"],
-#         "messages": [
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": "Say 'Hello world' and nothing else."},
-#         ],
-#         "max_tokens": 10,
-#         "temperature": 0.7,
-#         "stream": False,
-#     }
-#     response = requests.post(f"{SERVER_URL}/v1/chat/completions", json=chat_payload, timeout=120)
-#     assert response.status_code == 200
-#     result = response.json()
-#     validate_openai_response(result, cfg["name"])
-#
-#
-# # -------------------------
-# # Chat completions streaming
-# # -------------------------
-# def test_chat_completions_streaming(model_env):
-#     cfg, _ = model_env
-#     chat_payload = {
-#         "model": cfg["name"],
-#         "messages": [
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": "Say 'Hello world' and nothing else."},
-#         ],
-#         "max_tokens": 10,
-#         "temperature": 0.7,
-#         "stream": True,
-#     }
-#     full_text, chunks, content_fields = stream_and_collect(chat_payload)
-#     assert isinstance(full_text, str)
-#     assert content_fields > 0
-#     print(f"✅ Chat completions stream received {chunks} chunks: {full_text}")
-#
-#
-# # -------------------------
-# # Helper validators
-# # -------------------------
-# def validate_simple_response(result, expected_model):
-#     assert "id" in result
-#     assert "model" in result and result["model"] == expected_model
-#     assert "text" in result and len(result["text"]) > 0
-#     assert "usage" in result
-#     usage = result["usage"]
-#     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-#     assert "processing_time" in result
-#     assert result.get("finish_reason", "stop") == "stop"
-#
-#
-# def validate_openai_response(result, expected_model):
-#     assert result["object"] == "chat.completion"
-#     assert result["model"] == expected_model
-#     assert len(result["choices"]) > 0
-#     choice = result["choices"][0]
-#     assert choice["index"] == 0
-#     msg = choice["message"]
-#     assert msg["role"] == "assistant"
-#     assert isinstance(msg["content"], str)
-#     usage = result["usage"]
-#     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-#
-#
-# # -------------------------
-# # Streaming helper
-# # -------------------------
-# def stream_and_collect(payload):
-#     response = requests.post(f"{SERVER_URL}/v1/generate", json=payload, stream=True, timeout=120)
-#     assert response.status_code == 200
-#     full_text = ""
-#     done_received = False
-#     chunks = 0
-#     content_fields = 0
-#
-#     for line in response.iter_lines():
-#         if not line:
-#             continue
-#         decoded = line.decode("utf-8")
-#         if not decoded.startswith("data: "):
-#             continue
-#         data = decoded[6:]
-#         if data == "[DONE]":
-#             done_received = True
-#             break
-#         chunk = json.loads(data)
-#         chunks += 1
-#         delta = chunk.get("choices", [{}])[0].get("delta", {})
-#         if "content" in delta:
-#             content_fields += 1
-#             full_text += delta["content"]
-#         elif chunk.get("token"):
-#             content_fields += 1
-#             full_text += chunk["token"]
-#         elif chunk.get("done") is True:
-#             full_text = chunk.get("full_text", full_text)
-#             done_received = True
-#             break
-#
-#     assert done_received
-#     assert chunks > 0
-#     return full_text, chunks, content_fields

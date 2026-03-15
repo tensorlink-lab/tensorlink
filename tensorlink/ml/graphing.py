@@ -1,8 +1,7 @@
-from tensorlink.ml.utils import estimate_memory
-from tensorlink.ml.injector import find_loop_in_module_hierarchy
+import json
 
-from transformers import AutoModel, AutoConfig
-from accelerate import init_empty_weights
+from tensorlink.ml.utils import estimate_memory, load_model_skeleton
+from tensorlink.ml.injector import find_loop_in_module_hierarchy
 from collections import defaultdict
 from typing import Union, Optional, Dict, List, Any
 import torch.nn as nn
@@ -55,9 +54,8 @@ def _create_grouped_entry(parent_path: str, group: list) -> dict:
         "num_layers": len(group),
     }
 
-    # Preserve parent_forward_code if present
-    if "parent_forward_code" in configs[0]:
-        grouped_config["parent_forward_code"] = configs[0]["parent_forward_code"]
+    # Preserve parent_module_path if present
+    if "parent_module_path" in configs[0]:
         grouped_config["parent_module_path"] = configs[0]["parent_module_path"]
 
     return {grouped_path: grouped_config}
@@ -68,12 +66,12 @@ def _group_sequential_layers(config: dict) -> dict:
     Group consecutive layers assigned to the same worker into single entries.
 
     For example:
-    model.layers.0 -> worker1
-    model.layers.1 -> worker1
-    model.layers.2 -> worker1
+        model.layers.0 -> worker1
+        model.layers.1 -> worker1
+        model.layers.2 -> worker1
 
     Becomes:
-    model.layers.0-2 -> worker1
+        model.layers.0-2 -> worker1
     """
     # Group paths by their parent and extract layer patterns
     layer_groups = defaultdict(list)
@@ -133,7 +131,6 @@ def _group_sequential_layers(config: dict) -> dict:
 def _is_loop_iterable_module(module: nn.Module, module_path: str) -> bool:
     """
     Detect if this module is iterated over in a loop during the forward pass.
-
     Uses the same loop detection logic as the injector.
 
     Returns:
@@ -144,26 +141,99 @@ def _is_loop_iterable_module(module: nn.Module, module_path: str) -> bool:
         module_with_loop, loop_node, path = find_loop_in_module_hierarchy(
             module, max_depth=1  # Only check this level
         )
-
         # If we found a loop at this level, it's loop-iterable
         return True
-
     except ValueError:
         # No loop found, check if modulelist
         if isinstance(module, nn.ModuleList):
             return True
-
         return False
 
 
+def _log_assignment_summary(config: dict, workers_state: dict):
+    """
+    Log a summary of the final assignment after configuration is complete.
+    """
+    print("\n" + "=" * 80)
+    print("ASSIGNMENT SUMMARY:")
+    print("=" * 80)
+
+    # Group by worker
+    worker_assignments = defaultdict(list)
+    for module_path, module_config in config.items():
+        if "offloaded" in module_config.get("type", ""):
+            worker_id = module_config["assigned_workers"][0]
+            worker_assignments[worker_id].append(
+                {
+                    "path": module_path,
+                    "memory": module_config.get("memory", 0),
+                    "module_type": module_config.get("module", "Unknown"),
+                }
+            )
+
+    # Print per-worker assignments
+    for worker_id in sorted(worker_assignments.keys()):
+        assignments = worker_assignments[worker_id]
+        total_memory = sum(a["memory"] for a in assignments)
+
+        print(f"\n{worker_id}:")
+        print(f"  Total Memory: {total_memory / 1e6:.2f}MB")
+        print(f"  Remaining: {workers_state[worker_id]['gpu_memory'] / 1e6:.2f}MB")
+        print(f"  Modules ({len(assignments)}):")
+
+        for assignment in assignments:
+            print(f"    • {assignment['path']}")
+            print(
+                f"      [{assignment['module_type']}] - {assignment['memory'] / 1e6:.2f}MB"
+            )
+
+    # Print unassigned modules if any
+    unassigned = [
+        path for path, cfg in config.items() if cfg.get("type") == "unassigned"
+    ]
+    if unassigned:
+        print(f"\n⚠ UNASSIGNED MODULES ({len(unassigned)}):")
+        for path in unassigned:
+            print(f"  • {path}")
+
+    print("=" * 80 + "\n")
+
+
 class ModelParser:
+    """
+    Parses a PyTorch model and constructs a distributed execution configuration
+    for Tensorlink by analyzing module structure, memory requirements, and
+    forward-pass behavior. It will assign individual models, modules, or groups
+    of sequential layers in the model
+
+    The ModelParser is responsible for:
+    - Walking the module hierarchy.
+    - Estimating memory usage per submodule.
+    - Assigning modules to workers or host.
+    - Detecting and rewriting forward loops for offloaded execution.
+    - Producing a configuration graph used by DistributedModel.
+
+    This class does not execute the model itself, but prepares the metadata and
+    transformed forward methods required for distributed inference or training.
+    """
+
     def __init__(self, user_memory: int = 0, verbose=False):
-        self.user_memory = user_memory
+        """
+        Initialize a ModelParser instance.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            If True, enables verbose logging during model parsing, memory estimation,
+            and assignment steps. Default is False.
+        """
+
         self.model_name = ""
         self.assigned_workers = defaultdict(list)
-        self.forward_code_cache = {}
+        self.assigned_memory = 0
         self.verbose = verbose
         self.module_paths = {}  # Track all module paths
+        self._host_max_module_bytes = 0
 
     def create_distributed_config(
         self,
@@ -171,12 +241,11 @@ class ModelParser:
         workers: dict,
         training: bool,
         trusted: bool,
-        handle_layers: bool = True,
         input_obfuscation: bool = False,
         optimizer_type: str = "adam",
-        optimizer_spec: dict = {},
-        host_load_small: bool = False,
-        host_threshold_mb: int = 50,
+        optimizer_spec: Optional[dict] = None,
+        host_max_memory_bytes: int = 0,
+        host_max_module_bytes: int = 0,
         host_max_depth: int = 2,
         max_offload_depth: int = 3,
         max_seq_len: int = 4096,
@@ -184,13 +253,123 @@ class ModelParser:
         model_type: str = "chat",
     ):
         """
-        Creates a distributed configuration for a model, determining how it should be allocated across nodes.
+        Build a distributed execution configuration for a model by assigning its
+        submodules across available workers and optionally the local host.
+
+        This method recursively walks the model graph, estimates memory usage for
+        each submodule (parameters, optimizer state, activations, and KV cache),
+        and determines whether the module should be:
+          - kept on the local host,
+          - fully offloaded to a remote worker,
+          - split into children and recursively assigned, or
+          - marked as unassigned.
+
+        The result is a config dictionary describing how the model should be
+        partitioned for distributed inference or training.
+
+        Args:
+            model : Union[nn.Module, str]
+                Either a PyTorch model instance or a HuggingFace model name. If a string
+                is provided, the model is instantiated with empty weights using
+                `AutoConfig` to avoid loading parameters into memory.
+
+            workers : dict
+                Mapping of worker_id -> worker metadata. Each worker entry must contain
+                at least:
+                    {
+                        "gpu_memory": <bytes available on worker GPU>
+                    }
+                This memory is decremented as modules are assigned.
+
+            training : bool
+                Whether the configuration is for training or inference. Training mode
+                increases memory estimates to include gradients, optimizer state, and
+                activation storage.
+
+            trusted : bool
+                Indicates whether workers are trusted. Used for downstream logic such as
+                security policies, encryption, or obfuscation decisions.
+
+            input_obfuscation : bool, optional (default=False)
+                Whether inputs should be obfuscated when sent to workers. This flag is
+                propagated into the distributed config for runtime enforcement.
+
+            optimizer_type : str, optional (default="adam")
+                Optimizer type used for memory estimation (e.g. "adam", "sgd"). This
+                affects optimizer state size during training.
+
+            optimizer_spec : dict, optional
+                Extra optimizer configuration to attach to each assigned module
+                (e.g. learning rate, betas, weight decay). Stored in the config and
+                passed to workers.
+
+            host_max_memory_bytes : int, optional (default=0)
+                Maximum number of bytes the local host is allowed to consume for loading
+                small submodules. If 0, the host will not keep modules locally.
+
+            host_max_module_bytes : int, optional (default=0)
+                Maximum bytes size the local host is allowed to consume for an individual
+                submodule. If 0, the host will consider module size.
+
+            host_max_depth : int, optional (default=2)
+                Maximum recursion depth at which the host is allowed to keep modules.
+                Prevents deep layers from being pinned locally.
+
+            max_offload_depth : int, optional (default=3)
+                Maximum recursion depth for offloading. If exceeded, the module is marked
+                as unassigned and an AssignmentError may be raised in verbose mode.
+
+            max_seq_len : int, optional (default=4096)
+                Maximum sequence length used for estimating activation and KV cache
+                memory during inference or training.
+
+            batch_size : int, optional (default=1)
+                Batch size used for memory estimation of activations and optimizer state.
+
+            model_type : str, optional (default="chat")
+                Logical model type (e.g. "chat", "vision", "embedding"). Stored in the
+                config and used by downstream execution logic.
+
+        Returns:
+            dict: A dictionary with the following keys:
+                - success : bool
+                    Whether assignment completed successfully.
+                - config : dict
+                    Mapping of module_path -> assignment spec, where each entry may be:
+                        {
+                            "type": "loaded" | "offloaded" | "unassigned",
+                            "device": "host" (if loaded),
+                            "assigned_workers": [worker_id] (if offloaded),
+                            "memory": bytes,
+                            "module": str,
+                            "module_path": str,
+                            "training": bool,
+                            "optimizer_spec": dict,
+                            "batch_size": int,
+                            "model_type": str,
+                            "parent_module_path": str (optional, for pipelining)
+                        }
+                - model_memory : int
+                    Total estimated memory footprint of the model under the provided
+                    parameters (including activations and KV cache).
+                - host_memory_used: int
+                    Assigned memory to validator
+
+        Notes:
+            - Modules that are too large or loop-iterable are recursively split into
+              children until they can be assigned.
+            - Sequential layers may later be grouped for pipeline parallelism via
+              `_group_sequential_layers`.
+            - Worker memory is decremented as assignments occur to prevent overcommit.
+            - If assignment fails, `success=False` is returned and config may be partial.
         """
+        self.assigned_memory = 0
+        if optimizer_spec is None:
+            optimizer_spec = {}
+
         if isinstance(model, str):
             self.model_name = model
-            model_config = AutoConfig.from_pretrained(model)
-            with init_empty_weights():
-                model = AutoModel.from_config(model_config)
+            model = load_model_skeleton(self.model_name, model_type)
 
         workers_state = {
             wid: {"gpu_memory": w["gpu_memory"], "original_memory": w["gpu_memory"]}
@@ -199,6 +378,11 @@ class ModelParser:
 
         config = {}
         success = True
+
+        self._host_max_module_bytes = host_max_module_bytes
+        if host_max_module_bytes == 0:
+            self._host_max_module_bytes = 1e15  # Set to massive number if not specified
+
         model_memory, breakdown = estimate_memory(
             model,
             training=training,
@@ -210,100 +394,61 @@ class ModelParser:
             include_kv_cache=True,
         )
 
-        # # Log the model structure first
-        # if self.verbose:
-        #     print("\n" + "=" * 80)
-        #     print("MODEL STRUCTURE:")
-        #     print("=" * 80)
-        #     self._log_model_structure(
-        #         model,
-        #         prefix="model",
-        #         training=training,
-        #         optimizer_type=optimizer_type,
-        #         max_seq_len=max_seq_len,
-        #         batch_size=batch_size,
-        #     )
-        #     print("=" * 80 + "\n")
-
         try:
-            config, _ = self._recurse_module(
+            # We must detect any tied embedding weights here and force them
+            # to host loading if so
+            tied_embed_path = None
+            tied_lm_head_path = None
+
+            if hasattr(model, "get_output_embeddings") and hasattr(
+                model, "get_input_embeddings"
+            ):
+                out = model.get_output_embeddings()
+                inp = model.get_input_embeddings()
+                if out is not None and inp is not None:
+                    if out.weight.data_ptr() == inp.weight.data_ptr():
+                        for name, mod in model.named_modules():
+                            if mod is inp:
+                                tied_embed_path = f"model.{name}"
+                            if mod is out:
+                                tied_lm_head_path = f"model.{name}"
+
+            config, _, _ = self._recurse_module(
                 module=model,
+                root_module=None,
                 module_path="model",
                 workers_state=workers_state,
                 training=training,
                 trusted=trusted,
-                handle_layers=handle_layers,
                 input_obfuscation=input_obfuscation,
                 last_worker=None,
                 optimizer_type=optimizer_type,
                 optimizer_spec=optimizer_spec,
-                host_load_small=host_load_small,
-                host_threshold_mb=host_threshold_mb,
+                host_max_memory_bytes=host_max_memory_bytes,
                 host_max_depth=host_max_depth,
                 max_offload_depth=max_offload_depth,
                 max_seq_len=max_seq_len,
                 batch_size=batch_size,
                 model_type=model_type,
+                tied_embed_path=tied_embed_path,
+                tied_lm_head_path=tied_lm_head_path,
             )
 
             config = _group_sequential_layers(config)
 
             # Log final assignment summary
             if self.verbose:
-                self._log_assignment_summary(config, workers_state)
+                _log_assignment_summary(config, workers_state)
 
         except AssignmentError as e:
             success = False
 
-        return {"success": success, "config": config, "model_memory": model_memory}
-
-    def _log_model_structure(
-        self,
-        module: nn.Module,
-        prefix: str = "model",
-        depth: int = 0,
-        training=False,
-        optimizer_type=None,
-        max_seq_len: int = 2048,
-        batch_size: int = 1,
-    ):
-        """
-        Recursively log the entire model structure with module paths.
-
-        Args:
-            module: The module to log
-            prefix: Current path prefix
-            depth: Current depth in the hierarchy
-        """
-        indent = "  " * depth
-        module_type = type(module).__name__
-
-        memory, breakdown = estimate_memory(
-            module,
-            training=training,
-            seq_length=max_seq_len,
-            optimizer_type=optimizer_type,
-            batch_size=batch_size,
-            recursive=True,
-            count_activations=True,
-            include_kv_cache=(depth == 0),
-        )
-
-        print(f"{indent}{prefix} [{module_type}] (~{memory/1e6:.1f}MB)")
-
-        # Store in module_paths dict
-        self.module_paths[prefix] = {'type': module_type, 'memory_mb': memory / 1e6}
-
-        # Recurse into children
-        for child_name, child_module in module.named_children():
-            child_path = f"{prefix}.{child_name}"
-            self._log_model_structure(
-                child_module,
-                child_path,
-                depth + 1,
-                max_seq_len=max_seq_len,
-                batch_size=batch_size,
-            )
+        return {
+            "success": success,
+            "config": config,
+            "model_memory": model_memory,
+            "host_memory_used": self.assigned_memory,
+        }
 
     def _recurse_module(
         self,
@@ -312,36 +457,35 @@ class ModelParser:
         workers_state: dict,
         training: bool,
         trusted: bool,
-        handle_layers: bool,
         input_obfuscation: bool,
+        root_module: nn.Module = None,
         last_worker: Optional[str] = None,
         depth: int = 0,
-        ids: list = None,
         optimizer_type="adam",
         optimizer_spec=None,
-        host_load_small: bool = False,
-        host_threshold_mb: int = 50,
+        host_max_memory_bytes: int = 0,
         host_max_depth: int = 1,
         max_offload_depth: int = 3,
         max_seq_len: int = 2048,
         batch_size: int = 1,
         model_type: str = "chat",
         count_activations: bool = True,
+        obfuscation_layer_assigned: bool = False,
+        tied_embed_path: Optional[str] = None,
+        tied_lm_head_path: Optional[str] = None,
     ):
         config = {}
-        if ids is None:
-            ids = []
 
         indent = "  " * depth
 
-        # Root rule, host can never load entire model
-        is_root = module_path == "model"
+        if root_module is None:
+            root_module = module
 
         # Log current module being processed
         if self.verbose:
             print(f"{indent}Processing: {module_path}")
 
-        # sum children memory
+        # Get memory of current module
         memory, breakdown = estimate_memory(
             module,
             training=training,
@@ -357,44 +501,100 @@ class ModelParser:
             memory -= breakdown.get("activations", 0)
 
         if self.verbose:
-            print(f"{indent}   Memory required: {memory / 1e6:.2f}MB")
+            print(f"{indent}  Memory required: {memory / 1e6:.2f}MB")
 
-        # Local host small module logic
+        # --- Input obfuscation enforcement ---
+        force_host = False
+        if input_obfuscation and not obfuscation_layer_assigned:
+            # Keep the first substantial layer on host for input obfuscation
+            # This ensures raw inputs are transformed before being sent to workers
+
+            # Check if this is a leaf module with parameters (actual layer, not container)
+            has_params = any(True for _ in module.parameters(recurse=False))
+            has_no_children = len(list(module.children())) == 0
+
+            if has_params and has_no_children:
+                # This is a leaf layer with parameters - good candidate for obfuscation layer
+                force_host = True
+                obfuscation_layer_assigned = True
+            elif depth <= 1:
+                # At shallow depth, still enforce obfuscation even for containers
+                # to ensure we capture embedding layers or initial processing
+                force_host = True
+
+            # If we need to force host but have no host memory budget, that's an error
+            if force_host and host_max_memory_bytes == 0:
+                raise ValueError(
+                    f"input_obfuscation=True requires host_max_memory_bytes > 0 to keep "
+                    f"the input transformation layer on the host."
+                )
+
+        # Force host loading for tied embedding to avoid weight duplication across workers
+        force_host = force_host or (
+            (tied_embed_path and module_path == tied_embed_path)
+            or (tied_lm_head_path and module_path == tied_lm_head_path)
+        )
+
+        # Local host module if we have the memory OR input obfuscation is enabled
         if (
-            not is_root
-            and host_load_small
-            and (memory / 1e6) <= host_threshold_mb
+            host_max_memory_bytes
+            and memory <= host_max_memory_bytes - self.assigned_memory
             and depth <= host_max_depth
-        ):
-            config[module_path] = {
-                "type": "loaded",
-                "device": "host",
-                "name": self.model_name,
-                "module_id": ids,
-                "memory": memory,
-                "module": (
-                    f"{type(module)}".split(".")[-1].split(">")[0][:-1]
-                    if not isinstance(module, str)
-                    else module
-                ),
-                "module_path": module_path,
-                "training": training,
-                "optimizer_spec": optimizer_spec,
-                "batch_size": batch_size,
-                "model_type": model_type,
-            }
+            and memory <= self._host_max_module_bytes
+        ) or force_host:
+            # Double-check we can actually fit this on host if forced
+            if force_host and memory > host_max_memory_bytes - self.assigned_memory:
+                if self.verbose:
+                    print(
+                        f"{indent}  WARNING: Obfuscation layer too large for host ({memory / 1e6:.2f}MB > {(host_max_memory_bytes - self.assigned_memory) / 1e6:.2f}MB available)"
+                    )
+                # Don't force it if it truly won't fit
+                force_host = False
+            else:
+                # Check if this is a tied module
+                prev_assigned = self.assigned_memory
+                try:
+                    self.assigned_memory += memory
+                    config[module_path] = {
+                        "type": "loaded",
+                        "device": "host",
+                        "name": self.model_name,
+                        "memory": memory,
+                        "module": (
+                            f"{type(module)}".split(".")[-1].split(">")[0][:-1]
+                            if not isinstance(module, str)
+                            else module
+                        ),
+                        "module_path": module_path,
+                        "training": training,
+                        "optimizer_spec": optimizer_spec,
+                        "batch_size": batch_size,
+                        "model_type": model_type,
+                        "input_boundary": (
+                            True if input_obfuscation and depth == 0 else False
+                        ),
+                    }
 
-            if self.verbose:
-                print(f"{indent} Kept on host (local) — {memory / 1e6:.2f}MB")
-            return config, None
+                    if module_path == tied_lm_head_path and tied_embed_path:
+                        config[module_path]["tied_to"] = tied_embed_path
 
-        # Check if module is loop-iterable BEFORE trying to assign
+                    if self.verbose:
+                        why = "obfuscation boundary" if force_host else "host budget"
+                        print(f"{indent}  Kept on host ({why}) — {memory / 1e6:.2f}MB")
+
+                    return config, None, obfuscation_layer_assigned
+
+                except Exception:
+                    self.assigned_memory = prev_assigned
+                    raise
+
+        # Check if module is loop-iterable before trying to assign
         is_loop_iterable = _is_loop_iterable_module(module, module_path)
 
         if is_loop_iterable and depth > 0:
             if self.verbose:
-                print(f"{indent}   Module is loop-iterable, will recurse into children")
-            # Don't try to assign, just skip to recursion
+                print(f"{indent}  Module is loop-iterable, will recurse into children")
+            # Don't try to assign, skip to recursion
             assigned_worker = None
         else:
             assigned_worker = self._try_assign_worker(
@@ -407,7 +607,6 @@ class ModelParser:
                 "type": "offloaded",
                 "name": self.model_name,
                 "assigned_workers": [assigned_worker],
-                "module_id": ids,
                 "memory": memory,
                 "module": (
                     f"{type(module)}".split(".")[-1].split(">")[0][:-1]
@@ -421,9 +620,12 @@ class ModelParser:
                 "model_type": model_type,
             }
 
+            # Check if this is a tied module
+            if module_path == tied_lm_head_path and tied_embed_path:
+                config[module_path]["tied_to"] = tied_embed_path
+
             self.assigned_workers[assigned_worker].append(
                 {
-                    "module_id": ids,
                     "memory": memory,
                     "module": module,
                     "module_path": module_path,
@@ -431,9 +633,9 @@ class ModelParser:
             )
 
             if self.verbose:
-                print(f"{indent}   Assigned to {assigned_worker}")
+                print(f"{indent}  Assigned to {assigned_worker}")
 
-            return config, assigned_worker
+            return config, assigned_worker, obfuscation_layer_assigned
 
         # Check if we've exceeded max recursion depth
         if depth >= max_offload_depth:
@@ -452,10 +654,11 @@ class ModelParser:
         if self.verbose:
             reason = "is loop-iterable" if is_loop_iterable else "too large"
             print(
-                f"{indent}   Module {module_path} ({memory / 1e6:.2f}MB) {reason}, recursing into children..."
+                f"{indent}  Module {module_path} ({memory / 1e6:.2f}MB) {reason}, recursing into children..."
             )
 
         children = list(module.named_children())
+
         if not children:
             config[module_path] = {
                 "type": "unassigned",
@@ -463,13 +666,11 @@ class ModelParser:
                 "module_path": module_path,
             }
             if self.verbose:
-                print(f"{indent}   No children to recurse into - FAILED")
-
+                print(f"{indent}  No children to recurse into - FAILED")
             raise AssignmentError(
                 f"Unable to assign {module_path}: no children to distribute"
             )
 
-        parent_forward_code = self._extract_forward_code(module)
         child_workers = set()
         prev_child_worker = last_worker
         last_successful_worker = last_worker
@@ -478,28 +679,33 @@ class ModelParser:
             child_path = f"{module_path}.{child_name}"
 
             try:
-                child_config, child_last_worker = self._recurse_module(
-                    module=child_module,
-                    module_path=child_path,
-                    workers_state=workers_state,
-                    training=training,
-                    trusted=trusted,
-                    last_worker=prev_child_worker,
-                    handle_layers=handle_layers,
-                    input_obfuscation=input_obfuscation,
-                    depth=depth + 1,
-                    optimizer_type=optimizer_type,
-                    optimizer_spec=optimizer_spec,
-                    host_load_small=host_load_small,
-                    host_threshold_mb=host_threshold_mb,
-                    host_max_depth=host_max_depth,
-                    max_offload_depth=max_offload_depth,
-                    max_seq_len=max_seq_len,
-                    batch_size=batch_size,
-                    count_activations=False,
+                child_config, child_last_worker, obfuscation_layer_assigned = (
+                    self._recurse_module(
+                        module=child_module,
+                        root_module=root_module,
+                        module_path=child_path,
+                        workers_state=workers_state,
+                        training=training,
+                        trusted=trusted,
+                        last_worker=prev_child_worker,
+                        input_obfuscation=input_obfuscation,
+                        depth=depth + 1,
+                        optimizer_type=optimizer_type,
+                        optimizer_spec=optimizer_spec,
+                        host_max_memory_bytes=host_max_memory_bytes,
+                        host_max_depth=host_max_depth,
+                        max_offload_depth=max_offload_depth,
+                        max_seq_len=max_seq_len,
+                        batch_size=batch_size,
+                        count_activations=False,
+                        obfuscation_layer_assigned=obfuscation_layer_assigned,
+                        tied_embed_path=tied_embed_path,
+                        tied_lm_head_path=tied_lm_head_path,
+                    )
                 )
 
                 config.update(child_config)
+
                 if child_last_worker:
                     prev_child_worker = child_last_worker
                     last_successful_worker = child_last_worker
@@ -507,16 +713,19 @@ class ModelParser:
 
             except AssignmentError as e:
                 if self.verbose:
-                    print(f"{indent}   Child {child_path} failed: {e}")
+                    print(f"{indent}  Child {child_path} failed: {e}")
                 raise
 
-        if len(child_workers) > 1 and parent_forward_code:
-            for child_path, child_cfg in config.items():
-                if child_cfg.get("assigned_workers", [None])[0] in child_workers:
-                    child_cfg["parent_forward_code"] = parent_forward_code
+        # Add parent_module_path
+        # Get the children that were just processed (belong to this parent)
+        for child_name, _ in children:
+            child_path = f"{module_path}.{child_name}"
+            if child_path in config:
+                child_cfg = config[child_path]
+                if child_cfg.get("type") == "offloaded":
                     child_cfg["parent_module_path"] = module_path
 
-        return config, last_successful_worker
+        return config, last_successful_worker, obfuscation_layer_assigned
 
     def _try_assign_worker(
         self,
@@ -550,78 +759,6 @@ class ModelParser:
                 return worker_id
 
         return None
-
-    def _extract_forward_code(self, module: nn.Module):
-        """
-        Extract the forward pass logic from the source code. Allows workers to
-        execute the parent's forward logic locally.
-        """
-        # Check cache
-        module_class = type(module)
-        if module_class in self.forward_code_cache:
-            return self.forward_code_cache[module_class]
-
-        try:
-            forward_method = module.forward
-            source = inspect.getsource(forward_method)
-            source = textwrap.dedent(source)
-            self.forward_code_cache[module_class] = source
-            return source
-
-        except (OSError, TypeError) as e:
-            if self.verbose:
-                print(
-                    f"Could not extract forward code for {module_class.__name__}: {e}"
-                )
-            return None
-
-    def _log_assignment_summary(self, config: dict, workers_state: dict):
-        """
-        Log a summary of the final assignment after configuration is complete.
-        """
-        print("\n" + "=" * 80)
-        print("ASSIGNMENT SUMMARY:")
-        print("=" * 80)
-
-        # Group by worker
-        worker_assignments = defaultdict(list)
-        for module_path, module_config in config.items():
-            if "offloaded" in module_config.get("type", ""):
-                worker_id = module_config["assigned_workers"][0]
-                worker_assignments[worker_id].append(
-                    {
-                        "path": module_path,
-                        "memory": module_config.get("memory", 0),
-                        "module_type": module_config.get("module", "Unknown"),
-                    }
-                )
-
-        # Print per-worker assignments
-        for worker_id in sorted(worker_assignments.keys()):
-            assignments = worker_assignments[worker_id]
-            total_memory = sum(a["memory"] for a in assignments)
-
-            print(f"\n{worker_id}:")
-            print(f"  Total Memory: {total_memory / 1e6:.2f}MB")
-            print(f"  Remaining: {workers_state[worker_id]['gpu_memory'] / 1e6:.2f}MB")
-            print(f"  Modules ({len(assignments)}):")
-
-            for assignment in assignments:
-                print(f"    • {assignment['path']}")
-                print(
-                    f"      [{assignment['module_type']}] - {assignment['memory'] / 1e6:.2f}MB"
-                )
-
-        # Print unassigned modules if any
-        unassigned = [
-            path for path, cfg in config.items() if cfg.get("type") == "unassigned"
-        ]
-        if unassigned:
-            print(f"\n⚠ UNASSIGNED MODULES ({len(unassigned)}):")
-            for path in unassigned:
-                print(f"  • {path}")
-
-        print("=" * 80 + "\n")
 
     def get_module_path_info(self, module_path: str) -> dict:
         """

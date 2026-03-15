@@ -1,7 +1,6 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
 
-from dotenv import get_key
 import hashlib
 import json
 import logging
@@ -67,25 +66,6 @@ class UserThread(Torchnode):
         #         <= 0
         #     ):
         #         time.sleep(5)
-
-        if self.on_chain:
-            self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
-            if not self.public_key:
-                self.debug_print(
-                    "Public key not found in .env file, using donation wallet...",
-                    tag="User",
-                )
-                self.public_key = "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336"
-
-            self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
-
-        attempts = 0
-        while attempts < 3 and len(self.validators) == 0:
-            self.bootstrap()
-
-            if len(self.nodes) == 0:
-                time.sleep(3)
-                attempts += 1
 
     def handle_data(self, data: bytes, node: Connection) -> bool:
         """
@@ -489,10 +469,31 @@ class UserThread(Torchnode):
         # Get proposees from SC and send our state to them
         # If we are the next proposee, accept info from validators and only add info to the final state if there are
         # 2 or more of the identical info
-        super().run()
+        try:
+            super().run()
 
-        while not self.terminate_flag.is_set():
-            # Handle job oversight, and inspect other jobs (includes job verification and reporting)
-            time.sleep(3)
+            should_bootstrap = bool(self._priority_nodes) or self.on_chain
+            if should_bootstrap:
+                attempts = 0
+                while attempts < 3 and len(self.validators) == 0:
+                    self.bootstrap()
 
-        self.stop()
+                    if len(self.nodes) == 0:
+                        time.sleep(3)
+                        attempts += 1
+            else:
+                self.debug_print(
+                    "Skipping bootstrap (no priority nodes and not on-chain).",
+                    tag="Worker",
+                    level=logging.INFO,
+                )
+
+            while not self.terminate_flag.is_set():
+                # Handle job oversight, and inspect other jobs (includes job verification and reporting)
+                time.sleep(3)
+
+        except KeyboardInterrupt:
+            self.terminate_flag.set()
+
+        finally:
+            self.stop()

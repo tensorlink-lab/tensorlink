@@ -16,10 +16,20 @@ import time
 import os
 
 
-FREE_JOB_MAX_TIME = 60 * 30  # 30 minutes in seconds for a free job
+FREE_JOB_MAX_TIME = 60 * 60  # 60 minutes in seconds for a free job
 
 
 class ValidatorThread(Torchnode):
+    """
+    Coordinates connections, job requests, and smart contract updates across
+    the Tensorlink network.
+
+    The ValidatorThread is responsible for:
+    - Discovering and maintaining connections to workers and peers.
+    - Validating job requests and proposals.
+    - Interacting with the underlying smart contract layer (Smartnodes).
+    """
+
     def __init__(
         self,
         request_queue,
@@ -36,6 +46,9 @@ class ValidatorThread(Torchnode):
         priority_nodes: list = None,
         seed_validators: list = None,
     ):
+        """
+        Initialize a Validator P2P Node.
+        """
         super(ValidatorThread, self).__init__(
             request_queue,
             response_queue,
@@ -503,14 +516,14 @@ class ValidatorThread(Torchnode):
             self.rate_limiter.record_attempt(requesters_ip)
 
         if job_info.get("payment", 0) == 0:
-            _time = FREE_JOB_MAX_TIME
+            _time = min(job_info.get("time", FREE_JOB_MAX_TIME), FREE_JOB_MAX_TIME)
         else:
-            _time = job_info.get("time")
+            _time = job_info.get("time", FREE_JOB_MAX_TIME)
 
         job_data = job_info
-        job_data["time"] = _time
 
         if not job_data.get("id"):
+            job_data["time"] = _time
             job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
             job_data["id"] = job_id
 
@@ -520,12 +533,18 @@ class ValidatorThread(Torchnode):
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""
-        # Case 1: ML process is checking for incoming requests
+        # Case 1: ML process polling for incoming requests
         if len(request) == 2:
             model_name, model_id = request
 
             if self.endpoint_requests["incoming"]:
                 for i, api_request in enumerate(self.endpoint_requests["incoming"]):
+                    # Skip cancelled requests and clean them up
+                    if getattr(api_request, 'cancelled', False):
+                        self.endpoint_requests["incoming"].pop(i)
+                        self.response_queue.put({"status": "SUCCESS", "return": None})
+                        return
+
                     if not api_request.processing and api_request.hf_name == model_name:
                         api_request.processing = True
                         api_request = self.endpoint_requests["incoming"].pop(i)
@@ -534,19 +553,29 @@ class ValidatorThread(Torchnode):
                         )
                         return
 
-            # No matching request found
             self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Case 2: ML process is returning completed result
+        # Case 2: ML process returning completed result
         elif len(request) == 1:
             response = request[0]
-            if response.processing:
-                self.endpoint_requests["outgoing"].append(response)
+
+            if getattr(response, 'cancelled', False):
+                # Client already gone, drop result
                 self.response_queue.put({"status": "SUCCESS", "return": None})
+                return
+
+            if response.processing and self.endpoint:
+                if response.stream:
+                    # Streaming is already handled token-by-token via send_token_to_stream
+                    pass
+                else:
+                    # Resolve the waiting Future directly
+                    self.endpoint.resolve_pending_request(response)
+
+            self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Invalid request format
         self.response_queue.put(
             {"status": "FAILURE", "error": "Invalid request format"}
         )
@@ -947,42 +976,43 @@ class ValidatorThread(Torchnode):
     #                 ]
 
     def run(self):
-        super().run()
+        try:
+            super().run()
 
-        if self.on_chain:
-            time.sleep(15)
-            self.execution_listener = threading.Thread(
-                target=self.contract_manager.proposal_creator, daemon=True
-            )
-            self.execution_listener.start()
-            self.proposal_listener = threading.Thread(
-                target=self.contract_manager.proposal_validator, daemon=True
-            )
-            self.proposal_listener.start()
+            if self.on_chain:
+                time.sleep(15)
+                self.execution_listener = threading.Thread(
+                    target=self.contract_manager.proposal_creator, daemon=True
+                )
+                self.execution_listener.start()
+                self.proposal_listener = threading.Thread(
+                    target=self.contract_manager.proposal_validator, daemon=True
+                )
+                self.proposal_listener.start()
 
-        counter = 0
-        # Loop for active job and network moderation
-        while not self.terminate_flag.is_set():
-            if counter % 300 == 0:
-                self.keeper.write_state()
-            if counter % 120 == 0:
-                self.keeper.clean_node()
-                self.clean_port_mappings()
-                self.get_workers()
-            if counter % 180 == 0:
-                self.print_status()
+            counter = 0
+            # Loop for active job and network moderation
+            while not self.terminate_flag.is_set():
+                if counter % 300 == 0:
+                    self.keeper.write_state()
+                if counter % 120 == 0:
+                    self.keeper.clean_node()
+                    self.clean_port_mappings()
+                    self.get_workers()
+                if counter % 180 == 0:
+                    self.print_ui_status()
 
-            time.sleep(1)
-            counter += 1
+                time.sleep(1)
+                counter += 1
+        except KeyboardInterrupt:
+            self.terminate_flag.set()
+
+        finally:
+            self.stop()
 
     def stop(self):
         self.keeper.write_state()
         super().stop()
-
-    def print_status(self):
-        self.print_base_status()
-        print(f" Current Proposal: {self.current_proposal}")
-        print("=============================================\n")
 
     def get_tensorlink_status(self):
         # Path to package root (where this file lives)

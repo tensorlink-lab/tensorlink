@@ -30,6 +30,11 @@ jobs:
       run: |
         poetry install --only main --no-interaction --no-ansi
 
+    - name: Sync version from git tag
+      run: |
+        VERSION=${GITHUB_REF_NAME#v}
+        poetry version "$VERSION"
+
     # Build Python Package
     - name: Build wheel + sdist
       run: |

@@ -28,22 +28,24 @@
 ## What is Tensorlink?
 
 Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across 
-peer-to-peer networks. It enables you to run, train, and serve large models securely across distributed hardware without relying on 
-centralized cloud inference providers.
+peer-to-peer networks. It lets you run, train, and serve large models securely on distributed hardware without relying 
+on centralized cloud inference providers.
+
+With Tensorlink, models can be automatically sharded across multiple GPUs, enabling execution beyond local VRAM limits. 
+You can host models on your own devices, expose them through a REST API, stream tokens in real time, and optionally 
+route requests only to your own hardware for private usage. Tensorlink supports both distributed training with 
+optimizers and low-latency inference across the network.
 
 ### Key Features
-- **Native PyTorch & REST API Access** – Use models directly in Python or via HTTP endpoints  
-- **Run Large Models Without Local VRAM** – Execute models that exceed your GPU capacity  
-- **Remote Access to Your Own Hardware** – Securely host and access models on your devices via API  
-- **Plug-and-Play Distributed Execution** – Automatic model sharding across multiple GPUs  
-- **Training & Inference Support** – Train models with distributed optimizers or run inference across the network  
-- **Streaming Generation** – Token-by-token streaming for real-time responses   
-- **Privacy Controls** – Route queries exclusively to your own hardware for private usage  
-- **Earn Rewards for Idle Compute** – Contribute GPU resources to the network and get compensated  
+
+- **Native PyTorch & REST API Access** — Use models directly in Python or via HTTP endpoints.
+- **Run Large Models** — Automatic offloading and model sharding across peers.
+- **Plug-and-Play Distributed Execution** — No manual cluster setup required.
+- **Streaming Generation** — Token-by-token responses for real-time apps.
+- **Privacy Controls** — Route traffic exclusively to your own machines, or leverage hybrid models privacy enhanced model workflows.
 
 > **Early Access:** Tensorlink is under active development. APIs and internals may evolve.  
 > [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
-> Learn more in the [**Litepaper**](docs/LITEPAPER.md)
 
 ## Quick Start
 
@@ -73,7 +75,7 @@ model = DistributedModel(
 )
 optimizer = model.create_optimizer(lr=0.001)
 ```
-> See [Examples](docs/examples) for streaming generation, distributed training, custom models, 
+> See [Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples) for streaming generation, distributed training, custom models, 
 > and network configurations.
 
 ### Option 2: Accessing Models via HTTP
@@ -95,7 +97,7 @@ response = requests.post(
 
 print(response.json())
 ```
->Access the public network or configure your own hardware for private API access. See [Examples](docs/examples) for 
+>Access the public network or configure your own hardware for private API access. See [Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples) for 
 >streaming, chat completions, and API reference.
 
 ### Option 3: Run a Node
@@ -104,13 +106,13 @@ Run Tensorlink nodes to host models, shard workloads across GPUs, and expose the
 Nodes can act as workers (run models), validators (route requests + expose API), or both. This allows you to 
 build private clusters, public compute providers, or local development environments.
 
-1. Download the latest `tensorlink-node` from [Releases](releases)
+1. Download the latest `tensorlink-node` from [Releases](https://github.com/mattjhawken/tensorlink/releases)
 2. Edit `config.json` to configure your nodes.
 3. Run: `./run-node.sh`
 
 > By default, the config is set for running a public worker node. Your GPU will process network workloads and earn 
-> rewards via the networking layer ([Smartnodes](https://smartnodes.ca)). See [Examples](docs/examples) for different 
-> device and network configurations.
+> rewards via the networking layer ([Smartnodes](https://smartnodes.ca)). See [Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples) 
+> for different device and network configurations.
 
 ---
 
@@ -147,7 +149,7 @@ running a public worker node.
 | `mining_script`   | `str`                       | Path to mining / GPU workload executable                 |
 | `seed_validators` | `List[List[str, int, str]]` | Path to mining / GPU workload executable                 |
 
-> For common configuration recipes and examples, see [**Examples: Node Configuration**](docs/examples/EXAMPLES.md#node-configuration-examples)
+> For common configuration recipes and examples, see [**Examples: Node Configuration**](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples/EXAMPLES.md#node-configuration-examples)
 
 ---
 
@@ -185,15 +187,6 @@ Simple generation endpoint with flexible output formats.
 | `output_format`      | string | `"simple"` | `"simple"`, `"openai"`, or `"raw"`        |
 | `history`            | array  | `null`     | Chat history for multi-turn conversations |
 | `is_chat_completion` | bool   | `false`    | Determines whether to format chat output  |
-
-# In _generate_streaming:
-should_filter = request.is_chat_completion
-
-# Or if you want finer control:
-should_filter = (
-    request.is_chat_completion or 
-    (request.input_format == "chat" and request.output_format == "openai")
-)
 
 #### Example: Basic Generation
 
@@ -379,7 +372,7 @@ import requests
 
 r = requests.post(
     "http://localhost:64747/request-model",
-    json={"hf_name": "Qwen/Qwen2.5-7B-Instruct"}
+    json={"hf_name": "Qwen/Qwen3-8B"}
 )
 
 print(r.json())
@@ -396,25 +389,20 @@ models may appear. Please report any bugs via [Issues](https://github.com/mattjh
 - **Token IDs**: Automatically handles missing pad/eos tokens with safe fallbacks
 - **Format Control**: Use `input_format="chat"` and `output_format="openai"` for seamless integration
 
-> For complete examples, error handling, and advanced usage, see [**Examples: HTTP API**](docs/examples/EXAMPLES.md#http-api-examples)
+> For complete examples, error handling, and advanced usage, see [**Examples: HTTP API**](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples/EXAMPLES.md#http-api-examples)
 
 ---
 
 ## Learn More
 
 - 📚 **[Documentation](https://smartnodes.ca/tensorlink/docs)** – Full API reference and guides
-- 🎯 **[Examples](docs/examples/EXAMPLES.md)** – Comprehensive usage patterns and recipes
+- 🎯 **[Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples/EXAMPLES.md)** – Comprehensive usage patterns and recipes
 - 💬 **[Discord Community](https://discord.gg/aCW2kTNzJ2)** – Get help and connect with developers
-- 🎮 **[Live Demo](https://smartnodes.ca/localhostGPT)** – Try localhostGPT powered by Tensorlink
-- 📘 **[Litepaper](docs/LITEPAPER.md)** – Technical overview and architecture
+- 🎮 **[Live Demo](https://smartnodes.ca/tensorlink)** – Try the chatbot demo powered by a model on Tensorlink
+- 📘 **[Litepaper](https://github.com/mattjhawken/tensorlink/blob/main/docs/LITEPAPER.md)** – Technical overview and architecture
 
 ## Contributing
 
-We welcome contributions! Here's how to get involved:
-
-- **Report bugs** via [GitHub Issues](https://github.com/mattjhawken/tensorlink/issues)
-- **Suggest features** on our [Discord](https://discord.gg/aCW2kTNzJ2)
-- **Submit PRs** to improve code or documentation
-- **Support the project** via [Buy Me a Coffee](https://www.buymeacoffee.com/smartnodes)
+Read our [contirbution guide.](https://github.com/mattjhawken/tensorlink/blob/main/.github/CONTRIBUTING.md)
 
 Tensorlink is released under the [MIT License](LICENSE).

@@ -1,5 +1,5 @@
 """
-TensorLink node runner.
+Tensorlink node runner.
 Supports both Worker and Validator node types based on config.json
 """
 
@@ -81,12 +81,16 @@ def setup_logging(config):
     level_str = config.get("node", {}).get("logging", "INFO").upper()
 
     if not hasattr(logging, level_str):
-        raise ValueError(
-            f"Invalid logging level '{level_str}'. "
-            f"Must be one of: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
-        )
+        if level_str == "VERBOSE":
+            log_level = 5
+        else:
+            raise ValueError(
+                f"Invalid logging level '{level_str}'. "
+                f"Must be one of: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
+            )
+    else:
+        log_level = getattr(logging, level_str)
 
-    log_level = getattr(logging, level_str)
     logging.basicConfig(level=log_level)
 
     return log_level
@@ -182,7 +186,10 @@ def run_worker_loop(worker, config):
 
     except KeyboardInterrupt:
         logging.info("Exiting...")
+        print("Exiting...")
+
     finally:
+        worker.cleanup()
         if mining_process:
             stop_mining(mining_process)
 
@@ -197,6 +204,10 @@ def run_validator_loop(validator):
 
     except KeyboardInterrupt:
         logging.info("Exiting...")
+        print("Exiting...")
+
+    finally:
+        validator.cleanup()
 
 
 def main():
@@ -212,8 +223,12 @@ def main():
 
     if node_type not in ["worker", "validator"]:
         raise ValueError(
-            f"Invalid node type: {node_type}. Must be 'worker' or 'validator'"
+            f"Invalid node type: {node_type}. Must be 'worker', 'validator', or 'both'"
         )
+
+    max_memory_gb = config.get("ml", {}).get("max_memory_gb", 0)
+    max_module_bytes = config.get("ml", {}).get("max_module_bytes", 1e8)
+    enable_hosting = True
 
     # Parse common config
     trusted = config.get("ml", {}).get("trusted", False)
@@ -241,6 +256,7 @@ def main():
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,
             utilization=True,
@@ -262,6 +278,9 @@ def main():
                 seed_validators=config.get("crypto", {}).get("seed_validators", []),
             ),
             trusted=trusted,
+            max_memory_gb=max_memory_gb,
+            max_module_bytes=int(max_module_bytes),
+            enable_hosting=enable_hosting,
         )
         run_validator_loop(validator)
 

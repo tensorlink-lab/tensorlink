@@ -13,4 +13,4 @@ repos:
     rev: 7.1.1
     hooks:
       - id: flake8
-        files: ^(tensorlink/p2p|tensorlink/nodes)/
+        files: ^(tensorlink/p2p|tensorlink/nodes|tensorlink/api)/
