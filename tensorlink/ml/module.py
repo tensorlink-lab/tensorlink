@@ -278,6 +278,7 @@ class DistributedModel(nn.Module):
             tokenizer: can be specified for inference
             config (dict): Optional tensorlink model distribution configuration
         """
+
         super().__init__()
 
         if isinstance(model, nn.Module):
@@ -288,6 +289,7 @@ class DistributedModel(nn.Module):
             self.model = None
 
         self.tokenizer = tokenizer
+        self.dtype = dtype
 
         # Store model and training resources
         self.user_memory = get_gpu_memory()
@@ -1338,7 +1340,7 @@ class DistributedModel(nn.Module):
         # Load real weights into skeleton so forward produces valid buffers
         full_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=self.dtype,
             device_map="cpu",
             low_cpu_mem_usage=True,
         )
@@ -1577,6 +1579,7 @@ class OffloadedModule(nn.Module):
         output = bytes_to_tensor(output_bytes)
         output = attach_tensor(output, self.parent_model.device)
 
+        print(output)
         if self.training:
             output = enable_grad(output)
 

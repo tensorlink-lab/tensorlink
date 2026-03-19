@@ -287,6 +287,7 @@ def _determine_loop_variables(
     function_args: Set[str],
     pre_loop_vars: Set[str],
     kwarg_name: str = None,
+    layer_call_kwargs_values: set = None,
 ) -> Dict:
     """
     Determine which variables need to be passed to workers and returned.
@@ -348,6 +349,13 @@ def _determine_loop_variables(
         | pre_loop_written_in_loop
     )
 
+    # Any variable passed by value into the layer call that exists before
+    # the loop may be mutated via object aliasing inside the layer.
+    # Force those into passthrough so they're exported back to the caller.
+    if layer_call_kwargs_values:
+        alias_targets = layer_call_kwargs_values & pre_loop_vars
+        passthrough_vars.update(alias_targets)
+
     # Input-only: read but never written
     input_only_vars = (read_before_write - variables_written) | (
         function_args - variables_written
@@ -390,6 +398,7 @@ def _generate_new_forward_source(
     layer_call_info: Dict,
     loop_vars: Dict,
     offloaded_modules: List,
+    var_kwarg_name: str = None,
 ) -> str:
     """Generate new forward source with loop replaced by worker calls"""
     lines = original_source.split('\n')
@@ -444,7 +453,7 @@ def _generate_new_forward_source(
 
     # Generate worker calls
     worker_calls = _generate_worker_calls(
-        layer_call_info, loop_vars, indent_str, offloaded_modules
+        layer_call_info, loop_vars, indent_str, offloaded_modules, var_kwarg_name
     )
 
     # Combine
@@ -505,8 +514,29 @@ def _manually_construct_signature(func_node: ast.FunctionDef) -> str:
     return f"def {func_node.name}({', '.join(args_parts)}):"
 
 
+def _analyze_forward(fn):
+    """
+    Extract source, parse AST, extract args, and locate loop node.
+    """
+    source = inspect.getsource(fn)
+    source = textwrap.dedent(source)
+    tree = ast.parse(source)
+
+    arg_extractor = FunctionArgExtractor()
+    arg_extractor.visit(tree)
+
+    loop_finder = LoopFinder()
+    loop_finder.visit(tree)
+
+    return source, tree, arg_extractor, loop_finder
+
+
 def _generate_worker_calls(
-    layer_call_info: Dict, loop_vars: Dict, indent: str, offloaded_modules: List
+    layer_call_info: Dict,
+    loop_vars: Dict,
+    indent: str,
+    offloaded_modules: List,
+    var_kwarg_name: str = None,
 ) -> List[str]:
     """Generate worker calls with proper variable passing and unpacking"""
     calls = []
@@ -526,8 +556,8 @@ def _generate_worker_calls(
         for kw_arg, kw_value in layer_call_info.get('kwargs', {}).items():
             if kw_arg not in all_inputs:
                 arg_parts.append(f"{indent}    {kw_arg}={kw_value}")
-        if layer_call_info.get('has_var_kwargs'):
-            arg_parts.append(f"{indent}    **flash_attn_kwargs")
+        if layer_call_info.get('has_var_kwargs') and var_kwarg_name:
+            arg_parts.append(f"{indent}    **{var_kwarg_name}")
 
         if arg_parts:
             call_str += "\n" + ",\n".join(arg_parts) + f"\n{indent}"
@@ -554,23 +584,6 @@ def _generate_worker_calls(
         calls.append(f"{indent}")
 
     return calls
-
-
-def _analyze_forward(fn):
-    """
-    Extract source, parse AST, extract args, and locate loop node.
-    """
-    source = inspect.getsource(fn)
-    source = textwrap.dedent(source)
-    tree = ast.parse(source)
-
-    arg_extractor = FunctionArgExtractor()
-    arg_extractor.visit(tree)
-
-    loop_finder = LoopFinder()
-    loop_finder.visit(tree)
-
-    return source, tree, arg_extractor, loop_finder
 
 
 def generate_new_forward_method(
@@ -601,7 +614,7 @@ def generate_new_forward_method(
     for stmt in loop_finder.loop_node.body:
         loop_analyzer.visit(stmt)
 
-    # Analyze variables created BEFORE the loop
+    # Analyze variables created before the loop
     func_node = tree.body[0]
     pre_loop_analyzer = VariableUsageAnalyzer()
     for stmt in func_node.body:
@@ -610,9 +623,15 @@ def generate_new_forward_method(
         pre_loop_analyzer.visit(stmt)
 
     pre_loop_vars = pre_loop_analyzer.variables_written
-
     # Extract the layer call to preserve kwargs
     layer_call_info = _extract_layer_call(loop_finder.loop_node)
+
+    # Extract plain-identifier values from layer call kwargs
+    # These are variables passed by alias (e.g. past_key_value=past_key_values)
+    # whose underlying objects get mutated
+    layer_call_kwargs_values = {
+        v for v in layer_call_info.get('kwargs', {}).values() if v.isidentifier()
+    }
 
     # Determine input and output variables
     loop_vars = _determine_loop_variables(
@@ -621,6 +640,7 @@ def generate_new_forward_method(
         arg_extractor.args,
         pre_loop_vars,
         arg_extractor.kwarg_name,
+        layer_call_kwargs_values,
     )
 
     # Generate new forward code
@@ -630,6 +650,7 @@ def generate_new_forward_method(
         layer_call_info,
         loop_vars,
         offloaded_modules,
+        arg_extractor.kwarg_name,
     )
 
     # Prepare namespace
@@ -712,6 +733,10 @@ def get_loop_io_signature(parent_module) -> Dict:
         call_extractor.layer_calls[0] if call_extractor.layer_calls else {}
     )
 
+    layer_call_kwargs_values = {
+        v for v in layer_call_info.get('kwargs', {}).values() if v.isidentifier()
+    }
+
     # Determine input and output variables
     loop_vars = _determine_loop_variables(
         loop_analyzer,
@@ -719,6 +744,7 @@ def get_loop_io_signature(parent_module) -> Dict:
         arg_extractor.args,
         pre_loop_vars,
         arg_extractor.kwarg_name,
+        layer_call_kwargs_values,
     )
 
     # Extract loop body source and iterator name

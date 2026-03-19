@@ -124,7 +124,7 @@ def estimate_memory(
     return total, breakdown
 
 
-def get_gpu_memory(max_vram_gb: float | None = None):
+def get_gpu_memory(max_vram_gb: float | None = None) -> int:
     """
     Returns available memory in bytes.
     - Uses total free CUDA VRAM if available.

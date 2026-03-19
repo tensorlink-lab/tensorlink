@@ -155,7 +155,7 @@ class DistributedValidator(DistributedWorker):
         self.models_initializing = set()  # job_id
 
         # Configuration
-        self.TRACKING_DAYS = 1  # Track requests for past 1 day
+        self.TRACKING_DAYS = 7  # Track requests for past 1 day
         self.MIN_REQUESTS_THRESHOLD = 10  # Minimum requests to consider auto-loading
         self.MAX_AUTO_MODELS = 10  # Maximum models to auto-load
 
