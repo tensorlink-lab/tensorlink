@@ -306,7 +306,6 @@ class LayerGroupModule(torch.nn.Module):
 
         # Compile and return
         namespace = {'self': self, 'torch': torch}
-        print(forward_source)
         exec(forward_source, namespace)
         return namespace['forward']
 
@@ -594,7 +593,10 @@ def _generate_worker_calls(
             if kw_arg not in all_inputs:
                 arg_parts.append(f"{indent}    {kw_arg}={kw_value}")
         if layer_call_info.get('has_var_kwargs') and var_kwarg_name:
-            arg_parts.append(f"{indent}    **{var_kwarg_name}")
+            # Only spread **var_kwarg if it isn't already passed as a named arg.
+            # Passing both causes a duplicate keyword argument TypeError.
+            if var_kwarg_name not in all_inputs:
+                arg_parts.append(f"{indent}    **{var_kwarg_name}")
 
         if arg_parts:
             call_str += "\n" + ",\n".join(arg_parts) + f"\n{indent}"
@@ -630,12 +632,14 @@ def _generate_worker_calls(
                 f"{indent}        _val_{var} = _worker_output_{idx}.get('{alias}')"
             )
             calls.append(f"{indent}    if _val_{var} is not None:")
-            # If the value came back as a tuple-of-tuples (serialized DynamicCache),
-            # reconstruct a DynamicCache so downstream layers receive the right type.
-            # Use len() > 0 instead of truthiness to avoid "Boolean value of Tensor
-            # with more than one element is ambiguous" when the value is a tensor.
+            # If the value came back as a serialized DynamicCache (tuple of 2-tuples
+            # of 4-D tensors), rebuild it. The inner-element check is intentionally
+            # strict so we don't corrupt position_embeddings or other tuple values:
+            # each element must be a length-2 sequence of tensors with ndim==4.
             calls.append(
-                f"{indent}        if isinstance(_val_{var}, (list, tuple)) and len(_val_{var}) > 0 and isinstance(_val_{var}[0], (list, tuple)):"
+                f"{indent}        if (isinstance(_val_{var}, (list, tuple)) and len(_val_{var}) > 0"
+                f" and isinstance(_val_{var}[0], (list, tuple)) and len(_val_{var}[0]) == 2"
+                f" and hasattr(_val_{var}[0][0], 'ndim') and _val_{var}[0][0].ndim == 4):"
             )
             calls.append(f"{indent}            try:")
             calls.append(
@@ -728,7 +732,7 @@ def generate_new_forward_method(
 
     # Prepare namespace
     namespace = _get_model_module_globals(parent_module, original_forward)
-    print(new_forward_code)
+
     try:
         exec(new_forward_code, namespace)
         return namespace["forward"]
