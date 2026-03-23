@@ -306,6 +306,7 @@ class LayerGroupModule(torch.nn.Module):
 
         # Compile and return
         namespace = {'self': self, 'torch': torch}
+        print(forward_source)
         exec(forward_source, namespace)
         return namespace['forward']
 
@@ -727,7 +728,7 @@ def generate_new_forward_method(
 
     # Prepare namespace
     namespace = _get_model_module_globals(parent_module, original_forward)
-
+    print(new_forward_code)
     try:
         exec(new_forward_code, namespace)
         return namespace["forward"]

@@ -1,4 +1,5 @@
 from accelerate import init_empty_weights
+from sympy.utilities.timeutils import timethis
 from transformers import (
     PreTrainedModel,
     AutoConfig,
@@ -1547,14 +1548,18 @@ class OffloadedModule(nn.Module):
                 [handle_output(args), self.module_id]
             )
 
+        t01 = time.time()
         args = handle_output(args)
+        t02 = time.time()
         detached_args = detach_tensor(args, clone=True)
+        t03 = time.time()
         args_bytes = tensor_to_bytes(detached_args)
+        t04 = time.time()
         kwargs_bytes = tensor_to_bytes(kwargs)
+        t05 = time.time()
         forward_bytes = len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
-
         size, shm_name = store_in_shared_memory(forward_bytes, encoded=True)
-
+        t06 = time.time()
         # Relay forward pass to next roles
         self.parent_model.send_request(
             "send_forward", (self.worker_id, self.module_id, size, shm_name, tag)
@@ -1575,9 +1580,21 @@ class OffloadedModule(nn.Module):
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
                 waiting = False
-
+        print(f"Model: {self.module_name},\nHandle Output Time: {t02 - t01}")
+        print(f"Model: {self.module_name},\nDetach Time: {t03 - t02}")
+        print(f"Model: {self.module_name},\nArgs to Bytes Time: {t04 - t03}")
+        print(f"Model: {self.module_name},\nKwargs to Bytes Time: {t05 - t04}")
+        print(f"Model: {self.module_name},\nStore in Shared Memory Time: {t06 - t05}")
+        t1 = time.time()
         output = bytes_to_tensor(output_bytes)
+        print(
+            f"Model: {self.module_name},\nOutput: {output},\nBytes to Tensor Time: {time.time() - t1}"
+        )
+        t1 = time.time()
         output = attach_tensor(output, self.parent_model.device)
+        print(
+            f"Model: {self.module_name},\nOutput: {output},\nAttach Tensor Time: {time.time() - t1}"
+        )
 
         if self.training:
             output = enable_grad(output)
