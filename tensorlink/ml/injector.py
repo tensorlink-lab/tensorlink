@@ -273,7 +273,9 @@ class LayerGroupModule(torch.nn.Module):
             "    # the host generated forward can find it regardless of naming."
         )
         func_lines.append("    _output = {}")
-        func_lines.append("    _output.update(kwargs)  # preserve all pass-through keys")
+        func_lines.append(
+            "    _output.update(kwargs)  # preserve all pass-through keys"
+        )
 
         # Return every variable we know about under its name AND its alias
         all_vars = sorted(set(self.input_vars) | set(self.output_vars))
@@ -601,15 +603,11 @@ def _generate_worker_calls(
         # Unpack explicitly computed output vars first (also try alias)
         for var in all_outputs:
             alias = var + 's' if not var.endswith('s') else var[:-1]
-            calls.append(
-                f"{indent}if isinstance(_worker_output_{idx}, dict):"
-            )
+            calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
             calls.append(
                 f"{indent}    _val_{var}_out = _worker_output_{idx}.get('{var}')"
             )
-            calls.append(
-                f"{indent}    if _val_{var}_out is None:"
-            )
+            calls.append(f"{indent}    if _val_{var}_out is None:")
             calls.append(
                 f"{indent}        _val_{var}_out = _worker_output_{idx}.get('{alias}')"
             )
@@ -623,20 +621,14 @@ def _generate_worker_calls(
         # the host variable is always refreshed regardless of naming convention.
         calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
         for var in all_inputs:
-            calls.append(
-                f"{indent}    _val_{var} = _worker_output_{idx}.get('{var}')"
-            )
+            calls.append(f"{indent}    _val_{var} = _worker_output_{idx}.get('{var}')")
             # also try ±'s alias
             alias = var + 's' if not var.endswith('s') else var[:-1]
-            calls.append(
-                f"{indent}    if _val_{var} is None:"
-            )
+            calls.append(f"{indent}    if _val_{var} is None:")
             calls.append(
                 f"{indent}        _val_{var} = _worker_output_{idx}.get('{alias}')"
             )
-            calls.append(
-                f"{indent}    if _val_{var} is not None:"
-            )
+            calls.append(f"{indent}    if _val_{var} is not None:")
             # If the value came back as a tuple-of-tuples (serialized DynamicCache),
             # reconstruct a DynamicCache so downstream layers receive the right type.
             # Use len() > 0 instead of truthiness to avoid "Boolean value of Tensor
@@ -644,30 +636,18 @@ def _generate_worker_calls(
             calls.append(
                 f"{indent}        if isinstance(_val_{var}, (list, tuple)) and len(_val_{var}) > 0 and isinstance(_val_{var}[0], (list, tuple)):"
             )
-            calls.append(
-                f"{indent}            try:"
-            )
+            calls.append(f"{indent}            try:")
             calls.append(
                 f"{indent}                from transformers.cache_utils import DynamicCache as _DC"
             )
-            calls.append(
-                f"{indent}                _rebuilt = _DC()"
-            )
-            calls.append(
-                f"{indent}                for _lk, _lv in _val_{var}:"
-            )
-            calls.append(
-                f"{indent}                    _rebuilt.key_cache.append(_lk)"
-            )
+            calls.append(f"{indent}                _rebuilt = _DC()")
+            calls.append(f"{indent}                for _lk, _lv in _val_{var}:")
+            calls.append(f"{indent}                    _rebuilt.key_cache.append(_lk)")
             calls.append(
                 f"{indent}                    _rebuilt.value_cache.append(_lv)"
             )
-            calls.append(
-                f"{indent}                _val_{var} = _rebuilt"
-            )
-            calls.append(
-                f"{indent}            except Exception:"
-            )
+            calls.append(f"{indent}                _val_{var} = _rebuilt")
+            calls.append(f"{indent}            except Exception:")
             calls.append(
                 f"{indent}                pass  # leave as tuple if rebuild fails"
             )
