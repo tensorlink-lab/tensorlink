@@ -307,8 +307,12 @@ class DistributedWorker:
         kwargs = bytes_to_tensor(kwargs_bytes)
 
         # Move tensors to device
+        print(f"ARGS:{args}")
+        print(f"KWARGS:{kwargs}")
         inp = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
+        print(f"ARGS:{inp}")
+        print(f"KWARGS:{kwargs}")
 
         if module.training:
             inp = enable_grad(inp)
