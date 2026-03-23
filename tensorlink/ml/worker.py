@@ -303,11 +303,15 @@ class DistributedWorker:
         args_len = int.from_bytes(data[:8], "big")
         args_bytes = data[8 : 8 + args_len]
         kwargs_bytes = data[8 + args_len :]
+        t01 = time.time()
         args = bytes_to_tensor(args_bytes)
         kwargs = bytes_to_tensor(kwargs_bytes)
+        t02 = time.time()
 
         # Move tensors to device
-        print(f"ARGS:{args}")
+        print(
+            f"Model: {type(module)},\nBytes to Tensor Time: {t02 - t01},\nARGS:{args}"
+        )
         print(f"KWARGS:{kwargs}")
         inp = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
@@ -347,7 +351,10 @@ class DistributedWorker:
 
         # Detach and store output
         detached_out = detach_tensor(out)
+        t01 = time.time()
         output_bytes = tensor_to_bytes(detached_out)
+        t02 = time.time()
+        print(f"Model: {type(module)},\nBytes to Tensor Time: {t02 - t01}")
         size, name = store_in_shared_memory(output_bytes)
 
         self.send_request("send_forward", (module.host, module_id, size, name, key))
