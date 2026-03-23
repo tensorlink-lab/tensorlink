@@ -184,6 +184,12 @@ class LayerGroupModule(torch.nn.Module):
         Generate a forward function that executes the original loop body
         for each layer in self.layers.
 
+        The key design principle: expose ALL incoming kwargs into the loop body
+        namespace, not just the variables the AST identified as input_vars.
+        This handles model-specific aliasing (e.g. past_key_value=past_key_values)
+        where the loop body uses a different name than the function argument without
+        any model-specific hardcoding.
+
         Args:
             loop_body_source: The source code of the original loop body
             debug: If True, add print statements for debugging
@@ -191,36 +197,54 @@ class LayerGroupModule(torch.nn.Module):
         # Build function signature
         func_lines = [
             "def forward(self, **kwargs):",
-            "    # Extract input variables",
+            "    # ---- Expose all incoming kwargs as local variables ----",
+            "    # This is the model-agnostic key: the loop body may reference",
+            "    # variables under names that differ from the outer function args",
+            "    # (e.g. past_key_value vs past_key_values). By unpacking every",
+            "    # kwarg into the local namespace we handle any such aliasing",
+            "    # without knowing the model's variable naming convention.",
+            "    _ns = {k: v for k, v in kwargs.items()}",
         ]
 
         if debug:
             func_lines.append(
-                "    print(f'[LayerGroupModule] Forward called with {len(kwargs)} kwargs')"
-            )
-            func_lines.append(
-                "    print(f'[LayerGroupModule] Input kwargs keys: {list(kwargs.keys())}')"
+                "    print(f'[LayerGroupModule] Forward called with kwargs: {list(kwargs.keys())}')"
             )
 
-        # Extract each input variable from kwargs
+        # Extract the named input_vars the AST found (may be aliases / subsets).
+        # We still extract them explicitly so the loop body can reference them
+        # as bare names. The model-agnostic alias resolution works as follows:
+        #
+        #   1. Try the exact name first (most cases).
+        #   2. If not found, try the name with a trailing 's' added/removed.
+        #      This handles the very common HF pattern where the outer function
+        #      argument is past_key_values (plural) but the per-layer call uses
+        #      past_key_value (singular) as a local alias. We intentionally do
+        #      NOT hardcode either name — only the structural rule (+/-'s').
+        #   3. Still not found? Leave as None; the loop body will handle it.
+        func_lines.append("")
+        func_lines.append("    # ---- Extract loop-body variables from kwargs ----")
         for var in self.input_vars:
             if var.endswith('_kwargs') or var == 'flash_attn_kwargs':
-                func_lines.append(f"    {var} = kwargs.get('{var}', {{}})")
+                func_lines.append(f"    {var} = _ns.get('{var}', {{}})")
             else:
-                func_lines.append(f"    {var} = kwargs.get('{var}')")
+                # Step 1: exact name
+                func_lines.append(f"    {var} = _ns.get('{var}')")
+                # Step 2: plural/singular variant (±'s') — model-agnostic alias resolution
+                func_lines.append(f"    if {var} is None:")
+                func_lines.append(
+                    f"        _alias_{var} = '{var}' + 's' if not '{var}'.endswith('s') else '{var}'[:-1]"
+                )
+                func_lines.append(f"        {var} = _ns.get(_alias_{var})")
 
             if debug:
                 func_lines.append(
-                    f"    print(f'[LayerGroupModule] Extracted {var}: {{type({var})}}{{f\" shape={{list({var}.shape)}}\" if hasattr({var}, \"shape\") else \"\"}}')"
+                    f"    print(f'[LayerGroupModule] {var} = {{type({var})}}'"
+                    f"  f'{{\" shape=\" + str(list({var}.shape)) if hasattr({var}, \"shape\") else \"\"}}')"
                 )
 
         func_lines.append("")
         func_lines.append("    # Process through layers")
-        if debug:
-            func_lines.append(
-                f"    print(f'[LayerGroupModule] Processing {{len(self.layers)}} layers')"
-            )
-
         func_lines.append(
             f"    for layer_idx, {self.loop_iterator_name} in enumerate(self.layers):"
         )
@@ -229,34 +253,44 @@ class LayerGroupModule(torch.nn.Module):
             func_lines.append(
                 f"        print(f'[LayerGroupModule] Layer {{layer_idx}}/{{len(self.layers)}}')"
             )
-            func_lines.append(
-                f"        print(f'[LayerGroupModule]   hidden_states before: {{hidden_states.shape if hasattr(hidden_states, \"shape\") else type(hidden_states)}} min={{hidden_states.min().item() if hasattr(hidden_states, \"min\") else \"N/A\"}} max={{hidden_states.max().item() if hasattr(hidden_states, \"max\") else \"N/A\"}} mean={{hidden_states.mean().item() if hasattr(hidden_states, \"mean\") else \"N/A\"}}')"
-            )
 
-        # Add the original loop body (indented appropriately)
+        # Add the original loop body (indented inside the for loop)
         loop_lines = loop_body_source.strip().split('\n')
         for line in loop_lines:
             func_lines.append(f"        {line}")
 
-        if debug:
-            func_lines.append(
-                f"        print(f'[LayerGroupModule]   hidden_states after: {{hidden_states.shape if hasattr(hidden_states, \"shape\") else type(hidden_states)}} min={{hidden_states.min().item() if hasattr(hidden_states, \"min\") else \"N/A\"}} max={{hidden_states.max().item() if hasattr(hidden_states, \"max\") else \"N/A\"}} mean={{hidden_states.mean().item() if hasattr(hidden_states, \"mean\") else \"N/A\"}}')"
-            )
-            func_lines.append(
-                f"        if hasattr(hidden_states, 'isnan') and hidden_states.isnan().any():"
-            )
-            func_lines.append(
-                f"            print(f'[LayerGroupModule]   WARNING: NaN detected in hidden_states after layer {{layer_idx}}')"
-            )
-
         func_lines.append("")
         func_lines.append(
-            "    # Return all inputs plus computed outputs (outputs take priority)"
+            "    # Build output: start with all original kwargs, then overlay"
+        )
+        func_lines.append(
+            "    # every local variable that exists in the loop body namespace."
+        )
+        func_lines.append(
+            "    # Each var is stored under its own name AND its ±'s alias so that"
+        )
+        func_lines.append(
+            "    # the host generated forward can find it regardless of naming."
         )
         func_lines.append("    _output = {}")
-        func_lines.append("    _output.update(kwargs)")
-        for var in sorted(self.output_vars):
-            func_lines.append(f"    _output['{var}'] = {var}")
+        func_lines.append("    _output.update(kwargs)  # preserve all pass-through keys")
+
+        # Return every variable we know about under its name AND its alias
+        all_vars = sorted(set(self.input_vars) | set(self.output_vars))
+        for var in all_vars:
+            func_lines.append(f"    try:")
+            func_lines.append(f"        _output['{var}'] = {var}")
+            # Also write under the plural/singular alias so the host always finds it
+            func_lines.append(
+                f"        _alias_{var}_out = '{var}' + 's' if not '{var}'.endswith('s') else '{var}'[:-1]"
+            )
+            func_lines.append(
+                f"        if _alias_{var}_out not in _output or _output[_alias_{var}_out] is None:"
+            )
+            func_lines.append(f"            _output[_alias_{var}_out] = {var}")
+            func_lines.append(f"    except NameError:")
+            func_lines.append(f"        pass  # var was never assigned, skip")
+
         func_lines.append("    return _output")
 
         forward_source = '\n'.join(func_lines)
@@ -322,9 +356,9 @@ def _determine_loop_variables(
             variables_written.add(v)
 
     # A variable must exist before the loop if:
-    # 1. It's first accessed via READ (not write), OR
+    # 1. It's first accessed via read (not write), OR
     # 2. It's a function argument, OR
-    # 3. It was created before the loop (NEW)
+    # 3. It was created before the loop
     read_before_write = set()
     for var in variables_read:
         if var in var_analyzer.first_access:
@@ -564,22 +598,80 @@ def _generate_worker_calls(
         call_str += ")"
         calls.append(call_str)
 
-        # Unpack explicitly computed output vars first
+        # Unpack explicitly computed output vars first (also try alias)
         for var in all_outputs:
+            alias = var + 's' if not var.endswith('s') else var[:-1]
             calls.append(
-                f"{indent}if isinstance(_worker_output_{idx}, dict) and '{var}' in _worker_output_{idx}:"
+                f"{indent}if isinstance(_worker_output_{idx}, dict):"
             )
-            calls.append(f"{indent}    {var} = _worker_output_{idx}['{var}']")
+            calls.append(
+                f"{indent}    _val_{var}_out = _worker_output_{idx}.get('{var}')"
+            )
+            calls.append(
+                f"{indent}    if _val_{var}_out is None:"
+            )
+            calls.append(
+                f"{indent}        _val_{var}_out = _worker_output_{idx}.get('{alias}')"
+            )
+            calls.append(f"{indent}    if _val_{var}_out is not None:")
+            calls.append(f"{indent}        {var} = _val_{var}_out")
 
-        # update ANY input variable that appears in the
-        # worker output dict — catches in-place mutations like
-        # past_key_values that the AST analyzer missed entirely.
+        # Update any input variable from the worker output dict.
+        # Handles in-place mutations (e.g. DynamicCache) AND the common HF
+        # aliasing pattern (past_key_values / past_key_value ±'s').
+        # We look up both the exact name and its plural/singular variant so
+        # the host variable is always refreshed regardless of naming convention.
         calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
         for var in all_inputs:
             calls.append(
-                f"{indent}    if '{var}' in _worker_output_{idx} and _worker_output_{idx}['{var}'] is not None:"
+                f"{indent}    _val_{var} = _worker_output_{idx}.get('{var}')"
             )
-            calls.append(f"{indent}        {var} = _worker_output_{idx}['{var}']")
+            # also try ±'s alias
+            alias = var + 's' if not var.endswith('s') else var[:-1]
+            calls.append(
+                f"{indent}    if _val_{var} is None:"
+            )
+            calls.append(
+                f"{indent}        _val_{var} = _worker_output_{idx}.get('{alias}')"
+            )
+            calls.append(
+                f"{indent}    if _val_{var} is not None:"
+            )
+            # If the value came back as a tuple-of-tuples (serialized DynamicCache),
+            # reconstruct a DynamicCache so downstream layers receive the right type.
+            # Use len() > 0 instead of truthiness to avoid "Boolean value of Tensor
+            # with more than one element is ambiguous" when the value is a tensor.
+            calls.append(
+                f"{indent}        if isinstance(_val_{var}, (list, tuple)) and len(_val_{var}) > 0 and isinstance(_val_{var}[0], (list, tuple)):"
+            )
+            calls.append(
+                f"{indent}            try:"
+            )
+            calls.append(
+                f"{indent}                from transformers.cache_utils import DynamicCache as _DC"
+            )
+            calls.append(
+                f"{indent}                _rebuilt = _DC()"
+            )
+            calls.append(
+                f"{indent}                for _lk, _lv in _val_{var}:"
+            )
+            calls.append(
+                f"{indent}                    _rebuilt.key_cache.append(_lk)"
+            )
+            calls.append(
+                f"{indent}                    _rebuilt.value_cache.append(_lv)"
+            )
+            calls.append(
+                f"{indent}                _val_{var} = _rebuilt"
+            )
+            calls.append(
+                f"{indent}            except Exception:"
+            )
+            calls.append(
+                f"{indent}                pass  # leave as tuple if rebuild fails"
+            )
+            calls.append(f"{indent}        {var} = _val_{var}")
 
         calls.append(f"{indent}")
 
