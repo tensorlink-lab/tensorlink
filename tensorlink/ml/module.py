@@ -49,6 +49,7 @@ from tensorlink.ml.utils import (
     attach_tensor,
     load_model_skeleton,
     get_nested_module,
+    print_output,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -1580,21 +1581,19 @@ class OffloadedModule(nn.Module):
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
                 waiting = False
-        print(f"Model: {self.module_name},\nHandle Output Time: {t02 - t01}")
-        print(f"Model: {self.module_name},\nDetach Time: {t03 - t02}")
-        print(f"Model: {self.module_name},\nArgs to Bytes Time: {t04 - t03}")
-        print(f"Model: {self.module_name},\nKwargs to Bytes Time: {t05 - t04}")
-        print(f"Model: {self.module_name},\nStore in Shared Memory Time: {t06 - t05}")
+        print(f"Model: {self.module_name},Handle Output Time: {t02 - t01}")
+        print(f"Model: {self.module_name},Detach Time: {t03 - t02}")
+        print(f"Model: {self.module_name},Args to Bytes Time: {t04 - t03}")
+        print(f"Model: {self.module_name},Kwargs to Bytes Time: {t05 - t04}")
+        print(f"Model: {self.module_name},Store in Shared Memory Time: {t06 - t05}")
         t1 = time.time()
         output = bytes_to_tensor(output_bytes)
-        print(
-            f"Model: {self.module_name},\nOutput: {output},\nBytes to Tensor Time: {time.time() - t1}"
-        )
+        print_output(output, self.module_name)
+        print(f"Bytes to Tensor Time: {time.time() - t1}")
         t1 = time.time()
         output = attach_tensor(output, self.parent_model.device)
-        print(
-            f"Model: {self.module_name},\nOutput: {output},\nAttach Tensor Time: {time.time() - t1}"
-        )
+        print_output(output, self.module_name)
+        print(f"Attach Tensor Time: {time.time() - t1}")
 
         if self.training:
             output = enable_grad(output)

@@ -914,3 +914,80 @@ def load_model_skeleton(model_name: str, model_type: str = "chat"):
         param.requires_grad = False
 
     return skeleton_model
+
+
+from collections.abc import Mapping, Sequence
+
+
+def print_output(x, name=None, indent=0, max_elements=5):
+    def _tensor_preview(t, max_el=5):
+        shape = tuple(t.shape)
+        flat = t.flatten()
+
+        if flat.numel() == 0:
+            return f"shape={shape} EMPTY"
+
+        vals = flat[:max_el].detach().cpu().tolist()
+
+        if flat.numel() <= max_el:
+            return f"shape={shape} vals={vals}"
+        else:
+            tail = flat[-max_el:].detach().cpu().tolist()
+            return f"shape={shape} head={vals} tail={tail}"
+
+    p = " " * indent
+    prefix = f"{p}{name}: " if name else p
+
+    # ---- Dict ----
+    if isinstance(x, Mapping):
+        print(f"{prefix}dict[{len(x)}]")
+        for k, v in x.items():
+            print_output(v, name=str(k), indent=indent + 2)
+
+    # ---- Sequence ----
+    elif isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+        if len(x) == 0:
+            print(f"{prefix}list[0]")
+            return
+
+        print(f"{prefix}list[{len(x)}]")
+
+        # only show first element
+        print_output(x[0], name="[0]", indent=indent + 2)
+        if len(x) > 1:
+            print(f"{p}  ...")
+
+    # ---- Tensor ----
+    elif isinstance(x, torch.Tensor):
+        preview = _tensor_preview(x, max_elements)
+        print(f"{prefix}Tensor({preview}, dtype={x.dtype}, device={x.device})")
+
+    # ---- Cache-like ----
+    elif hasattr(x, "__class__") and "Cache" in x.__class__.__name__:
+        cls = x.__class__.__name__
+
+        summary = []
+        for attr in ["seen_tokens", "is_compileable"]:
+            if hasattr(x, attr):
+                summary.append(f"{attr}={getattr(x, attr)}")
+
+        print(f"{prefix}{cls}({', '.join(summary)})")
+
+        # selectively inspect key/value cache
+        for attr in ["key_cache", "value_cache"]:
+            if hasattr(x, attr):
+                val = getattr(x, attr)
+                if isinstance(val, list) and len(val) > 0:
+                    print(f"{p}  {attr}: list[{len(val)}]")
+                    print_output(val[0], name=f"{attr}[0]", indent=indent + 4)
+
+    # ---- Simple types ----
+    elif isinstance(x, (int, float, bool)):
+        print(f"{prefix}{type(x).__name__}({x})")
+
+    elif x is None:
+        print(f"{prefix}None")
+
+    # ---- Fallback ----
+    else:
+        print(f"{prefix}{type(x).__name__}")

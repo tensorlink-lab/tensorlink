@@ -34,6 +34,7 @@ from tensorlink.ml.utils import (
     get_nested_module,
     get_optimizer_from_spec,
     load_model_skeleton,
+    print_output,
 )
 from tensorlink.ml.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
@@ -309,14 +310,15 @@ class DistributedWorker:
         t02 = time.time()
 
         # Move tensors to device
-        print(
-            f"Model: {type(module)},\nBytes to Tensor Time: {t02 - t01},\nARGS:{args}"
-        )
-        print(f"KWARGS:{kwargs}")
+        print(f"Model: {type(module)}, Bytes to Tensor Time: {t02 - t01}")
+        print_output(args, "PREATTACH ARGS")
+        print_output(kwargs, "PREATTACH KWARGS")
+
         inp = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
-        print(f"ARGS:{inp}")
-        print(f"KWARGS:{kwargs}")
+
+        print_output(args, "ARGS")
+        print_output(kwargs, "KWARGS")
 
         if module.training:
             inp = enable_grad(inp)

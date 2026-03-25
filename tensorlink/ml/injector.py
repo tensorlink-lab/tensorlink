@@ -164,6 +164,7 @@ class LayerGroupModule(torch.nn.Module):
         output_vars: List[str],
         loop_body_source: str,
         loop_iterator_name: str,
+        layer_offset: int = 0,
         debug: bool = True,
     ):
         super().__init__()
@@ -172,6 +173,7 @@ class LayerGroupModule(torch.nn.Module):
         self.output_vars = output_vars
         self.loop_iterator_name = loop_iterator_name
         self.num_layers = len(layers)
+        self.layer_offset = layer_offset  # global index of first layer in this group
         self.debug = debug
 
         # Generate the forward function from the loop body
@@ -212,30 +214,13 @@ class LayerGroupModule(torch.nn.Module):
             )
 
         # Extract the named input_vars the AST found (may be aliases / subsets).
-        # We still extract them explicitly so the loop body can reference them
-        # as bare names. The model-agnostic alias resolution works as follows:
-        #
-        #   1. Try the exact name first (most cases).
-        #   2. If not found, try the name with a trailing 's' added/removed.
-        #      This handles the very common HF pattern where the outer function
-        #      argument is past_key_values (plural) but the per-layer call uses
-        #      past_key_value (singular) as a local alias. We intentionally do
-        #      NOT hardcode either name — only the structural rule (+/-'s').
-        #   3. Still not found? Leave as None; the loop body will handle it.
         func_lines.append("")
         func_lines.append("    # ---- Extract loop-body variables from kwargs ----")
         for var in self.input_vars:
-            if var.endswith('_kwargs') or var == 'flash_attn_kwargs':
+            if var.endswith('_kwargs'):
                 func_lines.append(f"    {var} = _ns.get('{var}', {{}})")
             else:
-                # Step 1: exact name
                 func_lines.append(f"    {var} = _ns.get('{var}')")
-                # Step 2: plural/singular variant (±'s') — model-agnostic alias resolution
-                func_lines.append(f"    if {var} is None:")
-                func_lines.append(
-                    f"        _alias_{var} = '{var}' + 's' if not '{var}'.endswith('s') else '{var}'[:-1]"
-                )
-                func_lines.append(f"        {var} = _ns.get(_alias_{var})")
 
             if debug:
                 func_lines.append(
@@ -246,12 +231,15 @@ class LayerGroupModule(torch.nn.Module):
         func_lines.append("")
         func_lines.append("    # Process through layers")
         func_lines.append(
-            f"    for layer_idx, {self.loop_iterator_name} in enumerate(self.layers):"
+            f"    for _local_idx, {self.loop_iterator_name} in enumerate(self.layers):"
+        )
+        func_lines.append(
+            f"        layer_idx = _local_idx + self.layer_offset  # global layer index"
         )
 
         if debug:
             func_lines.append(
-                f"        print(f'[LayerGroupModule] Layer {{layer_idx}}/{{len(self.layers)}}')"
+                f"        print(f'[LayerGroupModule] Layer {{_local_idx}}/{{len(self.layers)}} (global {{layer_idx}})')"
             )
 
         # Add the original loop body (indented inside the for loop)
