@@ -317,7 +317,9 @@ class DistributedWorker:
             }
 
         # Detach and store output
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         detached_out = detach_tensor(out)
 
         t01 = time.time()

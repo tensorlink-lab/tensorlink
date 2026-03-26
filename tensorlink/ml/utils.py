@@ -22,6 +22,19 @@ from transformers import (
 
 
 MODELS_CACHE_PATH = "logs/models.json"
+DTYPE_STR_MAP = {
+    torch.float32: "float32",
+    torch.float64: "float64",
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.int64: "int64",
+    torch.int32: "int32",
+    torch.int16: "int16",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
+    torch.bool: "bool",
+}
+DTYPE_OBJ_MAP = {v: k for k, v in DTYPE_STR_MAP.items()}
 
 
 def format_memory_size(number: int) -> str:
@@ -266,15 +279,17 @@ def detach_tensor(obj, clone: bool = False):
 def attach_tensor(tensor, device):
     # Case 1: DynamicCache
     if isinstance(tensor, DynamicCache):
-        tensor.key_cache = [
+        new_cache = DynamicCache()
+        new_cache.key_cache = [
             attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
             for t in tensor.key_cache
         ]
-        tensor.value_cache = [
+        new_cache.value_cache = [
             attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
             for t in tensor.value_cache
         ]
-        return tensor
+        new_cache._seen_tokens = tensor._seen_tokens
+        return new_cache
 
     # Case 2: torch.Tensor
     elif isinstance(tensor, torch.Tensor):
@@ -282,12 +297,10 @@ def attach_tensor(tensor, device):
 
     # Case 3: ModelOutput
     elif isinstance(tensor, ModelOutput):
+        new_out = tensor.__class__()
         for key, value in tensor.items():
-            if isinstance(
-                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-            ):
-                tensor[key] = attach_tensor(value, device)
-        return tensor
+            new_out[key] = attach_tensor(value, device)
+        return new_out
 
     # Case 4: list or tuple
     elif isinstance(tensor, (list, tuple)):
@@ -320,6 +333,104 @@ def attach_tensor(tensor, device):
 
     else:
         raise TypeError(f"Unsupported input type: {type(tensor)}")
+
+
+def tensor_to_bytes(obj):
+    """
+    Safe serialization: safetensors for tensors, JSON for structure.
+    No pickle, no arbitrary code execution.
+    """
+    # Flatten the object into a tensor map + structure skeleton
+    tensor_map = {}
+    counter = [0]
+
+    def _extract_tensors(o):
+        """Replace tensors with placeholder keys, collect into tensor_map"""
+        if isinstance(o, torch.Tensor):
+            key = f"__tensor_{counter[0]}__"
+            counter[0] += 1
+            # safetensors requires contiguous float tensors on CPU
+            tensor_map[key] = o.detach().cpu().contiguous().clone()
+            return {
+                "__tensor_ref__": key,
+                "dtype": DTYPE_STR_MAP.get(o.dtype),
+                "shape": list(o.shape),
+            }
+        elif isinstance(o, dict):
+            return {k: _extract_tensors(v) for k, v in o.items()}
+        elif isinstance(o, (list, tuple)):
+            result = [_extract_tensors(v) for v in o]
+            return (
+                {"__tuple__": True, "data": result} if isinstance(o, tuple) else result
+            )
+        elif isinstance(o, (int, float, bool, str, type(None))):
+            return o
+        elif hasattr(o, '__class__') and o.__class__.__name__ == 'DynamicCache':
+            # Serialize DynamicCache as its key/value tensor lists
+            return {
+                "__dynamic_cache__": True,
+                "key_cache": _extract_tensors(o.key_cache),
+                "value_cache": _extract_tensors(o.value_cache),
+                "_seen_tokens": o._seen_tokens,
+            }
+        else:
+            return None  # drop unserializable objects safely
+
+    structure = _extract_tensors(obj)
+    structure_bytes = json.dumps(structure).encode("utf-8")
+
+    # Pack: 4-byte length prefix for structure, then safetensors blob
+    if tensor_map:
+        tensor_bytes = st_save_bytes(tensor_map)
+    else:
+        tensor_bytes = b""
+
+    structure_len = len(structure_bytes).to_bytes(4, "big")
+    return structure_len + structure_bytes + tensor_bytes
+
+
+def bytes_to_tensor(data: bytes):
+    """
+    Safe deserialization matching tensor_to_bytes.
+    """
+    structure_len = int.from_bytes(data[:4], "big")
+    structure_bytes = data[4 : 4 + structure_len]
+    tensor_bytes = data[4 + structure_len :]
+
+    structure = json.loads(structure_bytes.decode("utf-8"))
+
+    # Load tensors from safetensors blob
+    tensor_map = {}
+    if tensor_bytes:
+        tensor_map = st_load_bytes(tensor_bytes)
+
+    def _restore(o):
+        if isinstance(o, dict):
+            if "__tensor_ref__" in o:
+                t = tensor_map[o["__tensor_ref__"]]
+                # Restore original dtype
+                dtype_str = o["dtype"]
+                if dtype_str not in DTYPE_OBJ_MAP:
+                    raise ValueError(
+                        f"Unsupported dtype during deserialization: {dtype_str}"
+                    )
+                return t.to(dtype=DTYPE_OBJ_MAP[dtype_str])
+            elif o.get("__dynamic_cache__"):
+                cache = DynamicCache()
+                cache.key_cache = _restore(o["key_cache"])
+                cache.value_cache = _restore(o["value_cache"])
+                cache._seen_tokens = o["_seen_tokens"]
+                return cache
+            elif o.get("__tuple__"):
+                return tuple(_restore(v) for v in o["data"])
+            else:
+                return {k: _restore(v) for k, v in o.items()}
+        elif isinstance(o, list):
+            return [_restore(v) for v in o]
+        else:
+            return o
+
+    return _restore(structure)
 
 
 def enable_grad(tensor):
@@ -564,100 +675,6 @@ def get_batch_size(inputs):
                 return value.size(0)
     else:
         raise ValueError("Unsupported input type")
-
-
-def tensor_to_bytes(obj):
-    """
-    Safe serialization: safetensors for tensors, JSON for structure.
-    No pickle, no arbitrary code execution.
-    """
-    # Flatten the object into a tensor map + structure skeleton
-    tensor_map = {}
-    counter = [0]
-
-    def _extract_tensors(o):
-        """Replace tensors with placeholder keys, collect into tensor_map"""
-        if isinstance(o, torch.Tensor):
-            key = f"__tensor_{counter[0]}__"
-            counter[0] += 1
-            # safetensors requires contiguous float tensors on CPU
-            tensor_map[key] = o.detach().cpu().contiguous().clone()
-            return {
-                "__tensor_ref__": key,
-                "dtype": str(o.dtype),
-                "shape": list(o.shape),
-            }
-        elif isinstance(o, dict):
-            return {k: _extract_tensors(v) for k, v in o.items()}
-        elif isinstance(o, (list, tuple)):
-            result = [_extract_tensors(v) for v in o]
-            return (
-                {"__tuple__": True, "data": result} if isinstance(o, tuple) else result
-            )
-        elif isinstance(o, (int, float, bool, str, type(None))):
-            return o
-        elif hasattr(o, '__class__') and o.__class__.__name__ == 'DynamicCache':
-            # Serialize DynamicCache as its key/value tensor lists
-            return {
-                "__dynamic_cache__": True,
-                "key_cache": _extract_tensors(o.key_cache),
-                "value_cache": _extract_tensors(o.value_cache),
-                "_seen_tokens": o._seen_tokens,
-            }
-        else:
-            return None  # drop unserializable objects safely
-
-    structure = _extract_tensors(obj)
-    structure_bytes = json.dumps(structure).encode("utf-8")
-
-    # Pack: 4-byte length prefix for structure, then safetensors blob
-    if tensor_map:
-        tensor_bytes = st_save_bytes(tensor_map)
-    else:
-        tensor_bytes = b""
-
-    structure_len = len(structure_bytes).to_bytes(4, "big")
-    return structure_len + structure_bytes + tensor_bytes
-
-
-def bytes_to_tensor(data: bytes):
-    """
-    Safe deserialization matching tensor_to_bytes.
-    """
-    structure_len = int.from_bytes(data[:4], "big")
-    structure_bytes = data[4 : 4 + structure_len]
-    tensor_bytes = data[4 + structure_len :]
-
-    structure = json.loads(structure_bytes.decode("utf-8"))
-
-    # Load tensors from safetensors blob
-    tensor_map = {}
-    if tensor_bytes:
-        tensor_map = st_load_bytes(tensor_bytes)
-
-    def _restore(o):
-        if isinstance(o, dict):
-            if "__tensor_ref__" in o:
-                t = tensor_map[o["__tensor_ref__"]]
-                # Restore original dtype
-                dtype = getattr(torch, o["dtype"].replace("torch.", ""))
-                return t.to(dtype=dtype)
-            elif o.get("__dynamic_cache__"):
-                cache = DynamicCache()
-                cache.key_cache = _restore(o["key_cache"])
-                cache.value_cache = _restore(o["value_cache"])
-                cache._seen_tokens = o["_seen_tokens"]
-                return cache
-            elif o.get("__tuple__"):
-                return tuple(_restore(v) for v in o["data"])
-            else:
-                return {k: _restore(v) for k, v in o.items()}
-        elif isinstance(o, list):
-            return [_restore(v) for v in o]
-        else:
-            return o
-
-    return _restore(structure)
 
 
 def load_models_cache():
