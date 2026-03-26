@@ -983,4 +983,4 @@ def print_output(x, name=None, indent=0, max_elements=5):
 
     # ---- Fallback ----
     else:
-        pass
+        print(f"{prefix}{type(x).__name__}({x})")

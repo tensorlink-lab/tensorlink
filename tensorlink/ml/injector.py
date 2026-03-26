@@ -295,6 +295,7 @@ class LayerGroupModule(torch.nn.Module):
         # Compile and return
         namespace = {'self': self, 'torch': torch}
         exec(forward_source, namespace)
+        print(forward_source)
         return namespace['forward']
 
     def forward(self, **kwargs):
@@ -721,6 +722,7 @@ def generate_new_forward_method(
 
     try:
         exec(new_forward_code, namespace)
+        print(new_forward_code)
         return namespace["forward"]
     except Exception as e:
         print("=" * 80)
