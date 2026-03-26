@@ -602,6 +602,7 @@ def tensor_to_bytes(obj):
                 "__dynamic_cache__": True,
                 "key_cache": _extract_tensors(o.key_cache),
                 "value_cache": _extract_tensors(o.value_cache),
+                "_seen_tokens": o._seen_tokens,
             }
         else:
             return None  # drop unserializable objects safely
@@ -642,11 +643,10 @@ def bytes_to_tensor(data: bytes):
                 dtype = getattr(torch, o["dtype"].replace("torch.", ""))
                 return t.to(dtype=dtype)
             elif o.get("__dynamic_cache__"):
-                from transformers import DynamicCache
-
                 cache = DynamicCache()
                 cache.key_cache = _restore(o["key_cache"])
                 cache.value_cache = _restore(o["value_cache"])
+                cache._seen_tokens = o["_seen_tokens"]
                 return cache
             elif o.get("__tuple__"):
                 return tuple(_restore(v) for v in o["data"])
