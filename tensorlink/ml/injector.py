@@ -577,9 +577,7 @@ def _generate_worker_calls(
         arg_parts = []
         for var in all_inputs:
             arg_parts.append(f"{indent}    {var}={var}")
-        for kw_arg, kw_value in layer_call_info.get('kwargs', {}).items():
-            if kw_arg not in all_inputs:
-                arg_parts.append(f"{indent}    {kw_arg}={kw_value}")
+
         if layer_call_info.get('has_var_kwargs') and var_kwarg_name:
             # Only spread **var_kwarg if it isn't already passed as a named arg.
             # Passing both causes a duplicate keyword argument TypeError.

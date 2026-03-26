@@ -981,13 +981,6 @@ def print_output(x, name=None, indent=0, max_elements=5):
                     print(f"{p}  {attr}: list[{len(val)}]")
                     print_output(val[0], name=f"{attr}[0]", indent=indent + 4)
 
-    # ---- Simple types ----
-    elif isinstance(x, (int, float, bool)):
-        print(f"{prefix}{type(x).__name__}({x})")
-
-    elif x is None:
-        print(f"{prefix}None")
-
     # ---- Fallback ----
     else:
-        print(f"{prefix}{type(x).__name__}")
+        pass
