@@ -1549,6 +1549,9 @@ class OffloadedModule(nn.Module):
                 [handle_output(args), self.module_id]
             )
 
+        print_output(args, f"Model: {self.module_name}, Args: ")
+        print_output(kwargs, f"Model: {self.module_name}, Kwargs: ")
+
         t01 = time.time()
         args = handle_output(args)
         t02 = time.time()
@@ -1561,6 +1564,7 @@ class OffloadedModule(nn.Module):
         forward_bytes = len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
         size, shm_name = store_in_shared_memory(forward_bytes, encoded=True)
         t06 = time.time()
+
         # Relay forward pass to next roles
         self.parent_model.send_request(
             "send_forward", (self.worker_id, self.module_id, size, shm_name, tag)
@@ -1581,19 +1585,22 @@ class OffloadedModule(nn.Module):
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
                 waiting = False
+
         print(f"Model: {self.module_name},Handle Output Time: {t02 - t01}")
         print(f"Model: {self.module_name},Detach Time: {t03 - t02}")
         print(f"Model: {self.module_name},Args to Bytes Time: {t04 - t03}")
         print(f"Model: {self.module_name},Kwargs to Bytes Time: {t05 - t04}")
         print(f"Model: {self.module_name},Store in Shared Memory Time: {t06 - t05}")
+
         t1 = time.time()
         output = bytes_to_tensor(output_bytes)
-        print_output(output, self.module_name)
+
         print(f"Bytes to Tensor Time: {time.time() - t1}")
+
         t1 = time.time()
         output = attach_tensor(output, self.parent_model.device)
-        print_output(output, self.module_name)
         print(f"Attach Tensor Time: {time.time() - t1}")
+        print_output(output, f"Model: {self.module_name}, Output: ")
 
         if self.training:
             output = enable_grad(output)

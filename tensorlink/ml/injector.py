@@ -261,23 +261,12 @@ class LayerGroupModule(torch.nn.Module):
             "    # the host generated forward can find it regardless of naming."
         )
         func_lines.append("    _output = {}")
-        func_lines.append(
-            "    _output.update(kwargs)  # preserve all pass-through keys"
-        )
 
         # Return every variable we know about under its name AND its alias
-        all_vars = sorted(set(self.input_vars) | set(self.output_vars))
+        all_vars = sorted(set(self.output_vars))
         for var in all_vars:
             func_lines.append(f"    try:")
             func_lines.append(f"        _output['{var}'] = {var}")
-            # Also write under the plural/singular alias so the host always finds it
-            func_lines.append(
-                f"        _alias_{var}_out = '{var}' + 's' if not '{var}'.endswith('s') else '{var}'[:-1]"
-            )
-            func_lines.append(
-                f"        if _alias_{var}_out not in _output or _output[_alias_{var}_out] is None:"
-            )
-            func_lines.append(f"            _output[_alias_{var}_out] = {var}")
             func_lines.append(f"    except NameError:")
             func_lines.append(f"        pass  # var was never assigned, skip")
 
@@ -295,7 +284,6 @@ class LayerGroupModule(torch.nn.Module):
         # Compile and return
         namespace = {'self': self, 'torch': torch}
         exec(forward_source, namespace)
-        print(forward_source)
         return namespace['forward']
 
     def forward(self, **kwargs):
@@ -303,7 +291,10 @@ class LayerGroupModule(torch.nn.Module):
         Execute the generated forward function.
         This gets replaced by _generate_forward_from_loop.
         """
-        return self.forward_func(self, **kwargs)
+        outputs = self.forward_func(self, **kwargs)
+        if isinstance(outputs, dict):
+            return {k: v for k, v in outputs.items() if k in self.output_vars}
+        return outputs
 
 
 def _determine_loop_variables(
@@ -587,63 +578,17 @@ def _generate_worker_calls(
 
         if arg_parts:
             call_str += "\n" + ",\n".join(arg_parts) + f"\n{indent}"
+
         call_str += ")"
         calls.append(call_str)
 
         # Unpack explicitly computed output vars first (also try alias)
         for var in all_outputs:
-            alias = var + 's' if not var.endswith('s') else var[:-1]
             calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
             calls.append(
                 f"{indent}    _val_{var}_out = _worker_output_{idx}.get('{var}')"
             )
-            calls.append(f"{indent}    if _val_{var}_out is None:")
-            calls.append(
-                f"{indent}        _val_{var}_out = _worker_output_{idx}.get('{alias}')"
-            )
-            calls.append(f"{indent}    if _val_{var}_out is not None:")
-            calls.append(f"{indent}        {var} = _val_{var}_out")
-
-        # Update any input variable from the worker output dict.
-        # Handles in-place mutations (e.g. DynamicCache) AND the common HF
-        # aliasing pattern (past_key_values / past_key_value ±'s').
-        # We look up both the exact name and its plural/singular variant so
-        # the host variable is always refreshed regardless of naming convention.
-        calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
-        for var in all_inputs:
-            calls.append(f"{indent}    _val_{var} = _worker_output_{idx}.get('{var}')")
-            # also try ±'s alias
-            alias = var + 's' if not var.endswith('s') else var[:-1]
-            calls.append(f"{indent}    if _val_{var} is None:")
-            calls.append(
-                f"{indent}        _val_{var} = _worker_output_{idx}.get('{alias}')"
-            )
-            calls.append(f"{indent}    if _val_{var} is not None:")
-            # If the value came back as a serialized DynamicCache (tuple of 2-tuples
-            # of 4-D tensors), rebuild it. The inner-element check is intentionally
-            # strict so we don't corrupt position_embeddings or other tuple values:
-            # each element must be a length-2 sequence of tensors with ndim==4.
-            calls.append(
-                f"{indent}        if (isinstance(_val_{var}, (list, tuple)) and len(_val_{var}) > 0"
-                f" and isinstance(_val_{var}[0], (list, tuple)) and len(_val_{var}[0]) == 2"
-                f" and hasattr(_val_{var}[0][0], 'ndim') and _val_{var}[0][0].ndim == 4):"
-            )
-            calls.append(f"{indent}            try:")
-            calls.append(
-                f"{indent}                from transformers.cache_utils import DynamicCache as _DC"
-            )
-            calls.append(f"{indent}                _rebuilt = _DC()")
-            calls.append(f"{indent}                for _lk, _lv in _val_{var}:")
-            calls.append(f"{indent}                    _rebuilt.key_cache.append(_lk)")
-            calls.append(
-                f"{indent}                    _rebuilt.value_cache.append(_lv)"
-            )
-            calls.append(f"{indent}                _val_{var} = _rebuilt")
-            calls.append(f"{indent}            except Exception:")
-            calls.append(
-                f"{indent}                pass  # leave as tuple if rebuild fails"
-            )
-            calls.append(f"{indent}        {var} = _val_{var}")
+            calls.append(f"{indent}    {var} = _val_{var}_out")
 
         calls.append(f"{indent}")
 
@@ -722,7 +667,6 @@ def generate_new_forward_method(
 
     try:
         exec(new_forward_code, namespace)
-        print(new_forward_code)
         return namespace["forward"]
     except Exception as e:
         print("=" * 80)

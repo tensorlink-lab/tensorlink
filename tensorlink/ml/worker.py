@@ -18,7 +18,6 @@ from transformers import (
     AutoModelForVision2Seq,
     AutoModelForSeq2SeqLM,
     AutoModelForSpeechSeq2Seq,
-    Cache,
 )
 from transformers.generation.streamers import BaseStreamer
 from safetensors import safe_open
@@ -34,7 +33,6 @@ from tensorlink.ml.utils import (
     get_nested_module,
     get_optimizer_from_spec,
     load_model_skeleton,
-    print_output,
 )
 from tensorlink.ml.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
@@ -96,29 +94,6 @@ def _create_layer_group_wrapper(
         loop_body_source=loop_body_source,
         loop_iterator_name=loop_iterator_name,
     )
-
-
-def normalize_past_key_values(pkv):
-    """
-    Ensures past_key_values has shape:
-    Tuple[Tuple[Tensor, Tensor], ...]
-    """
-    if pkv is None:
-        return None
-
-    if isinstance(pkv, Cache):
-        return pkv
-
-    # unwrap accidental singleton nesting
-    while (
-        isinstance(pkv, (list, tuple))
-        and len(pkv) == 1
-        and isinstance(pkv[0], (list, tuple))
-    ):
-        pkv = pkv[0]
-
-    # enforce tuple-of-tuples
-    return tuple(tuple(layer) for layer in pkv)
 
 
 class TensorlinkWorkerStreamer(BaseStreamer):
@@ -311,14 +286,9 @@ class DistributedWorker:
 
         # Move tensors to device
         print(f"Model: {type(module)}, Bytes to Tensor Time: {t02 - t01}")
-        print_output(args, "PREATTACH ARGS")
-        print_output(kwargs, "PREATTACH KWARGS")
 
         inp = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
-
-        print_output(args, "ARGS")
-        print_output(kwargs, "KWARGS")
 
         if module.training:
             inp = enable_grad(inp)
@@ -326,11 +296,6 @@ class DistributedWorker:
 
         if not isinstance(inp, (list, tuple)):
             inp = (inp,)
-
-        if "past_key_values" in kwargs:
-            kwargs["past_key_values"] = normalize_past_key_values(
-                kwargs.get("past_key_values")
-            )
 
         # Forward pass
         if self.use_amp and module.training:
@@ -352,11 +317,13 @@ class DistributedWorker:
             }
 
         # Detach and store output
+        torch.cuda.synchronize()
         detached_out = detach_tensor(out)
+
         t01 = time.time()
         output_bytes = tensor_to_bytes(detached_out)
         t02 = time.time()
-        print(f"Model: {type(module)},\nBytes to Tensor Time: {t02 - t01}")
+        print(f"Model: {type(module)},\nTensor to Bytes Time: {t02 - t01}")
         size, name = store_in_shared_memory(output_bytes)
 
         self.send_request("send_forward", (module.host, module_id, size, name, key))
