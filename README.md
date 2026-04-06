@@ -28,28 +28,44 @@
 ## What is Tensorlink?
 
 Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across 
-peer-to-peer networks. It lets you run, train, and serve large models securely on distributed hardware without relying 
-on centralized cloud inference providers.
+peer-to-peer networks. It enables you to easily distribute and remotely access models across devices, whether pooling 
+your own hardware or tapping into public peer-to-peer resources.
 
-With Tensorlink, models can be automatically sharded across multiple GPUs, enabling execution beyond local VRAM limits. 
-You can host models on your own devices, expose them through a REST API, stream tokens in real time, and optionally 
-route requests only to your own hardware for private usage. Tensorlink supports both distributed training with 
-optimizers and low-latency inference across the network.
+Tensorlink serves diverse computational scenarios across development and deployment. Whether you want to run LLMs 
+exceeding local memory, deploy and access private inference infrastructure, build agentic workflows with 
+our on-demand compute platform and API, or conduct distributed training. Hardware owners may also use 
+their GPUs as private API endpoints, or contribute resources to the public network and earn rewards.
 
 ### Key Features
 
-- **Native PyTorch & REST API Access** — Use models directly in Python or via HTTP endpoints.
 - **Run Large Models** — Automatic offloading and model sharding across peers.
-- **Plug-and-Play Distributed Execution** — No manual cluster setup required.
-- **Streaming Generation** — Token-by-token responses for real-time apps.
-- **Privacy Controls** — Route traffic exclusively to your own machines, or leverage hybrid models privacy enhanced model workflows.
+- **Native PyTorch & REST API Access** — Use models directly in Python or via HTTP endpoints.
+- **Plug-and-Play Distributed Execution** – Automatic model sharding across multiple GPUs.  
+- **Streaming Generation** – Token-by-token streaming for real-time responses   
+- **Privacy Controls** – Route queries exclusively to your own hardware for private usage  
+- **Earn Rewards for Idle Compute** – Contribute GPU resources to the network and get compensated  
 
 > **Early Access:** Tensorlink is under active development. APIs and internals may evolve.  
 > [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
+> Learn more in the [**Litepaper**](docs/LITEPAPER.md)
 
 ## Quick Start
 
-### Option 1: Distributed Models in Python
+There are multiple ways to interact with Tensorlink. Choose the path that best fits your use case:
+
+- **[Distributed Models in Python](#distributed-models-in-python)**  
+  Run PyTorch and Hugging Face models across the network directly from Python.
+
+- **[Model APIs](#accessing-models-via-http)**  
+  Use OpenAI-style REST endpoints for distributed inference.
+
+- **[Run a Node](#run-a-node)**  
+  Host models, shard workloads across GPUs, and expose them via Python and HTTP APIs.
+
+Each option below is intentionally minimal. For a complete breakdown, 
+see the [documentation](https://smartnodes.ca/tensorlink/docs).
+
+### Distributed Models in Python
 
 #### Installation
 
@@ -60,7 +76,8 @@ pip install tensorlink
 
 #### Basic Usage
 
-Execute Hugging Face models distributed across the network.
+Execute Hugging Face models distributed automatically across the public network (to learn how to leverage your
+own hardware, see here).
 
 ```python
 from tensorlink.ml import DistributedModel
@@ -71,14 +88,13 @@ MODEL_NAME = "Qwen/Qwen3-8B"
 model = DistributedModel(
     model=MODEL_NAME,
     training=True,
-    device="cuda"
 )
 optimizer = model.create_optimizer(lr=0.001)
 ```
 > See [Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples) for streaming generation, distributed training, custom models, 
 > and network configurations.
 
-### Option 2: Accessing Models via HTTP
+### Accessing Models via HTTP
 
 Access models via HTTP on the public network, or configure your own hardware for private API access. 
 Tensorlink exposes OpenAI-style endpoints for distributed inference:
@@ -100,7 +116,7 @@ print(response.json())
 >Access the public network or configure your own hardware for private API access. See [Examples](https://github.com/mattjhawken/tensorlink/blob/main/docs/examples) for 
 >streaming, chat completions, and API reference.
 
-### Option 3: Run a Node
+### Run a Node
 
 Run Tensorlink nodes to host models, shard workloads across GPUs, and expose them via Python and HTTP APIs.
 Nodes can act as workers (run models), validators (route requests + expose API), or both. This allows you to 
