@@ -56,10 +56,12 @@ jobs:
     # Build tensorlink-node binary
     - name: Build tensorlink node artifact
       run: |
-        chmod +x tensorlink/bin/run-node.sh
         VERSION=${GITHUB_REF_NAME#v}
-        mkdir -p release
-        tar -czf release/tensorlink-node-v${VERSION}.tar.gz tensorlink/bin
+        mkdir -p release/tensorlink-node
+        cp -r bin release/tensorlink-node/
+        cp README.md release/tensorlink-node/ || true
+        tar -czf release/tensorlink-node-v${VERSION}.tar.gz -C release tensorlink-node
+        ls -lh release
 
     # Create GitHub Release
     - name: Create GitHub Release
