@@ -137,8 +137,8 @@ def test_generate_basic(model_env):
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
     print(f"✅ Basic generate test passed")
-    print(f"   Generated: {message["content"][:50]}...")
-    print(f"   Tokens: {result["usage"]["total_tokens"]}")
+    print(f"   Generated: {message['content'][:50]}...")
+    print(f"   Tokens: {result['usage']['total_tokens']}")
 
 
 def test_generate_stream(model_env):
@@ -208,7 +208,7 @@ def test_generate_stream(model_env):
 
     print(f"✅ Streaming generate test passed")
     print(f"   Generated: {full_text[:50]}...")
-    print(f"   Tokens: {chunk["usage"]["total_tokens"]}")
+    print(f"   Tokens: {chunk['usage']['total_tokens']}")
 
 
 def test_chat_completions(model_env):
@@ -272,5 +272,5 @@ def test_chat_completions(model_env):
     )
 
     print(f"✅ Chat completions test passed")
-    print(f"   Generated: {result["choices"][0]["message"]["content"][:50]}...")
-    print(f"   Tokens: {result["usage"]["total_tokens"]}")
+    print(f"   Generated: {result['choices'][0]['message']['content'][:50]}...")
+    print(f"   Tokens: {result['usage']['total_tokens']}")
