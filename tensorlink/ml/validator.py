@@ -6,8 +6,9 @@ from tensorlink.ml.formatter import (
     normalize_generate_args,
     format_chat_prompt,
     extract_reasoning_and_answer,
+    post_process_output_ids,
 )
-from tensorlink.ml.utils import (
+from tensorlink.ml.utils.utils import (
     load_models_cache,
     save_models_cache,
     get_gpu_memory,
@@ -91,6 +92,7 @@ def _supports_reasoning(tokenizer):
 
         # Check if 'enable_thinking' is a parameter
         return 'enable_thinking' in sig.parameters
+
     except Exception:
         return False
 
@@ -545,7 +547,14 @@ class DistributedValidator(DistributedWorker):
                         self._handle_generate_request(generate_request, job_id)
 
         except Exception as e:
-            logging.error(f"Error checking for jobs: {str(e)}")
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> Error checking for jobs: {str(e)}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
 
         self.CHECK_COUNTER += 1
 
@@ -580,10 +589,9 @@ class DistributedValidator(DistributedWorker):
         distributed_model = self.models[job_id]
         tokenizer = self.tokenizers[request.hf_name]
 
-        # FORMAT PROMPT
+        # Format Prompt
         if request.input_format == "chat":
             formatted_prompt, reasoning_supported = format_chat_prompt(
-                request.hf_name,
                 request.message,
                 request.history,
                 enable_thinking=request.reasoning,
@@ -603,7 +611,7 @@ class DistributedValidator(DistributedWorker):
             formatted_prompt = request.message
             request._reasoning_supported = False
 
-        # TOKENIZE
+        # Tokenize
         model_max_length = getattr(tokenizer, "model_max_length", 2048)
         if model_max_length > 100000:
             model_max_length = 2048
@@ -621,7 +629,7 @@ class DistributedValidator(DistributedWorker):
         input_ids = inputs.input_ids.to(self.device)
         prompt_tokens = input_ids.shape[1]
 
-        # NORMALIZE ARGS
+        # Normalize args
         args = normalize_generate_args(
             request,
             tokenizer,
@@ -655,18 +663,18 @@ class DistributedValidator(DistributedWorker):
             self.send_request("update_api_request", (request,))
             return
 
-        start_time = getattr(request, 'start_time', time.time())
+        request.start_time = getattr(request, "start_time", time.time())
 
         if hasattr(request, "stream") and request.stream:
             # Streaming generation
             self._generate_streaming(request, job_id)
         else:
             # Generate
-            self._generate(request, job_id, start_time)
+            self._generate(request, job_id)
 
         self.send_request("update_api_request", (request,))
 
-    def _generate(self, request, job_id, start_time):
+    def _generate(self, request, job_id):
         """
         Fetches tokenizer, ensures generate arguments are not problematic with
         normalize_generate_args, and calls DistributedModel.generate.
@@ -681,6 +689,14 @@ class DistributedValidator(DistributedWorker):
                 status_code=400,
                 request_id=str(request.id),
             )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> {request.output}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
             return
 
         distributed_model = ctx["distributed_model"]
@@ -690,36 +706,47 @@ class DistributedValidator(DistributedWorker):
         prompt_tokens = ctx["prompt_tokens"]
         args = ctx["args"]
 
-        with torch.no_grad():
-            try:
+        try:
+            with torch.no_grad():
                 outputs = distributed_model.generate(input_ids, **args)
-            except RuntimeError as e:
-                error_msg = f"Generation failed: {str(e)}"
-                request.output = error_msg
-                request.formatted_response = ResponseFormatter.format_error_response(
-                    error_message=error_msg,
-                    error_type="generation_error",
-                    status_code=500,
-                    request_id=str(request.id),
+
+            new_token_ids = outputs[0][prompt_tokens:].tolist()
+            reasoning_text, text = post_process_output_ids(
+                new_token_ids, tokenizer, enable_thinking=ctx["reasoning_supported"]
+            )
+
+            request.output = text
+            completion_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+
+            request.formatted_response = (
+                ResponseFormatter.format_non_streaming_response(
+                    request=request,
+                    output_text=text,
+                    reasoning_text=reasoning_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    start_time=request.start_time,
                 )
-                return
+            )
 
-        generated_text = tokenizer.decode(outputs[0])
-        reasoning_text, text = _post_process_output(
-            request, tokenizer, formatted_prompt, generated_text
-        )
-
-        request.output = text
-        completion_tokens = len(tokenizer.encode(text, add_special_tokens=False))
-
-        request.formatted_response = ResponseFormatter.format_non_streaming_response(
-            request=request,
-            output_text=text,
-            reasoning_text=reasoning_text,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            start_time=start_time,
-        )
+        except RuntimeError as e:
+            error_msg = f"Generation failed: {str(e)}"
+            request.output = error_msg
+            request.formatted_response = ResponseFormatter.format_error_response(
+                error_message=error_msg,
+                error_type="generation_error",
+                status_code=500,
+                request_id=str(request.id),
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> {error_msg}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+            return
 
     def _generate_streaming(self, request: GenerationRequest, job_id: str):
         """
@@ -737,13 +764,13 @@ class DistributedValidator(DistributedWorker):
             prompt_tokens = ctx["prompt_tokens"]
             args = ctx["args"]
 
-            # ---- Build kwargs ----
+            # Build kwargs
             generation_kwargs = {
                 "input_ids": input_ids,
                 **args,
             }
 
-            # ---- Setup streamer + thread ----
+            # Setup streamer + thread
             if isinstance(distributed_model.model, OffloadedModule):
                 generation_kwargs["stream"] = True
 
@@ -773,12 +800,13 @@ class DistributedValidator(DistributedWorker):
                 )
                 generation_thread.start()
 
-            # ---- Stream tokens ----
+            # Stream tokens
             full_text = ""
             token_count = 0
             in_reasoning_block = False
             reasoning_buffer = ""
 
+            # Try and identify think sections via regex
             start_re = re.compile(
                 r"<\s*(think|reflection|thought|internal|analysis)\s*>",
                 re.IGNORECASE,
@@ -795,14 +823,12 @@ class DistributedValidator(DistributedWorker):
 
                     if not in_reasoning_block:
                         if start_re.search(token_text):
-                            print(f"ENTERING REASONING: {token_text}")
                             in_reasoning_block = True
                             reasoning_buffer = token_text
                             continue
                     else:
                         reasoning_buffer += token_text
                         if end_re.search(reasoning_buffer):
-                            print(f"EXITING REASONING: {token_text}")
                             in_reasoning_block = False
                             reasoning_buffer = ""
                         continue
@@ -822,19 +848,27 @@ class DistributedValidator(DistributedWorker):
                         (request.id, {"chunk": formatted_chunk, "done": False}),
                     )
 
-            # ---- Finalize ----
+            if generation_thread.is_alive():
+                generation_thread.join(timeout=1)
+                if generation_thread.is_alive():
+                    self.send_request(
+                        "debug_print",
+                        (
+                            "Generation thread did not finish within timeout",
+                            "yellow",
+                            logging.WARNING,
+                        ),
+                    )
+
+            # Finalize output
             reasoning_text = None
             cleaned_text = full_text
-            print(f"FINAL_TEXT: {cleaned_text}")
             if request.input_format == "chat":
                 reasoning_text, cleaned_text = extract_reasoning_and_answer(full_text)
-                print(f"REASON_TEXT: {cleaned_text}")
-                print(f"FINAL_TEXT: {cleaned_text}")
                 if not request.reasoning:
                     reasoning_text = None
 
             request.output = cleaned_text
-
             final_chunk = ResponseFormatter.format_stream_final(
                 request=request,
                 start_time=start_time,

@@ -1,7 +1,6 @@
-import json
-
-from tensorlink.ml.utils import estimate_memory, load_model_skeleton
+from tensorlink.ml.utils.utils import estimate_memory
 from tensorlink.ml.injector import find_loop_in_module_hierarchy
+from tensorlink.ml.utils.loading import load_model_skeleton
 from collections import defaultdict
 from typing import Union, Optional, Dict, List, Any
 import torch.nn as nn

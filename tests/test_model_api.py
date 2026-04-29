@@ -23,12 +23,12 @@ SERVER_URL = "http://127.0.0.1:64747"
 MODELS = [
     # pytest.param(
     #     {
-    #         "name": "Qwen/Qwen2.5-1.5B-Instruct",
+    #         "name": "Qwen/Qwen3-0.6B-MLX-8bit",
     #         "timeout": 600,
-    #         "sleep": 20,
+    #         "sleep": 15,
     #         "parsed": False,
     #     },
-    #     id="Qwen2.5-0.5B",
+    #     id="Qwen3-0.6B",
     # ),
     pytest.param(
         {
@@ -75,66 +75,7 @@ def model_env(request, connected_wwv_nodes):
     yield cfg, (worker, worker2, validator)
 
 
-def test_generate_simple(model_env):
-    """
-    Test generate request with simple format (default).
-    Validates structured response with metadata and usage stats.
-    """
-    cfg, (worker, worker2, validator) = model_env
-    time.sleep(1)
-
-    generate_payload = {
-        "hf_name": cfg["name"],
-        "message": "Hi.",
-        "max_new_tokens": 10,
-        "num_beams": 2,
-        "output_format": "simple",  # Explicitly set to simple
-    }
-
-    response = requests.post(
-        f"{SERVER_URL}/v1/generate",
-        json=generate_payload,
-        timeout=1000,
-    )
-
-    assert response.status_code == 200
-
-    result = response.json()
-
-    # Validate simple format structure
-    assert "id" in result, "Response missing 'id'"
-    assert "model" in result, "Response missing 'model'"
-    assert "text" in result, "Response missing 'text'"
-    assert "usage" in result, "Response missing 'usage'"
-    assert "processing_time" in result, "Response missing 'processing_time'"
-    assert "finish_reason" in result, "Response missing 'finish_reason'"
-
-    # Validate model matches request
-    assert result["model"] == cfg["name"]
-
-    # Validate usage statistics
-    usage = result["usage"]
-    assert "prompt_tokens" in usage
-    assert "completion_tokens" in usage
-    assert "total_tokens" in usage
-
-    # Validate text output
-    assert isinstance(result["text"], str)
-
-    # Validate processing time
-    assert isinstance(result["processing_time"], (int, float))
-    assert result["processing_time"] >= 0
-
-    # Validate finish reason
-    assert result["finish_reason"] == "stop"
-
-    print(f"✅ Simple format test passed")
-    print(f"   Generated: {result['text'][:50]}...")
-    print(f"   Usage: {usage}")
-    print(f"   Processing time: {result['processing_time']:.2f}s")
-
-
-def test_generate_openai(model_env):
+def test_generate_basic(model_env):
     """
     Test generate request with simple format (default).
     Validates structured response with metadata and usage stats.
@@ -195,12 +136,12 @@ def test_generate_openai(model_env):
     assert "total_tokens" in usage
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
-    print(f"✅ OpenAI format test passed")
-    print(f"   Generated: {message['content'][:50]}...")
-    print(f"   Usage: {usage}")
+    print(f"✅ Basic generate test passed")
+    print(f"   Generated: {message["content"][:50]}...")
+    print(f"   Tokens: {result["usage"]["total_tokens"]}")
 
 
-def test_streaming_generation_openai(model_env):
+def test_generate_stream(model_env):
     """
     Test generate request with token-by-token streaming via API
     """
@@ -225,6 +166,7 @@ def test_streaming_generation_openai(model_env):
 
     assert response.status_code == 200
 
+    chunk = None
     full_text = ""
     received_chunks = 0
     received_content_fields = 0
@@ -264,133 +206,71 @@ def test_streaming_generation_openai(model_env):
     if full_text.strip() != "":
         assert received_content_fields > 0
 
+    print(f"✅ Streaming generate test passed")
+    print(f"   Generated: {full_text[:50]}...")
+    print(f"   Tokens: {chunk["usage"]["total_tokens"]}")
 
-def test_streaming_generation_simple(model_env):
+
+def test_chat_completions(model_env):
     """
-    Test generate request with token-by-token streaming via API (simple format)
+    Test OpenAI-style chat completions endpoint (non-streaming)
     """
     cfg, (worker, worker2, validator) = model_env
     time.sleep(1)
 
-    generate_payload = {
-        "hf_name": cfg["name"],
-        "message": "Hi there, how are you?",
-        "max_new_tokens": 40,
-        "stream": True,
-        "num_beams": 1,
-        "output_format": "simple",
+    chat_payload = {
+        "model": cfg["name"],
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Say 'Hello world' and nothing else."},
+        ],
+        "max_tokens": 20,
+        "temperature": 0.1,
+        "stream": False,
     }
 
     response = requests.post(
-        f"{SERVER_URL}/v1/generate",
-        json=generate_payload,
-        stream=True,
-        timeout=1200,
+        f"{SERVER_URL}/v1/chat/completions",
+        json=chat_payload,
+        timeout=120,
     )
 
     assert response.status_code == 200
 
-    full_text = ""
-    received_chunks = 0
-    received_token_fields = 0
-    done_received = False
+    result = response.json()
 
-    for line in response.iter_lines():
-        if not line:
-            continue
+    # Validate OpenAI response format
+    assert "id" in result
+    assert "object" in result
+    assert result["object"] == "chat.completion"
+    assert "created" in result
+    assert "model" in result
+    assert result["model"] == cfg["name"]
+    assert "choices" in result
+    assert len(result["choices"]) > 0
 
-        decoded = line.decode("utf-8")
-        if not decoded.startswith("data: "):
-            continue
+    # Check the first choice
+    choice = result["choices"][0]
+    assert "index" in choice
+    assert choice["index"] == 0
+    assert "message" in choice
+    assert "role" in choice["message"]
+    assert choice["message"]["role"] == "assistant"
+    assert "content" in choice["message"]
+    assert (
+        result["usage"]["completion_tokens"] == 0
+        or choice["message"]["content"].strip() != ""
+    )
 
-        data = decoded[6:]
+    # Check usage stats
+    assert "usage" in result
+    assert "prompt_tokens" in result["usage"]
+    assert "completion_tokens" in result["usage"]
+    assert "total_tokens" in result["usage"]
+    assert result["usage"]["total_tokens"] == (
+        result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]
+    )
 
-        if data == "[DONE]":
-            done_received = True
-            break
-
-        try:
-            chunk = json.loads(data)
-
-            received_chunks += 1
-
-            if chunk.get("done") is True:
-                full_text = chunk.get("full_text", full_text)
-                done_received = True
-                break
-            else:
-                if "token" in chunk:
-                    received_token_fields += 1
-                    token = chunk.get("token") or ""
-                    full_text += token
-                    print(f"TOKEN: {token}")
-
-        except json.JSONDecodeError:
-            print(f"Failed to parse JSON: {data}")
-            raise
-
-    assert done_received, "Never received done=true or [DONE] marker"
-
-    print(f"Received {received_chunks} tokens")
-    print(f"Full text: {full_text}")
-
-
-# def test_chat_completions(model_env):
-#     """
-#     Test OpenAI-compatible chat completions endpoint (non-streaming)
-#     """
-#     cfg, (worker, worker2, validator) = model_env
-#     time.sleep(1)
-#
-#     chat_payload = {
-#         "model": cfg["name"],
-#         "messages": [
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": "Say 'Hello world' and nothing else."},
-#         ],
-#         "max_tokens": 20,
-#         "temperature": 0.1,
-#         "stream": False,
-#     }
-#
-#     response = requests.post(
-#         f"{SERVER_URL}/v1/chat/completions",
-#         json=chat_payload,
-#         timeout=120,
-#     )
-#
-#     assert response.status_code == 200
-#
-#     result = response.json()
-#
-#     # Validate OpenAI response format
-#     assert "id" in result
-#     assert "object" in result
-#     assert result["object"] == "chat.completion"
-#     assert "created" in result
-#     assert "model" in result
-#     assert result["model"] == cfg["name"]
-#     assert "choices" in result
-#     assert len(result["choices"]) > 0
-#
-#     # Check the first choice
-#     choice = result["choices"][0]
-#     assert "index" in choice
-#     assert choice["index"] == 0
-#     assert "message" in choice
-#     assert "role" in choice["message"]
-#     assert choice["message"]["role"] == "assistant"
-#     assert "content" in choice["message"]
-#     assert (
-#         result["usage"]["completion_tokens"] == 0
-#         or choice["message"]["content"].strip() != ""
-#     )
-#
-#     # Check usage stats
-#     assert "usage" in result
-#     assert "prompt_tokens" in result["usage"]
-#     assert "completion_tokens" in result["usage"]
-#     assert "total_tokens" in result["usage"]
-#     assert result["usage"]["total_tokens"] == (
-#         result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]
-#     )
+    print(f"✅ Chat completions test passed")
+    print(f"   Generated: {result["choices"][0]["message"]["content"][:50]}...")
+    print(f"   Tokens: {result["usage"]["total_tokens"]}")

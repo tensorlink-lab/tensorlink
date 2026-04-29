@@ -3,8 +3,6 @@ import time
 
 import torch
 
-from tensorlink.ml.utils import access_module
-
 
 class DistributedParameter(torch.nn.Parameter):
     """

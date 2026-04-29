@@ -1,4 +1,4 @@
-from tensorlink.ml.utils import get_gpu_memory
+from tensorlink.ml.utils.utils import get_gpu_memory
 from tensorlink.nodes.shared_memory import get_from_shared_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.smart_node import Smartnode
@@ -250,53 +250,63 @@ class Torchnode(Smartnode):
 
     def _handle_forward(self, data: bytes, node: Connection):
         """Handle a received forward pass from a node"""
-        # Basic check, must be upgraded to check if we are expecting the request
-        if node.node_id not in self.nodes:
-            node.ghosts += 1
-            return False
+        try:
+            # Basic check, must be upgraded to check if we are expecting the request
+            if node.node_id not in self.nodes:
+                node.ghosts += 1
+                return False
 
-        # Received a forward pass
-        eos = data.find(b"::")
-        size = int(data[7:eos])
-        formatted_size = format_size(size)
-        self.debug_print(
-            f"RECEIVED FORWARD: {formatted_size}", tag="Torchnode", level=self.VERBOSE
-        )
+            # Received a forward pass
+            eos = data.find(b"::")
+            size = int(data[7:eos])
+            formatted_size = format_size(size)
+            self.debug_print(
+                f"RECEIVED FORWARD: {formatted_size}",
+                tag="Torchnode",
+                level=self.VERBOSE,
+            )
 
-        # TODO we must check that the forward received corresponds to a sent pass/specific module
-        # must also do with backwards
-        tensor = data[eos + 2 : eos + 2 + size]
-        payload = json.loads(data[eos + 2 + size :])
+            # TODO we must check that the forward received corresponds to a sent pass/specific module
+            # must also do with backwards
+            tensor = data[eos + 2 : eos + 2 + size]
+            payload = json.loads(data[eos + 2 + size :])
 
-        if isinstance(payload, dict):
-            module_id = payload.get("module_id")
-            key = payload.get("key")
-        else:
-            module_id = None
-            key = payload
+            if isinstance(payload, dict):
+                module_id = payload.get("module_id")
+                key = payload.get("key")
+            else:
+                module_id = None
+                key = payload
 
-        if not isinstance(key, str):
-            key = tuple(key)
-            # Create shared mpc block and store tensor
-            self._store_tensor_in_shared_memory(key, tensor)
+            if not isinstance(key, str):
+                key = tuple(key)
+                # Create shared mpc block and store tensor
+                self._store_tensor_in_shared_memory(key, tensor)
+                return True
+
+            if module_id not in self.modules:
+                self.debug_print(
+                    f"Unknown module_id in forward: {module_id}", tag="Torchnode"
+                )
+                return False
+
+            shm = shared_memory.SharedMemory(create=True, size=size)
+            buffer = shm.buf[:size]
+            buffer[:] = tensor
+
+            self.modules[module_id]["forward_queue"][key] = (size, shm.name)
+            self.memory_manager[key] = shm.name
+
+            del buffer
+            shm.close()
             return True
 
-        if module_id not in self.modules:
+        except Exception as e:
             self.debug_print(
-                f"Unknown module_id in forward: {module_id}", tag="Torchnode"
+                f"Error handling received forward data: {e}",
+                tag="Torchnode",
+                level=logging.ERROR,
             )
-            return False
-
-        shm = shared_memory.SharedMemory(create=True, size=size)
-        buffer = shm.buf[:size]
-        buffer[:] = tensor
-
-        self.modules[module_id]["forward_queue"][key] = (size, shm.name)
-        self.memory_manager[key] = shm.name
-
-        del buffer
-        shm.close()
-        return True
 
     def _handle_generate(self, data: bytes, node: Connection):
         # Received a forward pass

@@ -46,9 +46,9 @@ class GenerationRequest(BaseModel):
     id: int = None
     start_time: float = 0
 
-    # Format control
+    # Format control: "raw" returns plain text, "openai" follows the OpenAI chat completion schema
     input_format: Literal["chat", "raw"] = "raw"
-    output_format: Literal["simple", "openai", "raw"] = "simple"
+    output_format: Literal["raw", "openai"] = "raw"
     is_chat_completion: bool = False
 
 
@@ -72,6 +72,10 @@ class ChatCompletionRequest(BaseModel):
 
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
+
+    # Chat completions always use chat input and openai-style output
+    input_format: Literal["chat", "raw"] = "chat"
+    output_format: Literal["raw", "openai"] = "openai"
 
     user: Optional[str] = None
 

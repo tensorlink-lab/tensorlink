@@ -1,4 +1,4 @@
-from tensorlink.ml.utils import get_popular_model_stats
+from tensorlink.ml.utils.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
     GenerationRequest,
@@ -23,7 +23,7 @@ def build_hf_job_data(
     author: str,
     model_type: str = "hf",
     payment: int = 0,
-    time: int = 0,
+    duration: int = 0,
     hosted: bool = True,
     training: bool = False,
     seed_validators=None,
@@ -38,7 +38,7 @@ def build_hf_job_data(
         "hosted": hosted,
         "training": training,
         "payment": payment,
-        "time": time,
+        "time": duration,
         "capacity": 0,
         "n_pipelines": 1,
         "dp_factor": 1,
@@ -126,7 +126,7 @@ class TensorlinkAPI:
 
         @self.router.post("/v1/generate")
         async def generate(request: GenerationRequest):
-            """Updated /v1/generate endpoint"""
+            """/v1/generate endpoint"""
             try:
                 start_time = time.time()
                 request.input_format = getattr(request, "input_format", "raw")
@@ -164,7 +164,6 @@ class TensorlinkAPI:
                 else:
                     # Non-streaming
                     request = await self._wait_for_result(request)
-
                     # Return formatted response (not just output text)
                     if hasattr(request, 'formatted_response'):
                         return request.formatted_response
@@ -255,7 +254,7 @@ class TensorlinkAPI:
                     model_name=model_name,
                     author=self.smart_node.rsa_key_hash,
                     payment=job_request.payment,
-                    time=job_request.time,
+                    duration=job_request.time,
                     model_type=job_request.model_type,
                 )
 

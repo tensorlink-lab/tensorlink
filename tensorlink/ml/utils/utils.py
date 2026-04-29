@@ -8,17 +8,8 @@ from safetensors.torch import save as st_save_bytes, load as st_load_bytes
 import psutil
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
-    AutoModelForSeq2SeqLM,
-    AutoModelForSpeechSeq2Seq,
-)
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -221,16 +212,12 @@ def detach_tensor(obj, clone: bool = False):
 
     # Case 2: DynamicCache
     elif isinstance(obj, DynamicCache):
+        keys, vals = _get_cache_kv(obj)
         new_cache = DynamicCache()
-        new_cache.key_cache = [
-            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
-            for t in obj.key_cache
-        ]
-        new_cache.value_cache = [
-            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
-            for t in obj.value_cache
-        ]
-        new_cache._seen_tokens = obj._seen_tokens
+        for layer_idx, (k, v) in enumerate(zip(keys, vals)):
+            new_cache.update(
+                detach_tensor(k, clone=clone), detach_tensor(v, clone=clone), layer_idx
+            )
         return new_cache
 
     # Case 3: ModelOutput (transformers container)
@@ -279,16 +266,10 @@ def detach_tensor(obj, clone: bool = False):
 def attach_tensor(tensor, device):
     # Case 1: DynamicCache
     if isinstance(tensor, DynamicCache):
+        keys, vals = _get_cache_kv(tensor)
         new_cache = DynamicCache()
-        new_cache.key_cache = [
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
-            for t in tensor.key_cache
-        ]
-        new_cache.value_cache = [
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
-            for t in tensor.value_cache
-        ]
-        new_cache._seen_tokens = tensor._seen_tokens
+        for layer_idx, (k, v) in enumerate(zip(keys, vals)):
+            new_cache.update(k.to(device), v.to(device), layer_idx)
         return new_cache
 
     # Case 2: torch.Tensor
@@ -356,23 +337,40 @@ def tensor_to_bytes(obj):
                 "dtype": DTYPE_STR_MAP.get(o.dtype),
                 "shape": list(o.shape),
             }
+
         elif isinstance(o, dict):
             return {k: _extract_tensors(v) for k, v in o.items()}
+
         elif isinstance(o, (list, tuple)):
             result = [_extract_tensors(v) for v in o]
             return (
                 {"__tuple__": True, "data": result} if isinstance(o, tuple) else result
             )
+
         elif isinstance(o, (int, float, bool, str, type(None))):
             return o
+
         elif hasattr(o, '__class__') and o.__class__.__name__ == 'DynamicCache':
-            # Serialize DynamicCache as its key/value tensor lists
+            keys, vals = _get_cache_kv(o)
+            seen = o.get_seq_length() if hasattr(o, 'get_seq_length') else 0
+
+            # Filter out unpopulated (None) layers — only serialize layers with actual data
+            populated = [
+                (i, k, v)
+                for i, (k, v) in enumerate(zip(keys, vals))
+                if k is not None and v is not None
+            ]
+
             return {
                 "__dynamic_cache__": True,
-                "key_cache": _extract_tensors(o.key_cache),
-                "value_cache": _extract_tensors(o.value_cache),
-                "_seen_tokens": o._seen_tokens,
+                "key_cache": _extract_tensors([k for _, k, _ in populated]),
+                "value_cache": _extract_tensors([v for _, _, v in populated]),
+                "layer_indices": [
+                    i for i, _, _ in populated
+                ],  # track original positions
+                "_seen_tokens": seen,
             }
+
         else:
             return None  # drop unserializable objects safely
 
@@ -415,18 +413,28 @@ def bytes_to_tensor(data: bytes):
                         f"Unsupported dtype during deserialization: {dtype_str}"
                     )
                 return t.to(dtype=DTYPE_OBJ_MAP[dtype_str])
+
             elif o.get("__dynamic_cache__"):
                 cache = DynamicCache()
-                cache.key_cache = _restore(o["key_cache"])
-                cache.value_cache = _restore(o["value_cache"])
-                cache._seen_tokens = o["_seen_tokens"]
+                key_layers = _restore(o["key_cache"])
+                val_layers = _restore(o["value_cache"])
+                layer_indices = o.get("layer_indices", list(range(len(key_layers))))
+
+                for layer_idx, k, v in zip(layer_indices, key_layers, val_layers):
+                    if k is not None and v is not None:
+                        cache.update(k, v, layer_idx)
+
                 return cache
+
             elif o.get("__tuple__"):
                 return tuple(_restore(v) for v in o["data"])
+
             else:
                 return {k: _restore(v) for k, v in o.items()}
+
         elif isinstance(o, list):
             return [_restore(v) for v in o]
+
         else:
             return o
 
@@ -904,100 +912,31 @@ def optimizer_to_spec(optimizer_cls):
     return optimizer_spec
 
 
-def load_model_skeleton(model_name: str, model_type: str = "chat"):
+def _get_cache_kv(cache):
     """
-    Load the HF model structure with empty weights.
+    Extract (key_list, value_list) from a DynamicCache regardless of
+    transformers version. New versions use cache.layers[i].keys/.values,
+    old versions expose cache.key_cache / cache.value_cache directly.
     """
-    # First, load the config
-    model_config = AutoConfig.from_pretrained(model_name)
+    if hasattr(cache, 'key_cache'):
+        return cache.key_cache, cache.value_cache
 
-    # Then create model from config with init_empty_weights
-    with init_empty_weights():
-        if model_type in ("causal", "chat"):
-            skeleton_model = AutoModelForCausalLM.from_config(model_config)
-        elif model_type == "seq2seq":
-            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
-        elif model_type == "vision2text":
-            skeleton_model = AutoModelForVision2Seq.from_config(model_config)
-        elif model_type == "audio2text":
-            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
-        else:
-            skeleton_model = AutoModel.from_config(model_config)
+    elif hasattr(cache, 'layers'):
+        if not cache.layers:
+            return [], []
 
-    skeleton_model.eval()  # Set to eval mode initially
+        # Probe attribute names on first layer
+        layer = cache.layers[0]
+        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
+        val_attr = 'values' if hasattr(layer, 'values') else 'value'
 
-    # Ensure no cached gradients or cached computations
-    for param in skeleton_model.parameters():
-        param.requires_grad = False
+        keys, vals = [], []
+        for l in cache.layers:
+            k = getattr(l, key_attr, None)
+            v = getattr(l, val_attr, None)
+            keys.append(k)
+            vals.append(v)
 
-    return skeleton_model
-
-
-from collections.abc import Mapping, Sequence
-
-
-def print_output(x, name=None, indent=0, max_elements=5):
-    def _tensor_preview(t, max_el=5):
-        shape = tuple(t.shape)
-        flat = t.flatten()
-
-        if flat.numel() == 0:
-            return f"shape={shape} EMPTY"
-
-        vals = flat[:max_el].detach().cpu().tolist()
-
-        if flat.numel() <= max_el:
-            return f"shape={shape} vals={vals}"
-        else:
-            tail = flat[-max_el:].detach().cpu().tolist()
-            return f"shape={shape} head={vals} tail={tail}"
-
-    p = " " * indent
-    prefix = f"{p}{name}: " if name else p
-
-    # ---- Dict ----
-    if isinstance(x, Mapping):
-        print(f"{prefix}dict[{len(x)}]")
-        for k, v in x.items():
-            print_output(v, name=str(k), indent=indent + 2)
-
-    # ---- Sequence ----
-    elif isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
-        if len(x) == 0:
-            print(f"{prefix}list[0]")
-            return
-
-        print(f"{prefix}list[{len(x)}]")
-
-        # only show first element
-        print_output(x[0], name="[0]", indent=indent + 2)
-        if len(x) > 1:
-            print(f"{p}  ...")
-
-    # ---- Tensor ----
-    elif isinstance(x, torch.Tensor):
-        preview = _tensor_preview(x, max_elements)
-        print(f"{prefix}Tensor({preview}, dtype={x.dtype}, device={x.device})")
-
-    # ---- Cache-like ----
-    elif hasattr(x, "__class__") and "Cache" in x.__class__.__name__:
-        cls = x.__class__.__name__
-
-        summary = []
-        for attr in ["seen_tokens", "is_compileable"]:
-            if hasattr(x, attr):
-                summary.append(f"{attr}={getattr(x, attr)}")
-
-        print(f"{prefix}{cls}({', '.join(summary)})")
-
-        # selectively inspect key/value cache
-        for attr in ["key_cache", "value_cache"]:
-            if hasattr(x, attr):
-                val = getattr(x, attr)
-                if isinstance(val, list) and len(val) > 0:
-                    print(f"{p}  {attr}: list[{len(val)}]")
-                    print_output(val[0], name=f"{attr}[0]", indent=indent + 4)
-
-    # ---- Fallback ----
+        return keys, vals
     else:
-        print(f"{prefix}{type(x).__name__}({x})")
+        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")

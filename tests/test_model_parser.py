@@ -4,7 +4,7 @@ and ensure different distribution techniques are working accordingly
 """
 
 from tensorlink.ml.graphing import ModelParser
-from tensorlink.ml.utils import estimate_memory, format_memory_size
+from tensorlink.ml.utils.utils import format_memory_size
 import pandas as pd
 
 MODELS = [
