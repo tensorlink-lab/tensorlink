@@ -20,13 +20,12 @@ import os
 
 from tensorlink.ml.injector import generate_new_forward_method, get_loop_io_signature
 from tensorlink.ml.optim import create_distributed_optimizer
-from tensorlink.ml.graphing import ModelParser
+from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.utils.loading import (
-    apply_required_buffers,
-    load_weights_for_paths,
-    load_full_model,
-    ModelCacheManager,
     load_model_skeleton,
+    ModelCacheManager,
+    load_module_weights,
+    get_nested_module,
 )
 from tensorlink.ml.utils import (
     get_gpu_memory,
@@ -43,7 +42,7 @@ from tensorlink.ml.utils import (
     optimizer_to_spec,
     handle_output,
     attach_tensor,
-    get_nested_module,
+    resolve_module_from_path,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -693,6 +692,8 @@ class DistributedModel(nn.Module):
 
         assert isinstance(self.model, nn.Module), "Model Distribution Failed!"
 
+        self._patch_skeleton_device(self.device)
+
         self.model.n_batch = 0
         self.model.forward_queues = {}
         self.model.backward_queues = {}
@@ -706,8 +707,11 @@ class DistributedModel(nn.Module):
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
-        with _set_micro(self._thread_local, 0):
-            return self.model.generate(*args, **kwargs)
+        try:
+            with _set_micro(self._thread_local, 0):
+                return self.model.generate(*args, **kwargs)
+        except Exception as e:
+            raise e
 
     def wrap_module(self, module_id: list, worker_id):
         # Access the module and parent
@@ -837,13 +841,11 @@ class DistributedModel(nn.Module):
             offloaded_module.entire_model = True
             return
 
+        if module_path[0] == "model" and not hasattr(self.model, "model"):
+            module_path = module_path[1:]
+
         module_path_list = module_path.split(".")
-        target = self.model
-
-        if module_path_list[0] == "model" and not hasattr(self.model, "model"):
-            module_path_list.pop(0)
-
-        target = get_nested_module(target, ".".join(module_path_list[:-1]))
+        target = get_nested_module(self.model, ".".join(module_path_list[1:-1]))
 
         setattr(target, module_path_list[-1], offloaded_module)
 
@@ -1009,66 +1011,20 @@ class DistributedModel(nn.Module):
 
         logging.info(f"Loading host module: {module_class} at {module_path}")
 
-        # Navigate to the target module in the skeleton
-        module_path_list = module_path.split(".")
-        target = self.model
-
-        # Handle 'model' prefix
-        if module_path_list[0] == "model" and (
-            not hasattr(self.model, "model")
-            or (
-                len(module_path_list) > 1
-                and not hasattr(self.model.model, module_path_list[1])
-            )
-        ):
-            module_path_list.pop(0)
-
-        # Special case: entire model
-        if not module_path_list:
-            logging.info(
-                "Module path refers to full model; loading directly into root model"
-            )
-
-            model_type = module_info.get('model_type', 'chat')
-            self.model = load_full_model(self.model_name, model_type, self.device)
-            return
-
-        # Navigate to parent
-        for attr in module_path_list[:-1]:
-            target = getattr(target, attr)
-
-        # Get the actual module
-        module_name = module_path_list[-1]
-        host_module = getattr(target, module_name)
-
-        # Load weights for this module
-        logging.info(f"Loading weights for {module_path}")
+        host_module = get_nested_module(self.model, module_path)
         model_path = self.cache_manager.load_model_path(self.model_name)
-        state_dict = load_weights_for_paths(model_path, [module_path])
 
-        # Convert module to empty weights on CPU first
-        host_module = host_module.to_empty(device=self.device)
-
-        # Load the state dict
-        missing_keys, unexpected_keys = host_module.load_state_dict(
-            state_dict, strict=False
+        load_module_weights(
+            model_path=model_path,
+            module_path=module_path,
+            target_module=host_module,
+            module_info=module_info,
+            device=self.device,
         )
 
-        if missing_keys:
-            logging.warning(f"Host module {module_path} - Missing keys: {missing_keys}")
-        if unexpected_keys:
-            logging.warning(
-                f"Host module {module_path} - Unexpected keys: {unexpected_keys}"
-            )
-
-        apply_required_buffers(host_module, module_info)
-
-        # Move to device
-        host_module = host_module.to(self.device)
-
-        # Update the module in place
-        setattr(target, module_name, host_module)
-
+        # Put the loaded module back into the skeleton in-place
+        parent, _, child_name = resolve_module_from_path(self.model, module_path)
+        setattr(parent, child_name, host_module)
         logging.info(f"Successfully loaded host module {module_class}")
 
     def _load_tied_host_module(self, module_id: str, module_info: Dict[str, Any]):
@@ -1224,6 +1180,24 @@ class DistributedModel(nn.Module):
 
         return buffer_map
 
+    def _patch_skeleton_device(self, host_device: torch.device):
+        model_cls = type(self.model)
+
+        if getattr(model_cls, "_tensorlink_device_patched", False):
+            return
+
+        distributed_model_ref = self  # reference to the DistributedModel wrapper
+
+        patched_cls = type(
+            f"Distributed_{model_cls.__name__}",
+            (model_cls,),
+            {
+                "device": property(lambda self, ref=distributed_model_ref: ref.device),
+                "_tensorlink_device_patched": True,
+            },
+        )
+        self.model.__class__ = patched_cls
+
 
 class OffloadedModule(nn.Module):
     """
@@ -1353,7 +1327,6 @@ class OffloadedModule(nn.Module):
                 [handle_output(args), self.module_id]
             )
 
-        args = handle_output(args)
         detached_args = detach_tensor(args, clone=True)
         args_bytes = tensor_to_bytes(detached_args)
         kwargs_bytes = tensor_to_bytes(kwargs)
@@ -1393,7 +1366,7 @@ class OffloadedModule(nn.Module):
 
         inter_storage = [
             self.module_id,
-            handle_output(output),
+            output,
         ]  # Store associated output
 
         # Store intermediates and connection for backwards pass

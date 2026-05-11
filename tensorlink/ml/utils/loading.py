@@ -1,5 +1,4 @@
-from tensorlink.ml.utils import bytes_to_tensor, get_nested_module
-
+from tensorlink.ml.utils import bytes_to_tensor
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -10,7 +9,7 @@ from transformers import (
 from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download, model_info
 from safetensors import safe_open
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch.nn as nn
 import torch
 import logging
@@ -47,17 +46,12 @@ class ModelCacheManager:
             return snapshot_download(
                 repo_id=model_name,
                 cache_dir=self.hf_cache_dir,
-                local_files_only=True,  # 🔑 key
+                local_files_only=True,
             )
-
         except Exception:
             return None
 
     def load_model_path(self, model_name):
-        """
-        Get model path, first check local cache, then global, then download
-        if not found. If download size is too large, remove the oldest cache.
-        """
         local = self.get_local_snapshot(model_name)
         if local:
             return local
@@ -87,7 +81,6 @@ class ModelCacheManager:
             return 0
 
     def cleanup_hf_cache(self, required_bytes: int) -> None:
-        """Evict least-recently-used cache entries until *required_bytes* are freed."""
         entries = []
         for root, dirs, _ in os.walk(self.hf_cache_dir):
             for d in dirs:
@@ -100,11 +93,10 @@ class ModelCacheManager:
                         for f in filenames
                     )
                     entries.append((full_path, stat.st_atime, size))
-
                 except Exception:
                     continue
 
-        entries.sort(key=lambda x: x[1])  # oldest first
+        entries.sort(key=lambda x: x[1])
 
         freed = 0
         for path, _, size in entries:
@@ -112,6 +104,98 @@ class ModelCacheManager:
             freed += size
             if freed >= required_bytes:
                 break
+
+
+# ---------------------------------------------------------------------------
+# Universal prefix resolution
+# ---------------------------------------------------------------------------
+
+
+class TiedLinear(nn.Module):
+    """Linear projection using a weight tensor tied to an Embedding."""
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=weight.requires_grad)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight)
+
+
+def _iter_safetensor_keys(model_path: str):
+    """Yield all weight keys from safetensors shards (or .bin as fallback)."""
+    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    if safetensor_files:
+        for shard_path in safetensor_files:
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                yield from f.keys()
+            return  # one shard is enough to discover prefixes
+    else:
+        bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
+        if bin_files:
+            shard = torch.load(bin_files[0], map_location="cpu")
+            yield from shard.keys()
+
+
+def resolve_weight_prefix(model_path: str, module_path: str) -> str:
+    """
+    Discover the actual key prefix used in the weight files for *module_path*.
+
+    Works by progressively stripping leading path components until a prefix
+    is found that actually exists in the weight files. This is entirely
+    architecture-agnostic — no hardcoded model family names.
+
+    Examples (Qwen3 weight keys: "model.embed_tokens.weight", "lm_head.weight"):
+      module_path="model.model"              -> "model"
+      module_path="model.model.embed_tokens" -> "model.embed_tokens"
+      module_path="model.lm_head"            -> "lm_head"
+      module_path="model"                    -> "model"
+
+    Returns the matched prefix string, or "" if nothing matched (caller
+    should treat "" as a root/full load).
+    """
+    sampled: List[str] = []
+    try:
+        for key in _iter_safetensor_keys(model_path):
+            sampled.append(key)
+            if len(sampled) >= 256:
+                break
+    except Exception:
+        return ""
+
+    if not sampled:
+        return ""
+
+    # Build candidates by dropping 0, 1, 2, … leading components.
+    # e.g. "model.model.embed_tokens" ->
+    #   ["model.model.embed_tokens", "model.embed_tokens", "embed_tokens"]
+    parts = module_path.split(".")
+    for i in range(len(parts)):
+        candidate = ".".join(parts[i:])
+        if any(key.startswith(candidate + ".") for key in sampled):
+            return candidate
+
+    # Nothing matched — signal a root/full load
+    return ""
+
+
+def _strip_to_local_key(key: str, matched_prefix: str) -> str:
+    """
+    Strip *matched_prefix* (and a trailing dot) from *key*, returning the
+    local parameter name suitable for load_state_dict on the target module.
+
+    Examples:
+        key="model.layers.3.mlp.gate_proj.weight", prefix="model.layers.3"
+          -> "mlp.gate_proj.weight"
+        key="layers.3.mlp.gate_proj.weight",        prefix="layers.3"
+          -> "mlp.gate_proj.weight"
+    """
+    return key[len(matched_prefix) + 1 :]  # +1 for the "."
+
+
+# ---------------------------------------------------------------------------
+# Core shared loading primitives
+# ---------------------------------------------------------------------------
 
 
 def apply_required_buffers(
@@ -124,6 +208,11 @@ def apply_required_buffers(
     """
     Apply buffers that cannot be recovered from safetensors weights alone.
 
+    Buffer keys in module_info may be stored relative to the model root
+    (e.g. ``"model.layers.0.rotary_emb.inv_freq"``) or relative to the
+    target module (e.g. ``"rotary_emb.inv_freq"``).  We normalise to the
+    latter before navigating into *module*.
+
     Handles three cases:
       1. Buffer already exists on module (overwrite in-place or re-register on
          shape mismatch)
@@ -134,29 +223,51 @@ def apply_required_buffers(
     if not required_buffers or required_buffers == b"{}":
         return
 
+    # The module_path tells us what prefix to strip from absolute buffer keys
+    module_path = module_info.get("module_path", "")
+    # Build candidate prefixes to strip (same logic as weight prefix resolution)
+    strip_candidates = set()
+    if module_path:
+        strip_candidates.add(module_path + ".")
+        # Also try without leading "model." in case keys were stored differently
+        bare = module_path
+        for segment in ("model", "transformer", "encoder", "decoder"):
+            if bare.startswith(segment + "."):
+                bare = bare[len(segment) + 1 :]
+                strip_candidates.add(bare + ".")
+
     for key, buf_spec in required_buffers.items():
         try:
-            # buf_spec may arrive as raw bytes or as an encoded string
             if isinstance(buf_spec, str):
                 tensor = bytes_to_tensor(buf_spec.encode())
             else:
                 tensor = bytes_to_tensor(buf_spec)
 
-            # Navigate to the correct submodule if key is dotted
-            parts = key.rsplit(".", 1)
+            rel_key = key
+            for strip in strip_candidates:
+                if rel_key.startswith(strip):
+                    rel_key = rel_key[len(strip) :]
+                    break
+
+            parts = rel_key.rsplit(".", 1)
             if len(parts) == 2:
                 submodule_path, buf_name = parts
                 try:
                     target = get_nested_module(module, submodule_path)
-
                 except Exception:
+                    target = None
+                    for mod_name, mod in module.named_modules():
+                        if mod_name == submodule_path:
+                            target = mod
+                            break
+                if target is None:
                     warn_fn(
-                        f"Buffer submodule not found: {submodule_path}, skipping {key}"
+                        f"Buffer submodule not found: '{submodule_path}' (key '{key}'), skipping"
                     )
                     continue
             else:
                 target = module
-                buf_name = key
+                buf_name = rel_key
 
             existing_buffers = dict(target.named_buffers(recurse=False))
             if hasattr(target, buf_name) and buf_name in existing_buffers:
@@ -164,129 +275,178 @@ def apply_required_buffers(
                 if existing.shape == tensor.shape:
                     existing.copy_(tensor)
                 else:
-                    # Shape mismatch (e.g. seq_len changed) — re-register
                     target.register_buffer(buf_name, tensor)
             else:
                 target.register_buffer(buf_name, tensor)
 
-            log_fn(f"Applied buffer {key}")
+            log_fn(f"Applied buffer '{rel_key}'")
 
         except Exception as e:
-            error_fn(f"Failed to apply buffer {key}: {e}")
+            error_fn(f"Failed to apply buffer '{key}': {e}")
 
 
-def load_weights_for_paths(
+def _load_tensors_from_shards(
     model_path: str,
-    layer_paths: List[str],
+    prefix: str,
     log_fn: Callable[[str], None] = logging.debug,
-    warn_fn: Callable[[str], None] = logging.warning,
-    single: bool = False,
-    base_model_prefix: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Load safetensors weight shards from *model_path*, returning only the tensors
-    that belong to any of the module paths in *layer_paths*.
+    Low-level: scan all safetensors (or .bin) shards in *model_path* and
+    return every tensor whose key starts with ``prefix + "."``, stripped to
+    its local name.
 
-    Key stripping rules:
-      - The matched layer prefix (and a leading "model." variant) is removed.
-      - If *single* is True and the remaining key still contains a ".", the
-        first segment is also stripped (for single-module loads where the weight
-        key encodes the class path rather than just the parameter name).
-
-    Falls back to pytorch_model*.bin only when no safetensors shards exist.
+    When *prefix* is ``""`` (root / whole-model load) every key is returned
+    as-is with no stripping.
     """
     state_dict: Dict[str, torch.Tensor] = {}
+    root_load = prefix == ""
+    full_prefix = "" if root_load else (prefix + ".")
 
     safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
     if safetensor_files:
-        log_fn(f"Found {len(safetensor_files)} safetensors shards in {model_path}")
-        layer_path_to_idx = {p: i for i, p in enumerate(layer_paths)}
-
         for shard_path in safetensor_files:
-            log_fn(f"Reading {os.path.basename(shard_path)}")
             with safe_open(shard_path, framework="pt", device="cpu") as f:
                 keys_loaded = 0
                 for key in f.keys():
-                    for layer_path in layer_path_to_idx:
-                        layer_prefix = layer_path + "."
-
-                        # Try progressively shorter prefixes (strip leading "model.")
-                        matched_prefix = None
-                        trimmed = layer_prefix
-                        for _ in range(2):
-                            if key.startswith(trimmed):
-                                matched_prefix = trimmed
-                                break
-                            trimmed = trimmed.split("model.", 1)[-1]
-
-                        if matched_prefix is None:
-                            continue
-
-                        new_key = key[len(matched_prefix) :]
-
-                        if single and "." in new_key:
-                            new_key = new_key.split(".", 1)[1]
-                        elif len(new_key.split(".")) > 1:
-                            new_key = key.split(".", 1)[1]
-
-                        state_dict[new_key] = f.get_tensor(key)
+                    if root_load or key.startswith(full_prefix):
+                        local_key = (
+                            key if root_load else _strip_to_local_key(key, prefix)
+                        )
+                        state_dict[local_key] = f.get_tensor(key)
                         keys_loaded += 1
-                        break
-
                 if keys_loaded:
-                    log_fn(f"  Loaded {keys_loaded} tensors")
-
+                    log_fn(f"  {os.path.basename(shard_path)}: {keys_loaded} tensors")
             gc.collect()
 
     else:
-        # Fallback: .bin shards
         bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
         if not bin_files:
             raise ValueError(f"No weight files found in {model_path}")
-
-        warn_fn("No safetensors found — falling back to .bin files")
-
         for bin_path in bin_files:
-            shard_dict = torch.load(bin_path, map_location="cpu")
+            shard = torch.load(bin_path, map_location="cpu")
+            for key, value in shard.items():
+                if root_load or key.startswith(full_prefix):
+                    local_key = key if root_load else _strip_to_local_key(key, prefix)
+                    state_dict[local_key] = value
 
-            # Full-model load: no filtering
-            if layer_paths == ["model"]:
-                state_dict.update(shard_dict)
-                continue
-
-            for key, value in shard_dict.items():
-                for layer_path in layer_paths:
-                    prefix = layer_path + "."
-                    if key.startswith(prefix):
-                        state_dict[key[len(prefix) :]] = value
-                        break
-
-    log_fn(f"Loaded {len(state_dict)} weight tensors total")
     return state_dict
 
 
-def load_grouped_layer_weights(
+# ---------------------------------------------------------------------------
+# Universal single-module weight loader
+# ---------------------------------------------------------------------------
+
+
+def load_module_weights(
+    model_path: str,
+    module_path: str,
+    target_module: nn.Module,
+    module_info: Optional[Dict[str, Any]] = None,
+    device: torch.device = torch.device("cpu"),
+    log_fn: Callable[[str], None] = logging.debug,
+    warn_fn: Callable[[str], None] = logging.warning,
+) -> Tuple[List[str], List[str]]:
+    """
+    Universal weight loader for a single module.  Used by both module.py
+    (host loading) and worker.py (offloaded loading).
+
+    Resolves the actual weight-file prefix for *module_path* automatically,
+    so no hard-coded "model." trimming or ``single`` flag is needed.
+
+    Steps:
+      1. Resolve the real prefix used in the weight files.
+      2. Extract the matching tensors (stripped to local names).
+      3. Materialise the module on CPU with empty weights.
+      4. Load the state dict (strict=False so tied / missing weights don't crash).
+      5. Apply required buffers from *module_info* if provided.
+      6. Move to *device*.
+
+    Returns (missing_keys, unexpected_keys) from load_state_dict.
+    """
+    log_fn(f"Resolving weight prefix for '{module_path}'")
+    prefix = resolve_weight_prefix(model_path, module_path)
+
+    if prefix is None:
+        warn_fn(
+            f"Could not resolve weight prefix for '{module_path}' — "
+            f"falling back to full scan. Module may load with missing keys."
+        )
+        # Last resort: load everything and let load_state_dict filter
+        state_dict = _fallback_full_scan(model_path, module_path, log_fn, warn_fn)
+    else:
+        log_fn(f"Resolved prefix '{prefix}' for module '{module_path}'")
+        state_dict = _load_tensors_from_shards(model_path, prefix, log_fn)
+
+    log_fn(f"Loaded {len(state_dict)} tensors for '{module_path}'")
+
+    # Materialise on CPU before loading weights
+    target_module = target_module.to_empty(device="cpu")
+
+    missing_keys, unexpected_keys = target_module.load_state_dict(
+        state_dict, strict=False
+    )
+
+    del state_dict
+    gc.collect()
+
+    if missing_keys:
+        warn_fn(f"Missing keys for '{module_path}': {missing_keys}")
+    if unexpected_keys:
+        warn_fn(f"Unexpected keys for '{module_path}': {unexpected_keys}")
+
+    if module_info:
+        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+
+    target_module = target_module.to(device)
+    return missing_keys, unexpected_keys
+
+
+# ---------------------------------------------------------------------------
+# Universal grouped-layer weight loader
+# ---------------------------------------------------------------------------
+
+
+def load_grouped_module_weights(
     model_path: str,
     layer_paths: List[str],
     target_module: nn.Module,
+    module_info: Optional[Dict[str, Any]] = None,
+    device: torch.device = torch.device("cpu"),
     log_fn: Callable[[str], None] = logging.debug,
     warn_fn: Callable[[str], None] = logging.warning,
 ) -> None:
     """
-    Load weights for a grouped LayerGroupModule directly into *target_module*,
-    remapping HF layer prefixes to local ``layers.<idx>`` indices in-place.
+    Universal weight loader for a LayerGroupModule (encoder/decoder stacks,
+    nn.ModuleList loops, etc.).  Used by both module.py and worker.py.
 
-    Mutates *target_module* via ``load_state_dict(strict=False)`` per shard.
+    Maps HF layer paths -> local ``layers.<idx>`` indices inside the wrapper,
+    using the same universal prefix resolution so any model architecture works.
+
+    Mutates *target_module* in-place via ``load_state_dict(strict=False)``
+    per shard to keep peak memory low.
     """
-    layer_prefix_to_local_idx = {p: i for i, p in enumerate(layer_paths)}
-    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    if not layer_paths:
+        raise ValueError("layer_paths must be non-empty for grouped layer loading")
 
+    # Resolve real prefixes for every layer path up front (one probe per layer)
+    resolved: List[Optional[str]] = []
+    for lp in layer_paths:
+        prefix = resolve_weight_prefix(model_path, lp)
+        if prefix is None:
+            warn_fn(f"Could not resolve prefix for layer '{lp}', will skip")
+        resolved.append(prefix)
+
+    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
     if not safetensor_files:
-        raise RuntimeError("No safetensors found for grouped layer loading")
+        raise RuntimeError(
+            f"No safetensors found in {model_path} for grouped layer loading"
+        )
+
+    target_module = target_module.to_empty(device="cpu")
 
     loaded_keys: List[str] = []
-    missing_keys = set(target_module.state_dict().keys())
+    missing_keys_set = set(target_module.state_dict().keys())
 
     for shard_idx, shard_path in enumerate(safetensor_files):
         log_fn(f"Loading shard {shard_idx + 1}/{len(safetensor_files)}")
@@ -294,35 +454,103 @@ def load_grouped_layer_weights(
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for key in f.keys():
-                for layer_prefix, local_idx in layer_prefix_to_local_idx.items():
-                    full_prefix = layer_prefix + "."
-                    # Try progressively shorter prefixes
-                    matched = None
-                    for _ in range(3):
-                        if key.startswith(full_prefix):
-                            matched = full_prefix
-                            break
-                        full_prefix = full_prefix.split(".", 1)[-1]
-
-                    if matched is None:
+                for local_idx, (layer_path, prefix) in enumerate(
+                    zip(layer_paths, resolved)
+                ):
+                    if prefix is None:
                         continue
-
-                    subkey = key[len(matched) :]
-                    new_key = f"layers.{local_idx}.{subkey}"
-                    shard_state_dict[new_key] = f.get_tensor(key)
-                    loaded_keys.append(new_key)
-                    missing_keys.discard(new_key)
-                    break
+                    full_prefix = prefix + "."
+                    if key.startswith(full_prefix):
+                        subkey = _strip_to_local_key(key, prefix)
+                        new_key = f"layers.{local_idx}.{subkey}"
+                        shard_state_dict[new_key] = f.get_tensor(key)
+                        loaded_keys.append(new_key)
+                        missing_keys_set.discard(new_key)
+                        break
 
         if shard_state_dict:
             target_module.load_state_dict(shard_state_dict, strict=False)
             del shard_state_dict
             gc.collect()
 
-    if missing_keys:
-        warn_fn(f"Missing keys after grouped load: {missing_keys}")
+    if missing_keys_set:
+        warn_fn(f"Missing keys after grouped load: {missing_keys_set}")
 
-    log_fn(f"Loaded {len(loaded_keys)} tensors across {len(safetensor_files)} shards")
+    log_fn(
+        f"Loaded {len(loaded_keys)} tensors across "
+        f"{len(safetensor_files)} shards for {len(layer_paths)} layers"
+    )
+
+    if module_info:
+        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+
+    target_module.to(device)
+
+
+def _fallback_full_scan(
+    model_path: str,
+    module_path: str,
+    log_fn: Callable[[str], None],
+    warn_fn: Callable[[str], None],
+) -> Dict[str, torch.Tensor]:
+    """
+    When prefix resolution fails completely, scan all weight keys using the
+    same progressive-strip logic to find the best matching prefix.
+    """
+    warn_fn(f"Full scan fallback for '{module_path}'")
+
+    # Reuse the same candidate logic as resolve_weight_prefix
+    sampled: List[str] = []
+    try:
+        for key in _iter_safetensor_keys(model_path):
+            sampled.append(key)
+            if len(sampled) >= 256:
+                break
+    except Exception:
+        pass
+
+    matched_prefix = ""
+    parts = module_path.split(".")
+    for i in range(len(parts)):
+        candidate = ".".join(parts[i:])
+        if any(key.startswith(candidate + ".") for key in sampled):
+            matched_prefix = candidate
+            break
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
+    if not safetensor_files:
+        bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
+        if not bin_files:
+            raise ValueError(f"No weight files in {model_path}")
+        for bf in bin_files:
+            shard = torch.load(bf, map_location="cpu")
+            for key, val in shard.items():
+                if not matched_prefix or key.startswith(matched_prefix + "."):
+                    local_key = (
+                        key[len(matched_prefix) + 1 :] if matched_prefix else key
+                    )
+                    state_dict[local_key] = val
+        return state_dict
+
+    for shard_path in safetensor_files:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if not matched_prefix or key.startswith(matched_prefix + "."):
+                    local_key = (
+                        key[len(matched_prefix) + 1 :] if matched_prefix else key
+                    )
+                    state_dict[local_key] = f.get_tensor(key)
+        gc.collect()
+
+    log_fn(f"Fallback scan found {len(state_dict)} tensors (prefix='{matched_prefix}')")
+    return state_dict
+
+
+# ---------------------------------------------------------------------------
+# Full-model loaders (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def load_full_model(
@@ -332,12 +560,6 @@ def load_full_model(
     log_fn: Callable[[str], None] = logging.debug,
     torch_dtype: torch.dtype = torch.float16,
 ) -> nn.Module:
-    """
-    Load a complete HuggingFace model with optimal memory usage.
-
-    For single-GPU setups the model is loaded to CPU first and moved to *device*
-    afterward. Multi-GPU setups use ``device_map="auto"``.
-    """
     num_gpus = torch.cuda.device_count()
     load_kwargs: Dict[str, Any] = {
         "low_cpu_mem_usage": True,
@@ -351,8 +573,6 @@ def load_full_model(
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
     elif model_type == "seq2seq":
         model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **load_kwargs)
-    # elif model_type == "vision2text":
-    #     model = AutoModelForVision2Seq.from_pretrained(model_name, **load_kwargs)
     elif model_type == "audio2text":
         model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, **load_kwargs)
     else:
@@ -369,29 +589,106 @@ def load_full_model(
 
 
 def load_model_skeleton(model_name: str, model_type: str = "chat"):
-    """
-    Load the HF model structure with empty weights.
-    """
-    # First, load the config
     model_config = AutoConfig.from_pretrained(model_name)
 
-    # Then create model from config with init_empty_weights
     with init_empty_weights():
         if model_type in ("causal", "chat"):
             skeleton_model = AutoModelForCausalLM.from_config(model_config)
         elif model_type == "seq2seq":
             skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
-        # elif model_type == "vision2text":
-        #     skeleton_model = AutoModelForVision2Seq.from_config(model_config)
         elif model_type == "audio2text":
             skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
         else:
             skeleton_model = AutoModel.from_config(model_config)
 
-    skeleton_model.eval()  # Set to eval mode initially
+    skeleton_model.eval()
 
-    # Ensure no cached gradients or cached computations
     for param in skeleton_model.parameters():
         param.requires_grad = False
 
     return skeleton_model
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible
+# ---------------------------------------------------------------------------
+
+
+def load_weights_for_paths(
+    model_path: str,
+    layer_paths: List[str],
+    log_fn: Callable[[str], None] = logging.debug,
+    warn_fn: Callable[[str], None] = logging.warning,
+) -> Dict[str, torch.Tensor]:
+    """
+    Shim: resolve the best prefix for the *first* layer_path and return
+    a raw state dict.  Prefer calling load_module_weights() directly.
+    """
+    if not layer_paths:
+        return {}
+
+    # Use the universal resolver for every path and merge
+    state_dict: Dict[str, torch.Tensor] = {}
+    for lp in layer_paths:
+        prefix = resolve_weight_prefix(model_path, lp)
+        if prefix is None:
+            warn_fn(f"load_weights_for_paths: could not resolve prefix for '{lp}'")
+            partial = _fallback_full_scan(model_path, lp, log_fn, warn_fn)
+        else:
+            partial = _load_tensors_from_shards(model_path, prefix, log_fn)
+        state_dict.update(partial)
+
+    log_fn(f"load_weights_for_paths: {len(state_dict)} tensors total")
+    return state_dict
+
+
+def load_grouped_layer_weights(
+    model_path: str,
+    layer_paths: List[str],
+    target_module: nn.Module,
+    log_fn: Callable[[str], None] = logging.debug,
+    warn_fn: Callable[[str], None] = logging.warning,
+) -> None:
+    """Shim: delegates to load_grouped_module_weights."""
+    load_grouped_module_weights(
+        model_path,
+        layer_paths,
+        target_module,
+        module_info=None,
+        device=torch.device("cpu"),
+        log_fn=log_fn,
+        warn_fn=warn_fn,
+    )
+
+
+def get_nested_module(
+    model: torch.nn.Module, path: str, target_class_name: str = None
+) -> torch.nn.Module:
+    parts = path.split('.')
+    current = model
+
+    for i in range(len(parts)):
+        part = parts[i]
+
+        if part == "":
+            continue
+
+        if part == "model":
+            # Only skip if there are further parts AND the next part
+            # is accessible without going through .model explicitly
+            has_more = len(parts) > i + 1
+            if has_more and hasattr(current, "model"):
+                next_part = parts[i + 1]
+                if hasattr(current, next_part):
+                    continue
+            elif not has_more:
+                pass
+            else:
+                continue
+
+        if part.isdigit():
+            current = current[int(part)]
+        else:
+            current = getattr(current, part)
+
+    return current

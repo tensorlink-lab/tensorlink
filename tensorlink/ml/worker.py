@@ -5,16 +5,17 @@ from tensorlink.ml.utils import (
     attach_tensor,
     handle_output,
     enable_grad,
-    get_nested_module,
     get_optimizer_from_spec,
 )
 from tensorlink.ml.utils.loading import (
     apply_required_buffers,
-    load_weights_for_paths,
-    load_grouped_layer_weights,
+    TiedLinear,
     load_full_model,
-    ModelCacheManager,
     load_model_skeleton,
+    ModelCacheManager,
+    load_module_weights,
+    load_grouped_module_weights,
+    get_nested_module,
 )
 from tensorlink.ml.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
@@ -34,36 +35,6 @@ import torch
 import torch.amp as amp
 from typing import Optional, List, Dict, Any
 from transformers.generation.streamers import BaseStreamer
-
-
-def _find_module_path_by_class(
-    model: torch.nn.Module, class_name: str
-) -> Optional[str]:
-    """
-    Search the model for the first submodule whose class name matches class_name.
-    Returns the module path as returned by named_modules (empty string for root).
-    """
-    if not class_name:
-        return None
-
-    for name, mod in model.named_children():
-        # skip the root empty name if it is the same class as requested
-        if name == "":
-            # if root has the requested class, return empty string
-            if mod.__class__.__name__ == class_name:
-                return name
-            continue
-
-        if name == "model":
-            if hasattr(model, "model"):
-                return "model." + _find_module_path_by_class(model.model, class_name)
-            else:
-                return _find_module_path_by_class(model.model, class_name)
-
-        if mod.__class__.__name__ == class_name:
-            return name
-
-    return None
 
 
 def _create_layer_group_wrapper(
@@ -363,10 +334,7 @@ class DistributedWorker:
         host_id = module.host
 
         try:
-            if (
-                not stream
-                or "streamer" not in inspect.signature(module.generate).parameters
-            ):
+            if not stream or "streamer" not in inspect.signature(module).parameters:
                 with torch.no_grad():
                     output = module.generate(**kwargs)
 
@@ -517,27 +485,15 @@ class DistributedWorker:
         Load a group of layers as a single module. Uses empty weights initialization
         and only loads required layer weights.
         """
-        layer_paths = module_info.get('layer_paths', [])
-        layer_range = module_info.get('layer_range', [])
-        expected_inputs = module_info.get('expected_inputs', [])
-        expected_outputs = module_info.get('expected_outputs', [])
-        loop_body_source = module_info.get('loop_body_source')
-        loop_iterator_name = module_info.get('loop_iterator_name')
+        layer_paths = module_info.get("layer_paths", [])
+        expected_inputs = module_info.get("expected_inputs", [])
+        expected_outputs = module_info.get("expected_outputs", [])
+        loop_body_source = module_info.get("loop_body_source")
+        loop_iterator_name = module_info.get("loop_iterator_name")
 
         if not layer_paths:
             raise ValueError("layer_paths must be provided for grouped layer loading")
 
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading grouped layers {layer_range[0]}-{layer_range[1]} from {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        # Create the layer group wrapper with the skeleton's layers
-        # Extract references quickly before cleanup
         grouped_module = _create_layer_group_wrapper(
             base_model,
             layer_paths,
@@ -547,39 +503,19 @@ class DistributedWorker:
             loop_iterator_name,
         )
 
-        # Aggressively cleanup skeleton immediately after extraction
         del base_model
         self.cleanup_memory()
 
-        # Convert grouped module to empty tensors on CPU to clear any weight references
-        grouped_module = grouped_module.to_empty(device="cpu")
-
-        # Now load only the weights for the assigned layers
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading weights for layers {layer_range[0]}-{layer_range[1]}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
         model_path = self.cache_manager.load_model_path(model_name)
-        load_grouped_layer_weights(model_path, layer_paths, grouped_module)
 
-        self.cleanup_memory()
-
-        self._debug_move_to_device(grouped_module, device=self.device)
-
-        apply_required_buffers(grouped_module, module_info)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded {len(layer_paths)} layers with weights",
-                "blue",
-                logging.DEBUG,
-            ),
+        # resolves each layer's prefix, remaps to layers.<idx>, applies
+        # buffers, and moves to device (layer by layer to avoid OOM).
+        load_grouped_module_weights(
+            model_path=model_path,
+            layer_paths=layer_paths,
+            target_module=grouped_module,
+            module_info=module_info,
+            device=self.device,
         )
 
         return grouped_module
@@ -731,116 +667,51 @@ class DistributedWorker:
         Load a single module (e.g., just the RMSNorm layer).
         Uses empty weights initialization and only loads required module weights.
         """
-        parent_module_path = module_info.get('parent_module_path', '')
-        module_class_name = module_info.get('module', '')
-        module_id = module_info.get("module_id")
+        module_path = module_info.get("module_path", "")
+        module_class_name = module_info.get("module", "")
 
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading single module {module_class_name} from {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        if parent_module_path == "":
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Parent module is entire model — loading full model.",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            # aggressive cleanup before full model load
-            if module_id in self.modules:
-                del self.modules[module_id]
-
+        if not module_path or module_info.get("module", "").endswith("ForCausalLM"):
             del base_model
             self.cleanup_memory()
+            return self._load_full_model(model_name, module_info)
 
-            final_model = self._load_full_model(model_name, module_info)
-            return final_model
-
-        # Extract the specific module with empty weights
-        try:
-            # Fall through to class-based lookup
-            effective_layer_path = _find_module_path_by_class(
-                base_model, module_class_name
-            )
-            if effective_layer_path is None:
-                target_module = base_model
-                effective_layer_path = parent_module_path or "model"
-            else:
-                target_module = get_nested_module(base_model, effective_layer_path)
-
-        except Exception as e:
-            target_module = get_nested_module(base_model, module_info["module_path"])
-            effective_layer_path = module_info["module_path"]
-
-        # Get name of model for loading weights
-        base_model_prefix = getattr(base_model, "base_model_prefix", None)
-
-        # Load only the weights for this specific module
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading weights for {parent_module_path}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        if module_info.get("tied_to"):
-            effective_layer_path = module_info["tied_to"]
-
-        model_path = self.cache_manager.load_model_path(model_name)
-        state_dict = load_weights_for_paths(
-            model_path,
-            [effective_layer_path],
-            single=True,
-            base_model_prefix=base_model_prefix,
-        )
+        # Otherwise proceed with submodule extraction
+        tied_to = module_info.get("tied_to", "")
+        effective_path = tied_to or module_path
+        target_module = get_nested_module(base_model, effective_path)
 
         del base_model
         self.cleanup_memory()
 
-        target_module = target_module.to_empty(device="cpu")
+        model_path = self.cache_manager.load_model_path(model_name)
 
-        # Load the state dict
-        missing_keys, unexpected_keys = target_module.load_state_dict(
-            state_dict, strict=False
-        )
-
-        apply_required_buffers(target_module, module_info)
-
-        del state_dict
-        self.cleanup_memory()
-
-        if missing_keys:
-            self.send_request(
+        load_module_weights(
+            model_path=model_path,
+            module_path=effective_path,
+            target_module=target_module,
+            module_info=module_info,
+            device=self.device,
+            log_fn=lambda x: self.send_request(
                 "debug_print",
                 (
-                    f"DistributedWorker -> Error loading single module weights on model: {model_name}"
-                    f"\n Module: {effective_layer_path}\n Missing keys: {missing_keys}\n Unexpected keys: {unexpected_keys}",
-                    "bright_red",
-                    logging.CRITICAL,
+                    x,
+                    "cyan",
+                    logging.DEBUG,
                 ),
-            )
-
-        # Move to device
-        target_module = target_module.to(self.device)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded single module {module_class_name}",
-                "blue",
-                logging.DEBUG,
+            ),
+            warn_fn=lambda x: self.send_request(
+                "debug_print",
+                (
+                    x,
+                    "red",
+                    logging.WARNING,
+                ),
             ),
         )
+
+        if tied_to and module_class_name == "Linear":
+            return TiedLinear(target_module.weight)
+
         return target_module
 
     def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:

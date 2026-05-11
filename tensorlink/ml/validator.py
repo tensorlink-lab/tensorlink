@@ -1,4 +1,4 @@
-from tensorlink.ml.graphing import ModelParser
+from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, OffloadedModule
 from tensorlink.ml.formatter import (
