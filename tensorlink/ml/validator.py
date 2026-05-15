@@ -1,7 +1,7 @@
 from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, OffloadedModule
-from tensorlink.ml.formatter import (
+from tensorlink.ml.utils.formatter import (
     ResponseFormatter,
     normalize_generate_args,
     format_chat_prompt,

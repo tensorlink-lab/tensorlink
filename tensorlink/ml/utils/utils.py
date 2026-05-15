@@ -904,8 +904,9 @@ def resolve_module_from_path(model: nn.Module, path: str):
     """Return (parent_module, child_module, child_name)."""
     parts = path.split(".")
     parent = model
-    for p in parts[:-1]:
-        if p == "model":
+    for i in range(len(parts[:-1])):
+        p = parts[i]
+        if i == 0 and p == "model":
             continue
         parent = getattr(parent, p)
     child_name = parts[-1]

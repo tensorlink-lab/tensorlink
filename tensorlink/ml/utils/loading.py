@@ -129,7 +129,7 @@ def _iter_safetensor_keys(model_path: str):
         for shard_path in safetensor_files:
             with safe_open(shard_path, framework="pt", device="cpu") as f:
                 yield from f.keys()
-            return  # one shard is enough to discover prefixes
+            return
     else:
         bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
         if bin_files:
@@ -158,8 +158,7 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
     try:
         for key in _iter_safetensor_keys(model_path):
             sampled.append(key)
-            if len(sampled) >= 256:
-                break
+
     except Exception:
         return ""
 
@@ -382,7 +381,7 @@ def load_module_weights(
 
     # Materialise on CPU before loading weights
     target_module = target_module.to_empty(device="cpu")
-
+    dict_keys = list(state_dict.keys())
     missing_keys, unexpected_keys = target_module.load_state_dict(
         state_dict, strict=False
     )
@@ -394,11 +393,13 @@ def load_module_weights(
         warn_fn(f"Missing keys for '{module_path}': {missing_keys}")
     if unexpected_keys:
         warn_fn(f"Unexpected keys for '{module_path}': {unexpected_keys}")
+    if not missing_keys and not unexpected_keys:
+        warn_fn(f"All keys correct for '{module_path}': {dict_keys}")
 
     if module_info:
         apply_required_buffers(target_module, module_info, log_fn, warn_fn)
 
-    target_module = target_module.to(device)
+    target_module.to(device)
     return missing_keys, unexpected_keys
 
 
@@ -607,58 +608,6 @@ def load_model_skeleton(model_name: str, model_type: str = "chat"):
         param.requires_grad = False
 
     return skeleton_model
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible
-# ---------------------------------------------------------------------------
-
-
-def load_weights_for_paths(
-    model_path: str,
-    layer_paths: List[str],
-    log_fn: Callable[[str], None] = logging.debug,
-    warn_fn: Callable[[str], None] = logging.warning,
-) -> Dict[str, torch.Tensor]:
-    """
-    Shim: resolve the best prefix for the *first* layer_path and return
-    a raw state dict.  Prefer calling load_module_weights() directly.
-    """
-    if not layer_paths:
-        return {}
-
-    # Use the universal resolver for every path and merge
-    state_dict: Dict[str, torch.Tensor] = {}
-    for lp in layer_paths:
-        prefix = resolve_weight_prefix(model_path, lp)
-        if prefix is None:
-            warn_fn(f"load_weights_for_paths: could not resolve prefix for '{lp}'")
-            partial = _fallback_full_scan(model_path, lp, log_fn, warn_fn)
-        else:
-            partial = _load_tensors_from_shards(model_path, prefix, log_fn)
-        state_dict.update(partial)
-
-    log_fn(f"load_weights_for_paths: {len(state_dict)} tensors total")
-    return state_dict
-
-
-def load_grouped_layer_weights(
-    model_path: str,
-    layer_paths: List[str],
-    target_module: nn.Module,
-    log_fn: Callable[[str], None] = logging.debug,
-    warn_fn: Callable[[str], None] = logging.warning,
-) -> None:
-    """Shim: delegates to load_grouped_module_weights."""
-    load_grouped_module_weights(
-        model_path,
-        layer_paths,
-        target_module,
-        module_info=None,
-        device=torch.device("cpu"),
-        log_fn=log_fn,
-        warn_fn=warn_fn,
-    )
 
 
 def get_nested_module(

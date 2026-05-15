@@ -50,42 +50,35 @@ Connects to the validator by specifying its IP:PORT:
     }
   }
 }
+
+Next, the user can either access the validator via HTTP and request a model, or they can 
+leverage DistributedModel for access.
+
+import requests
+
+
+# Request model
+response = requests.post(
+    url=f"192.168.2.x:64747/request-model",
+    json={"model": MODEL_NAME, "model_type": "causal", "time": 300},
+    timeout=30,
+)
+
+chat_response = requests.post(
+    f"{SERVER_URL}/v1/chat/completions",
+    json={
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "max_new_tokens": MAX_NEW_TOKENS,
+    },
+    timeout=300,
+)
+
+
+from tensorlink import DistributedModel
+
+
+model = DistributedModel(
+
 """
-
-import torch
-import logging
-from collections import deque
-from transformers import AutoTokenizer
-from tensorlink.ml import DistributedModel
-from tensorlink.nodes import User, UserConfig
-
-MODEL_NAME = "Qwen/Qwen3-8B"
-
-MAX_HISTORY_TURNS = 6
-MAX_NEW_TOKENS = 256
-TEMPERATURE = 0.4
-
-if __name__ == "__main__":
-    # Must explicitly define a User node when connecting to private devices in Python
-    user = User(
-        UserConfig(priority_nodes=[["192.168.2.42", 38751]])
-    )  # Can also connect nodes after init via user.connect_node("ip", port)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = DistributedModel(model=MODEL_NAME, training=False, node=user)
-
-    history = deque(maxlen=MAX_HISTORY_TURNS)
-    history.append("System: You are a helpful assistant.")
-    history.append(f"User: Hello world!")
-    prompt = "\n".join(history) + "\nAssistant:"
-
-    inputs = tokenizer(prompt, return_tensors="pt")
-
-    with torch.no_grad():
-        outputs = model.generate(
-            inputs["input_ids"],
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            do_sample=True,
-            eos_token_id=tokenizer.eos_token_id,
-        )

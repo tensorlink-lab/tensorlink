@@ -8,7 +8,6 @@ from tensorlink.ml.utils import (
     get_optimizer_from_spec,
 )
 from tensorlink.ml.utils.loading import (
-    apply_required_buffers,
     TiedLinear,
     load_full_model,
     load_model_skeleton,
@@ -17,7 +16,7 @@ from tensorlink.ml.utils.loading import (
     load_grouped_module_weights,
     get_nested_module,
 )
-from tensorlink.ml.injector import LayerGroupModule
+from tensorlink.ml.utils.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
@@ -33,7 +32,7 @@ import time
 from threading import Thread
 import torch
 import torch.amp as amp
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 from transformers.generation.streamers import BaseStreamer
 
 
@@ -43,7 +42,7 @@ def _create_layer_group_wrapper(
     expected_inputs: List[str],
     expected_outputs: List[str],
     loop_body_source: str,
-    loop_iterator_name: str,
+    loop_structure: Dict,
 ) -> torch.nn.Module:
     """
     Create a wrapper module that processes multiple layers sequentially.
@@ -55,10 +54,11 @@ def _create_layer_group_wrapper(
     # Create and return the wrapper
     return LayerGroupModule(
         layers=layers,
+        parent_module=base_model,
         input_vars=expected_inputs,
         output_vars=expected_outputs,
         loop_body_source=loop_body_source,
-        loop_iterator_name=loop_iterator_name,
+        loop_structure=loop_structure,
     )
 
 
@@ -334,7 +334,7 @@ class DistributedWorker:
         host_id = module.host
 
         try:
-            if not stream or "streamer" not in inspect.signature(module).parameters:
+            if not stream:
                 with torch.no_grad():
                     output = module.generate(**kwargs)
 
@@ -468,11 +468,20 @@ class DistributedWorker:
 
         except Exception as e:
             # Make sure skeleton is cleaned up on error
+            err = f"Failed to load model from HuggingFace: {str(e)}"
+            self.send_request(
+                "debug_print",
+                (
+                    err,
+                    "red",
+                    logging.ERROR,
+                ),
+            )
             del skeleton_module
             self.cleanup_memory()
 
-            logging.error(f"Failed to load model from HuggingFace: {str(e)}")
-            raise ValueError(f"Failed to load model from HuggingFace: {str(e)}")
+            logging.error(err)
+            raise ValueError(err)
 
     def _load_grouped_layers(
         self,
@@ -489,7 +498,7 @@ class DistributedWorker:
         expected_inputs = module_info.get("expected_inputs", [])
         expected_outputs = module_info.get("expected_outputs", [])
         loop_body_source = module_info.get("loop_body_source")
-        loop_iterator_name = module_info.get("loop_iterator_name")
+        loop_structure = module_info.get("loop_structure")
 
         if not layer_paths:
             raise ValueError("layer_paths must be provided for grouped layer loading")
@@ -500,7 +509,7 @@ class DistributedWorker:
             expected_inputs,
             expected_outputs,
             loop_body_source,
-            loop_iterator_name,
+            loop_structure,
         )
 
         del base_model
@@ -670,7 +679,7 @@ class DistributedWorker:
         module_path = module_info.get("module_path", "")
         module_class_name = module_info.get("module", "")
 
-        if not module_path or module_info.get("module", "").endswith("ForCausalLM"):
+        if not module_path or module_path == "model":
             del base_model
             self.cleanup_memory()
             return self._load_full_model(model_name, module_info)
@@ -880,9 +889,11 @@ class DistributedWorker:
                 if forward_task:
                     key, args = forward_task
                     if len(args) == 3:
+                        # len(arg) of 3 includes stream arg for generate requests
                         size, name, stream = args
                         self._handle_generate(module_id, size, name, stream)
                     else:
+                        # len(arg) of 2 for basic forward requests
                         size, name = args
                         self._handle_forward(module_id, key, size, name)
 

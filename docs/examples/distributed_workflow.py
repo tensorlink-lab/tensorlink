@@ -112,29 +112,24 @@ if __name__ == "__main__":
         )
         distributed_model.train()
 
-    # Run a dummy training loop to showcase functionality
-    for _ in range(5):
-        # Tokenize input
-        input_text = "You: Hello Bot."
-        inputs = tokenizer(
-            input_text, return_tensors="pt", padding=True, truncation=True
+    # Run a dummy input to showcase functionality
+    input_text = "You: Hello Bot."
+    inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
+
+    # Generate response
+    with torch.no_grad():
+        # Then during generation:
+        outputs = distributed_model.generate(
+            inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            do_sample=True,
         )
 
-        # Generate response
-        with torch.no_grad():
-            # Then during generation:
-            outputs = distributed_model.generate(
-                inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                pad_token_id=tokenizer.eos_token_id,  # still valid, optional if eos_token_id is used
-                eos_token_id=tokenizer.eos_token_id,  # explicitly recommended
-                do_sample=True,  # temperature only has effect if sampling is on
-            )
-
-        # Decode and print response
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Bot: {response}\n")
+    # Decode and print response
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     # Gracefully shut down nodes
     user.cleanup()

@@ -4,8 +4,12 @@ from tensorlink.api.models import (
     GenerationRequest,
     ModelStatusResponse,
     ChatCompletionRequest,
+    AnyResponseRequest,
+    TextResponseRequest,
+    ImageResponseRequest,
+    EmbeddingResponseRequest,
 )
-from tensorlink.ml.formatter import ResponseFormatter
+from tensorlink.ml.utils.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from collections import defaultdict
@@ -91,7 +95,32 @@ def _parse_chat_messages(messages):
     return system_messages, history, last_user_message
 
 
+def _build_generation_request(request) -> GenerationRequest:
+    """Shared factory: ChatCompletionRequest or TextResponseRequest → GenerationRequest."""
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+    _, history, last_user_message = _parse_chat_messages(request.messages)
+    return GenerationRequest(
+        hf_name=request.model,
+        message=last_user_message,
+        history=history,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_new_tokens=request.max_tokens,
+        stream=request.stream,
+        input_format="chat",
+        output_format="openai",
+        do_sample=(request.temperature or 0) > 0,
+        is_chat_completion=True,
+    )
+
+
 class TensorlinkAPI:
+    """
+    Supports API requests to request and interact with models, along with
+    probing node & job information.
+    """
+
     def __init__(self, smart_node, host="0.0.0.0", port=64747):
         self.smart_node = smart_node
         self.host = host
@@ -122,95 +151,30 @@ class TensorlinkAPI:
         self.app.include_router(self.router)
 
     def _register_generate_routes(self):
-        """Register generation and chat completion endpoints"""
-
-        @self.router.post("/v1/generate")
-        async def generate(request: GenerationRequest):
-            """/v1/generate endpoint"""
+        @self.router.post("/v1/chat/completions")
+        async def chat_completions(request: ChatCompletionRequest):
             try:
-                start_time = time.time()
-                request.input_format = getattr(request, "input_format", "raw")
-                request.output_format = getattr(request, "output_format", "simple")
-
-                # Log model request
-                self._log_model_request(request.hf_name)
-
-                request.output = None
-                request_id = f"req_{hash(random.random())}"
-                request.id = hash(request_id)
-
-                # Model status checks
-                model_status = self._check_model_status(request.hf_name)
-                if model_status["status"] == "not_loaded":
-                    self._trigger_model_load(request.hf_name)
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Model '{request.hf_name}' has been requested on the network. "
-                        f"Please try again in a few moments.",
-                    )
-                elif model_status["status"] == "loading":
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Model {request.hf_name} is still loading. Please try again.",
-                    )
-
-                stream = getattr(request, 'stream', False)
-
-                if stream:
-                    return StreamingResponse(
-                        self._generate_stream(request, request_id, start_time),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    # Non-streaming
-                    request = await self._wait_for_result(request)
-                    # Return formatted response (not just output text)
-                    if hasattr(request, 'formatted_response'):
-                        return request.formatted_response
-                    else:
-                        # Fallback for legacy compatibility
-                        return {"text": request.output}
-
+                return await self._dispatch_text(_build_generation_request(request))
             except HTTPException:
                 raise
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
-        @self.router.post("/v1/chat/completions")
-        async def chat_completions(request: ChatCompletionRequest):
-            """
-            OpenAI-compatible chat completions endpoint.
-            Maps OpenAI request into Tensorlink GenerationRequest.
-            """
+        @self.router.post("/v1/responses")
+        async def responses(request: AnyResponseRequest):
+            handlers = {
+                "text": self._handle_text_response,
+                "image": self._handle_image_response,
+                "embedding": self._handle_embedding_response,
+            }
+            handler = handlers.get(request.type)
+            if not handler:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unsupported response type: '{request.type}'",
+                )
             try:
-                if not request.messages:
-                    raise HTTPException(
-                        status_code=400, detail="messages cannot be empty"
-                    )
-
-                # Parse messages into system messages, history, and last user message
-                system_messages, history, last_user_message = _parse_chat_messages(
-                    request.messages
-                )
-
-                # Create GenerationRequest
-                gen_request = GenerationRequest(
-                    hf_name=request.model,
-                    message=last_user_message,
-                    history=history,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    max_new_tokens=request.max_tokens,
-                    stream=request.stream,
-                    input_format="chat",
-                    output_format="openai",
-                    do_sample=request.temperature > 0,
-                    is_chat_completion=True,
-                )
-
-                # Call generate endpoint
-                return await generate(gen_request)
-
+                return await handler(request)
             except HTTPException:
                 raise
             except Exception as e:
@@ -375,6 +339,47 @@ class TensorlinkAPI:
         async def get_worker_claims(node_address: str):
             """Get claim information for a specific worker node"""
             return self.smart_node.contract_manager.get_worker_claim_data(node_address)
+
+    async def _dispatch_text(self, gen_request: GenerationRequest):
+        start_time = time.time()
+        self._log_model_request(gen_request.hf_name)
+        gen_request.output = None
+        gen_request.id = hash(f"req_{random.random()}")
+
+        model_status = self._check_model_status(gen_request.hf_name)
+        if model_status["status"] == "not_loaded":
+            self._trigger_model_load(gen_request.hf_name)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
+            )
+        if model_status["status"] == "loading":
+            raise HTTPException(
+                status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
+            )
+
+        if gen_request.stream:
+            return StreamingResponse(
+                self._generate_stream(gen_request, str(gen_request.id), start_time),
+                media_type="text/event-stream",
+            )
+        gen_request = await self._wait_for_result(gen_request)
+        if getattr(gen_request, "formatted_response", None):
+            return gen_request.formatted_response
+        return {"text": gen_request.output}
+
+    async def _handle_text_response(self, request: TextResponseRequest):
+        return await self._dispatch_text(_build_generation_request(request))
+
+    async def _handle_image_response(self, request: ImageResponseRequest):
+        raise HTTPException(
+            status_code=501, detail="Image generation is not yet implemented."
+        )
+
+    async def _handle_embedding_response(self, request: EmbeddingResponseRequest):
+        raise HTTPException(
+            status_code=501, detail="Embeddings are not yet implemented."
+        )
 
     def _log_model_request(self, model_name: str):
         """Log and track model requests for prioritization"""

@@ -18,7 +18,10 @@ import gc
 import io
 import os
 
-from tensorlink.ml.injector import generate_new_forward_method, get_loop_io_signature
+from tensorlink.ml.utils.injector import (
+    generate_new_forward_method,
+    get_loop_io_signature,
+)
 from tensorlink.ml.optim import create_distributed_optimizer
 from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.utils.loading import (
@@ -875,8 +878,10 @@ class DistributedModel(nn.Module):
             module_info["expected_inputs"] = list(io_signature["all_inputs"])
             module_info["expected_outputs"] = list(io_signature["all_outputs"])
             module_info["loop_body_source"] = io_signature["loop_body_source"]
-            module_info["loop_iterator_name"] = io_signature["loop_iterator_name"]
-            module_info["module_path"] = io_signature["module_path"]
+            module_info["loop_structure"] = io_signature["loop_structure"]
+            module_info["module_path"] = module_info.get(
+                "module_path", module_info.get("parent_module_path")
+            )
 
             file_name = f"{module_id}_{worker_id}.pt"
             with open(file_name, "wb") as f:
@@ -993,10 +998,6 @@ class DistributedModel(nn.Module):
             except Exception as e:
                 logging.error(f"Failed to load tied host module {module_id}: {e}")
                 raise
-
-        # if hasattr(self.model, "tie_weights"):
-        #     logging.info("Re-tying weights after host module loading")
-        #     self.model.tie_weights()
 
     def _load_single_host_module(self, module_id: str, module_info: Dict[str, Any]):
         """

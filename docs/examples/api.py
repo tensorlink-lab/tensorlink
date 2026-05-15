@@ -7,25 +7,25 @@ import json
 
 
 SERVER_URL = "https://smartnodes.ddns.net/tensorlink-api"  # Use HTTP if HTTPS fails
-MODEL_NAME = "Qwen/Qwen3-8B"
+MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
 
 
 def generate():
     payload = {
         "hf_name": MODEL_NAME,
         "message": "Describe the role of AI in medicine.",
-        "max_length": 4096,
-        "max_new_tokens": 2048,
+        "max_length": 1048,
+        "max_new_tokens": 1048,
         "temperature": 0.7,
         "do_sample": True,
         "num_beams": 3,
         "history": [
-            {"role": "user", "content": "What is artificial intelligence?"},
-            {"role": "assistant", "content": "Artificial intelligence refers to..."},
+            {"role": "user", "content": "Hi!"},
+            {"role": "assistant", "content": "Hi"},
         ],
     }
 
-    response = requests.post(f"{SERVER_URL}/v1/generate", json=payload)
+    response = requests.post(f"{SERVER_URL}/v1/generate", json=payload, timeout=180)
     print(response.json())
 
 
@@ -69,11 +69,11 @@ def generate_stream():
 
 
 def request_model():
-    payload = {"hf_name": MODEL_NAME}
+    payload = {"hf_name": MODEL_NAME, "time": "18000"}
     response = requests.post(f"{SERVER_URL}/request-model", json=payload)
     print(response.json())
 
 
 if __name__ == "__main__":
-    request_model()
-    generate()
+    # request_model()
+    generate_stream()

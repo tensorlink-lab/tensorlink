@@ -67,27 +67,55 @@ class VariableUsageAnalyzer(ast.NodeVisitor):
 
 
 class LoopFinder(ast.NodeVisitor):
-    """Find the layer iteration loop"""
+    """
+    Find loops iterating over module layer containers.
+    """
+
+    LAYER_ATTRS = {
+        "layers",
+        "h",
+        "blocks",
+        "decoder_layers",
+        "encoder_layers",
+        "transformer_blocks",
+    }
 
     def __init__(self):
         self.loop_node = None
 
     def visit_For(self, node):
-        """Find loop that iterates over layers"""
-        # Look for patterns like: for ... in self.layers
-        if isinstance(node.iter, ast.Attribute):
-            if node.iter.attr in ['layers', 'h', 'blocks', 'decoder_layers']:
-                self.loop_node = node
-                return
-
-        # Look for: for ... in self.layers[:...]
-        if isinstance(node.iter, ast.Subscript):
-            if isinstance(node.iter.value, ast.Attribute):
-                if node.iter.value.attr in ['layers', 'h', 'blocks', 'decoder_layers']:
-                    self.loop_node = node
-                    return
+        if self._contains_layer_iteration(node.iter):
+            self.loop_node = node
+            return
 
         self.generic_visit(node)
+
+    def _contains_layer_iteration(self, node):
+        """
+        Recursively inspect iterator expression.
+        """
+
+        # self.layers
+        if isinstance(node, ast.Attribute):
+            return node.attr in self.LAYER_ATTRS
+
+        # self.layers[:...]
+        if isinstance(node, ast.Subscript):
+            return self._contains_layer_iteration(node.value)
+
+        # enumerate(self.layers), reversed(self.layers), list(self.layers), etc.
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if self._contains_layer_iteration(arg):
+                    return True
+
+        # tuple/list generators
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                if self._contains_layer_iteration(elt):
+                    return True
+
+        return False
 
 
 class LayerCallExtractor(ast.NodeVisitor):
@@ -160,24 +188,35 @@ class LayerGroupModule(torch.nn.Module):
     def __init__(
         self,
         layers: List[torch.nn.Module],
+        parent_module: torch.nn.Module,
         input_vars: List[str],
         output_vars: List[str],
         loop_body_source: str,
-        loop_iterator_name: str,
+        loop_structure: Dict,
         layer_offset: int = 0,
         debug: bool = True,
     ):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
+        self.parent_module = parent_module
         self.input_vars = input_vars
         self.output_vars = output_vars
-        self.loop_iterator_name = loop_iterator_name
+        self.loop_structure = loop_structure
         self.num_layers = len(layers)
         self.layer_offset = layer_offset  # global index of first layer in this group
         self.debug = debug
 
         # Generate the forward function from the loop body
         self.forward_func = self._generate_forward_from_loop(loop_body_source)
+
+    def __getattr__(self, name):
+        """
+        Fallback missing attributes to original parent module.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.parent_module, name)
 
     def _generate_forward_from_loop(
         self, loop_body_source: str, debug: bool = False
@@ -230,17 +269,44 @@ class LayerGroupModule(torch.nn.Module):
 
         func_lines.append("")
         func_lines.append("    # Process through layers")
-        func_lines.append(
-            f"    for _local_idx, {self.loop_iterator_name} in enumerate(self.layers):"
-        )
-        func_lines.append(
-            f"        layer_idx = _local_idx + self.layer_offset  # global layer index"
+
+        target_src = self.loop_structure["target_source"]
+        iter_src = self.loop_structure["iter_source"]
+
+        # Rewrite the layer container reference
+        iter_src = iter_src.replace(
+            "self.layers[: self.config.num_hidden_layers]", "self.layers"
         )
 
+        iter_src = iter_src.replace(
+            "self.layers[:self.config.num_hidden_layers]", "self.layers"
+        )
+
+        loop_header = f"    for {target_src} in {iter_src}:"
+        func_lines.append(loop_header)
+
+        # Inject global index helper if loop already has an index variable.
+        target_ast = ast.parse(target_src).body[0].value
+        index_var = None
+
+        if isinstance(target_ast, ast.Tuple):
+            if len(target_ast.elts) >= 1:
+                first = target_ast.elts[0]
+                if isinstance(first, ast.Name):
+                    index_var = first.id
+
+        if index_var:
+            func_lines.append(f"        layer_idx = {index_var} + self.layer_offset")
+
         if debug:
-            func_lines.append(
-                f"        print(f'[LayerGroupModule] Layer {{_local_idx}}/{{len(self.layers)}} (global {{layer_idx}})')"
-            )
+            if index_var:
+                func_lines.append(
+                    f"        print(f'[LayerGroupModule] Layer {{{index_var}}}/{{len(self.layers)}} (global {{layer_idx}})')"
+                )
+            else:
+                func_lines.append(
+                    f"        print(f'[LayerGroupModule] Processing layer')"
+                )
 
         # Add the original loop body (indented inside the for loop)
         loop_lines = loop_body_source.strip().split('\n')
@@ -692,7 +758,7 @@ def get_loop_io_signature(parent_module) -> Dict:
     - 'all_outputs': All variables that should be returned
     - 'layer_call_info': Information about the original layer call signature
     - 'loop_body_source': The exact source code of the loop body
-    - 'loop_iterator_name': Name of the loop iterator variable
+    - 'loop_structure': dict of the loop variables
     """
     # Find the module that contains the loop
     module_with_loop, loop_node, module_path = find_loop_in_module_hierarchy(
@@ -760,14 +826,14 @@ def get_loop_io_signature(parent_module) -> Dict:
 
     # Extract loop body source and iterator name
     loop_body_source = _extract_loop_body_source(loop_finder.loop_node, source)
-    loop_iterator_name = _extract_loop_iterator_name(loop_finder.loop_node)
+    loop_structure = _extract_loop_structure(loop_finder.loop_node)
 
     # Add all extracted info
     result = {
         **loop_vars,
         'layer_call_info': layer_call_info,
         'loop_body_source': loop_body_source,
-        'loop_iterator_name': loop_iterator_name,
+        'loop_structure': loop_structure,
         'module_with_loop': module_with_loop,
         'module_path': module_path,
     }
@@ -848,15 +914,15 @@ def _extract_loop_body_source(loop_node: ast.For, original_source: str) -> str:
     return ''
 
 
-def _extract_loop_iterator_name(loop_node: ast.For) -> str:
+def _extract_loop_structure(loop_node: ast.For) -> Dict:
     """
-    Extract the name of the loop iterator variable.
+    Extract the name of the original loop iterator variable.
     Example: for decoder_layer in self.layers: -> 'decoder_layer'
     """
-    if isinstance(loop_node.target, ast.Name):
-        return loop_node.target.id
-    else:
-        return ast.unparse(loop_node.target)
+    return {
+        "target_source": ast.unparse(loop_node.target),
+        "iter_source": ast.unparse(loop_node.iter),
+    }
 
 
 def find_loop_in_module_hierarchy(parent_module, max_depth=2):
