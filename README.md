@@ -28,12 +28,10 @@
 ## What is Tensorlink?
 
 Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across
-peer-to-peer networks. It enables you to easily distribute and remotely access models across devices, whether pooling
-your own hardware or tapping into public peer-to-peer resources.
-
-Whether you want to run LLMs exceeding local memory, deploy private inference infrastructure, build agentic workflows
-with on-demand compute, or conduct distributed training, Tensorlink handles the coordination. Hardware owners can also
-expose their GPUs as private API endpoints, or contribute resources to the public network and earn rewards.
+peer-to-peer networks. It enables you to easily distribute and remotely access models across devices through 
+PyTorch-facing wrappers or HTTP endpoints via your own hardware or by tapping into public peer-to-peer resources. 
+Hardware owners can leverage their own GPUs for private remote AI services or contribute resources to the public network 
+and earn rewards.
 
 ### Key Features
 

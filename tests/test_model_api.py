@@ -41,15 +41,15 @@ MODELS = [
         },
         id="tiny-gpt2",
     ),
-    # pytest.param(
-    #     {
-    #         "name": "HuggingFaceTB/SmolLM2-135M",
-    #         "timeout": 60,
-    #         "sleep": 15,
-    #         "parsed": True,
-    #     },
-    #     id="smollm2-135m",
-    # ),
+    pytest.param(
+        {
+            "name": "HuggingFaceTB/SmolLM2-135M",
+            "timeout": 60,
+            "sleep": 15,
+            "parsed": True,
+        },
+        id="smollm2-135m",
+    ),
 ]
 
 

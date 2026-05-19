@@ -83,7 +83,7 @@ Contribute your GPU to the public network and earn token rewards for processing 
     "mining": false,
     "mining_script": "path/to/mining.executable",
     "seed_validators": [
-      ["tensorlink.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2e"]
+      ["tensorlink.ddns.net", 38752, "58ef79797cd451e19df4a73fbd9871797f9c6a2e"]
     ]
   },
   "ml": {
@@ -158,7 +158,7 @@ from tensorlink.nodes import User, UserConfig
 
 node = User(
     UserConfig(
-        priority_nodes=[["192.168.1.100", 38751]]  # Your validator IP/port
+        priority_nodes=[["192.168.1.100", 38752]]  # Your validator IP/port
     )
 )
 
@@ -206,7 +206,7 @@ model = DistributedModel(
 
 ```
 Device 1 (192.168.1.100)
-  ├── Validator Node :38751  (API endpoint)
+  ├── Validator Node :38752  (API endpoint)
   └── Worker Node   :38752  (24GB VRAM)
 ```
 
@@ -215,7 +215,7 @@ Simplest setup. One device runs both roles, exposing an API endpoint while execu
 **Private LAN Cluster**
 
 ```
-Validator (192.168.1.100:38751)
+Validator (192.168.1.100:38752)
     ├── Worker 1 (192.168.1.100:38752)  24GB VRAM
     ├── Worker 2 (192.168.1.101:38753)  12GB VRAM
     └── Worker 3 (192.168.1.102:38754)  24GB VRAM

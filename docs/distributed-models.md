@@ -144,7 +144,7 @@ from custom_model import CustomModel
 
 node = User(
     UserConfig(
-        priority_nodes=[["192.168.2.42", 38751]]
+        priority_nodes=[["192.168.2.42", 38752]]
     )
 )
 

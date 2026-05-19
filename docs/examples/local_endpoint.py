@@ -5,12 +5,11 @@ the model via API, then chats via /v1/chat/completions.
 """
 
 import requests
-import logging
 import time
 from contextlib import contextmanager
 from tensorlink.nodes import Worker, Validator, WorkerConfig, ValidatorConfig
 
-from helpers import chat_loop
+from helpers import chat_loop, request_model
 
 
 # Model config
@@ -78,17 +77,6 @@ def spawn_nodes():
         _validator.cleanup()
 
 
-def request_model():
-    """Request model to be loaded on the local network via API."""
-    response = requests.post(
-        url=f"{SERVER_URL}/request-model",
-        json={"hf_name": MODEL_NAME, "model_type": "causal", "time": 300},
-        timeout=30,
-    )
-    assert response.status_code == 200
-    time.sleep(10)
-
-
 def generate(history: list) -> str:
     """Use tensorlink chat endpoint for inference."""
     messages = [SYSTEM_PROMPT] + history
@@ -108,8 +96,7 @@ def generate(history: list) -> str:
 if __name__ == "__main__":
     try:
         with spawn_nodes() as (workers, validator):
-            request_model()
-            # time.sleep(1000)
+            request_model(SERVER_URL, MODEL_NAME)
             chat_loop(generate)
 
     except KeyboardInterrupt:

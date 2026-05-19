@@ -62,7 +62,7 @@ Open `config.json` and set your wallet address. Everything else can stay as-is f
     "mining": false,
     "mining_script": "path/to/mining.executable",
     "seed_validators": [
-      ["tensorlink.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
+      ["tensorlink.ddns.net", 38752, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
     ]
   },
   "ml": {
@@ -113,7 +113,7 @@ Below are some common issues:
 CUDA drivers are not installed. Follow the [NVIDIA CUDA installation guide](https://developer.nvidia.com/cuda-downloads) for your operating system.
 
 **Node fails to connect**
-Check that your internet connection is stable and ensure no firewall is blocking outbound traffic on port `38751`.
+Check that your internet connection is stable and ensure no firewall is blocking outbound traffic on port `38752`.
 
 **Out of memory errors**
 Reduce `max_vram_gb` in `config.json` to leave additional headroom for system processes.

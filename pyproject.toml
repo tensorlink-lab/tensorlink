@@ -1,9 +1,9 @@
 [tool.poetry]
 name = "tensorlink"
-version = "0.3.0-rc.1"
+version = "0.3.0"
 description = "Tensorlink is a decentralized Python library for distributed PyTorch models, providing easy Hugging Face API access and enabling users to share compute resources across a global network."
 authors = [
-    "Smartnodes Lab <smartnodes-lab@proton.me>",
+    "Tensorlink Lab <smartnodes-lab@proton.me>",
     "Matthew Hawken",
     "Nikita Vassilyev"
 ]
@@ -26,29 +26,24 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.10"
-cryptography = "^45.0.3"
-fastapi = "0.115.11"
-graphviz = "0.20.3"
-matplotlib = "3.9.2"
-miniupnpc = "2.2.8"
-multiprocess = "0.70.16"
-networkx = "3.2.1"
-psutil = "7.0.0"
-pydantic = "2.9.2"
-pydantic-core = "2.23.4"
-python-dotenv = "1.0.1"
-regex = "2024.9.11"
-requests = "2.32.4"
-safetensors = "0.4.5"
-tokenizers = "^0.21.1"
-torch = "^2.7.0"
-torchviz = "0.0.2"
-tqdm = "4.66.5"
-transformers = "^4.52.4"
-uvicorn = "0.34.0"
-web3 = "7.3.0"
-huggingface-hub = "^0.32.3"
-accelerate = "^1.12.0"
+cryptography = "^45"
+fastapi = "^0.115"
+uvicorn = "^0.34"
+web3 = "^7.3"
+miniupnpc = "^2.2"
+psutil = "^7"
+requests = "^2.32"
+python-dotenv = "^1.0"
+tqdm = "^4.66"
+torch = "^2.7"
+transformers = "^5.5.3"
+accelerate = "^1.12"
+matplotlib = "^3.9"
+networkx = "^3.2"
+graphviz = "^0.20"
+torchviz = "^0.0.2"
+multiprocess = "^0.70"
+pydantic = "^2.9"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

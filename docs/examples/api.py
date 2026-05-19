@@ -6,39 +6,55 @@ import requests
 import json
 
 
-SERVER_URL = "https://smartnodes.ddns.net/tensorlink-api"  # Use HTTP if HTTPS fails
-MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
+SERVER_URL = "https://tensorlink.ddns.net/tensorlink"  # Use HTTP if HTTPS fails
+MODEL_NAME = "Qwen/Qwen3-14B"
 
 
-def generate():
+def chat_completion():
     payload = {
-        "hf_name": MODEL_NAME,
-        "message": "Describe the role of AI in medicine.",
-        "max_length": 1048,
-        "max_new_tokens": 1048,
-        "temperature": 0.7,
-        "do_sample": True,
-        "num_beams": 3,
-        "history": [
-            {"role": "user", "content": "Hi!"},
-            {"role": "assistant", "content": "Hi"},
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant.",
+            },
+            {
+                "role": "user",
+                "content": "Explain distributed inference in one sentence.",
+            },
         ],
+        "max_tokens": 128,
+        "temperature": 0.7,
+        "stream": False,
     }
 
-    response = requests.post(f"{SERVER_URL}/v1/generate", json=payload, timeout=180)
-    print(response.json())
+    response = requests.post(
+        f"{SERVER_URL}/v1/chat/completions",
+        json=payload,
+        timeout=120,
+    )
+
+    result = response.json()
+
+    print(json.dumps(result, indent=2))
 
 
-def generate_stream():
+def chat_completion_stream():
     payload = {
-        "hf_name": MODEL_NAME,
-        "message": "Hello!",
-        "max_new_tokens": 32,
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Count from one to five.",
+            }
+        ],
+        "max_tokens": 32,
+        "temperature": 0.1,
         "stream": True,
     }
 
     response = requests.post(
-        f"{SERVER_URL}/v1/generate",
+        f"{SERVER_URL}/v1/chat/completions",
         json=payload,
         stream=True,
         timeout=120,
@@ -51,15 +67,19 @@ def generate_stream():
             continue
 
         decoded = line.decode("utf-8")
+
         if not decoded.startswith("data: "):
             continue
 
         data = decoded[6:]
+
         if data == "[DONE]":
             break
 
         chunk = json.loads(data)
-        token = chunk["choices"][0]["delta"].get("content")
+
+        delta = chunk["choices"][0].get("delta", {})
+        token = delta.get("content")
 
         if token:
             full_text += token
@@ -68,12 +88,40 @@ def generate_stream():
     print("\n\nDone.")
 
 
-def request_model():
-    payload = {"hf_name": MODEL_NAME, "time": "18000"}
-    response = requests.post(f"{SERVER_URL}/request-model", json=payload)
-    print(response.json())
+def responses_text():
+    payload = {
+        "model": MODEL_NAME,
+        "type": "text",
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 2 + 2?",
+            }
+        ],
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "stream": False,
+    }
+
+    response = requests.post(
+        f"{SERVER_URL}/v1/responses",
+        json=payload,
+        timeout=120,
+    )
+
+    result = response.json()
+
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
-    # request_model()
-    generate_stream()
+    # request_model(SERVER_URL, MODEL_NAME)
+
+    # Non-streaming
+    chat_completion()
+
+    # Streaming
+    chat_completion_stream()
+
+    # Responses API
+    responses_text()
