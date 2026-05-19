@@ -20,7 +20,7 @@ network. If you wish to connect to private infrastructure, you will manually hav
 
 | Parameter | Type | Default | Description                                                                                             |
 |-----------|------|---------|---------------------------------------------------------------------------------------------------------|
-| `model` | `str \| nn.Module` | — | Hugging Face model name, a PyTorch module instance, or a path to model weights                          |
+| `model` | `str \| nn.Module` | - | Hugging Face model name, a PyTorch module instance, or a path to model weights                          |
 | `training` | `bool` | `False` | When `True`, enables gradient synchronization and distributed optimizer creation.                       |
 | `device` | `str` | `"cuda"` | Target device for worker execution. Workers without compatible hardware are filtered automatically      |
 | `trusted` | `bool` | `False` | Required for custom user-supplied architectures. Workers must also have `trusted: true` in their config |
@@ -123,8 +123,8 @@ model.save_pretrained("./fine-tuned-model")
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `optimizer_type` | `str` | `"adamw"` | Optimizer algorithm: `"adam"`, `"adamw"`, or `"sgd"`. AdamW is recommended for most LLM fine-tuning |
-| `lr` | `float` | — | Learning rate |
-| `weight_decay` | `float` | — | Weight decay (L2 regularization) |
+| `lr` | `float` | - | Learning rate |
+| `weight_decay` | `float` | - | Weight decay (L2 regularization) |
 | `**kwargs` | | | Any additional arguments are passed through to the underlying PyTorch optimizer |
 
 > **Performance tip:** Low-shot fine-tuning (few epochs, small datasets) is significantly more practical than 

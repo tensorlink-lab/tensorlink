@@ -93,8 +93,8 @@ print(response.json()["choices"][0]["message"]["content"])
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | — | Hugging Face model identifier |
-| `messages` | array | — | Chat message list (`role`, `content`) |
+| `model` | string | - | Hugging Face model identifier |
+| `messages` | array | - | Chat message list (`role`, `content`) |
 | `max_tokens` | int | 1024 | Maximum tokens to generate |
 | `temperature` | float | 0.7 | Sampling temperature |
 | `top_p` | float | 1.0 | Nucleus sampling probability |
@@ -131,7 +131,7 @@ response = requests.post(
 print(response.json()["choices"][0]["message"]["content"])
 ```
 
-### Image *(type: "image") — coming soon*
+### Image *(type: "image") - coming soon*
 
 ```python
 {
@@ -145,7 +145,7 @@ print(response.json()["choices"][0]["message"]["content"])
 }
 ```
 
-### Embeddings *(type: "embedding") — coming soon*
+### Embeddings *(type: "embedding") - coming soon*
 
 ```python
 {
@@ -187,4 +187,4 @@ requests.post(
 
 Possible `status` values: `"loaded"`, `"loading"`, `"requested"`, `"error"`.
 
-> If you send an inference request to a model that isn't loaded yet, the API will automatically trigger loading and return a `503` — retry after a short delay.
+> If you send an inference request to a model that isn't loaded yet, the API will automatically trigger loading and return a `503` - retry after a short delay.

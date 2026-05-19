@@ -10,7 +10,8 @@ Nodes are for when you want to **contribute compute or control your own infrastr
 - Expose your hardware as a private API endpoint for external applications
 - Run custom models that require trusted execution environments
 
-> **Just want to contribute your GPU to the public network?** Skip ahead to the [Worker Quick Start Guide](worker-quickstart.md) — you'll be up and running in minutes.
+> **Just want to contribute your GPU to the public network?** Skip ahead to the 
+> [Worker Quick Start Guide](worker-quickstart.md), and you'll be up and running in minutes.
 
 Public nodes communicate through a peer-to-peer network secured by smart contracts, enabling rewards and payments for GPU resources.
 
@@ -20,7 +21,7 @@ Public nodes communicate through a peer-to-peer network secured by smart contrac
 
 Tensorlink separates computational responsibilities into three distinct node types.
 
-**Workers**
+### Workers
 
 Worker nodes execute the actual model operations on GPU hardware. They handle tensor computations, gradient calculations, and model weight storage, receiving job assignments from validators.
 
@@ -29,7 +30,7 @@ Worker nodes execute the actual model operations on GPU hardware. They handle te
 - Compute gradients during distributed training
 - Process inference requests from user nodes
 
-**Validators**
+### Validators
 
 Validator nodes coordinate distributed jobs, route API requests, and manage network topology. They determine optimal model sharding strategies and worker assignments, and optionally expose HTTP endpoints for external access.
 
@@ -38,9 +39,9 @@ Validator nodes coordinate distributed jobs, route API requests, and manage netw
 - Expose HTTP API endpoints (optional)
 - Validate job authenticity and manage network security
 
-**Users**
+### Users
 
-User nodes request jobs and communicate with workers via `DistributedModel`. They are spawned automatically inside `DistributedModel.__init__` — no manual setup required for client use.
+User nodes request jobs and communicate with workers via `DistributedModel`. They are spawned automatically inside `DistributedModel.__init__` - no manual setup required for client use.
 
 ---
 
@@ -55,7 +56,7 @@ To run dedicated worker or validator nodes, download the latest node software fr
 
 **System Requirements:**
 
-- UNIX-based OS (Linux, macOS) — Windows via WSL
+- UNIX-based OS (Linux, macOS) - Windows via WSL
 - Python 3.10+ (required for worker nodes)
 - CUDA-compatible GPU (recommended for workers)
 - Stable internet connection
@@ -239,18 +240,16 @@ Validator connects to both private local workers and the public network, allowin
 
 ## Security Best Practices
 
-🔒 **Never enable `trusted: true` on public nodes.** This allows arbitrary code execution. Only enable it on infrastructure you fully control. Public workers should always use `trusted: false`.
+**Never enable `trusted: true` on public nodes.** This allows arbitrary code execution. Only enable it on infrastructure you fully control. Public workers should always use `trusted: false`.
 
-🛡️ **Firewall private endpoints.** Binding to `0.0.0.0` exposes the API on all network interfaces — use firewall rules to restrict access to trusted IP ranges.
+**Firewall private endpoints.** Binding to `0.0.0.0` exposes the API on all network interfaces - use firewall rules to restrict access to trusted IP ranges.
 
-🔐 **Protect your wallet keys.** `config.json` only requires your public wallet address for reward distribution. Never share your private keys.
-
-📊 **Set `max_vram_gb` appropriately.** This prevents workers from accepting jobs that exceed available GPU memory, avoiding OOM errors during peak usage.
+**Protect your wallet keys.** `config.json` only requires your public wallet address for reward distribution. Never share your private keys.
 
 ---
 
 ## Next Steps
 
-- [Worker Quick Start Guide](worker-quickstart.md) — contribute GPU resources in minutes
+- [Worker Quick Start Guide](worker-quickstart.md) - contribute GPU resources to the public in minutes
 - Download the latest node software from GitHub releases
 - Join the Discord community for help with node setup and configuration
