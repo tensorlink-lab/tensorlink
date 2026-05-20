@@ -1,4 +1,4 @@
-from tensorlink.ml.utils import get_gpu_memory
+from tensorlink.ml.utils.utils import get_gpu_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
 from tensorlink.nodes.keeper import Keeper

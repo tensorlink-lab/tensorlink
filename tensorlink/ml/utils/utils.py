@@ -1,6 +1,7 @@
 import importlib
 import json
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from typing import Dict
 import time
 import os
@@ -8,20 +9,25 @@ from safetensors.torch import save as st_save_bytes, load as st_load_bytes
 import psutil
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights
+from dataclasses import is_dataclass, asdict
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
-    AutoModelForSeq2SeqLM,
-    AutoModelForSpeechSeq2Seq,
-)
 
 
 MODELS_CACHE_PATH = "logs/models.json"
+DTYPE_STR_MAP = {
+    torch.float32: "float32",
+    torch.float64: "float64",
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.int64: "int64",
+    torch.int32: "int32",
+    torch.int16: "int16",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
+    torch.bool: "bool",
+}
+DTYPE_OBJ_MAP = {v: k for k, v in DTYPE_STR_MAP.items()}
 
 
 def format_memory_size(number: int) -> str:
@@ -124,7 +130,7 @@ def estimate_memory(
     return total, breakdown
 
 
-def get_gpu_memory(max_vram_gb: float | None = None):
+def get_gpu_memory(max_vram_gb: float | None = None) -> int:
     """
     Returns available memory in bytes.
     - Uses total free CUDA VRAM if available.
@@ -194,194 +200,357 @@ def access_module(module: nn.Module, indices: list):
     return current_module, module_name
 
 
-def detach_tensor(obj, clone: bool = False):
-    """
-    Recursively detach tensors (and optionally clone them) from GPU to CPU.
-    Supports Tensor, DynamicCache, ModelOutput, list, tuple, and dict.
-    """
-    # Case 1: torch.Tensor
-    if isinstance(obj, torch.Tensor):
-        t = obj.detach().cpu()
-        if clone:
-            t = t.clone()
-        return t
-
-    # Case 2: DynamicCache
-    elif isinstance(obj, DynamicCache):
-        new_cache = DynamicCache()
-        new_cache.key_cache = [
-            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
-            for t in obj.key_cache
-        ]
-        new_cache.value_cache = [
-            detach_tensor(t, clone=clone) if isinstance(t, torch.Tensor) else t
-            for t in obj.value_cache
-        ]
-        new_cache._seen_tokens = obj._seen_tokens
-        return new_cache
-
-    # Case 3: ModelOutput (transformers container)
-    elif isinstance(obj, ModelOutput):
-        new_out = obj.__class__()
-        for key, value in obj.items():
-            if isinstance(
-                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-            ):
-                new_out[key] = detach_tensor(value, clone=clone)
-            else:
-                new_out[key] = value
-        return new_out
-
-    # Case 4: list or tuple
-    elif isinstance(obj, (list, tuple)):
-        new_seq = [
-            (
-                detach_tensor(v, clone=clone)
-                if isinstance(
-                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-                )
-                else v
-            )
-            for v in obj
-        ]
-        return type(obj)(new_seq)
-
-    # Case 5: dictionary
-    elif isinstance(obj, dict):
-        return {
-            k: (
-                detach_tensor(v, clone=clone)
-                if isinstance(
-                    v, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-                )
-                else v
-            )
-            for k, v in obj.items()
-        }
-
-    else:
-        raise TypeError(f"Unsupported input type: {type(obj)}")
-
-
-def attach_tensor(tensor, device):
-    # Case 1: DynamicCache
-    if isinstance(tensor, DynamicCache):
-        tensor.key_cache = [
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
-            for t in tensor.key_cache
-        ]
-        tensor.value_cache = [
-            attach_tensor(t, device) if isinstance(t, torch.Tensor) else t
-            for t in tensor.value_cache
-        ]
-        return tensor
-
-    # Case 2: torch.Tensor
-    elif isinstance(tensor, torch.Tensor):
-        return tensor.to(device)
-
-    # Case 3: ModelOutput
-    elif isinstance(tensor, ModelOutput):
-        for key, value in tensor.items():
-            if isinstance(
-                value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-            ):
-                tensor[key] = attach_tensor(value, device)
-        return tensor
-
-    # Case 4: list or tuple
-    elif isinstance(tensor, (list, tuple)):
-        return type(tensor)(
-            (
-                attach_tensor(t, device)
-                if isinstance(
-                    t, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-                )
-                else t
-            )
-            for t in tensor
-        )
-
-    # Case 5: dict
-    elif isinstance(tensor, dict):
-        return {
-            key: (
-                attach_tensor(value, device)
-                if isinstance(
-                    value, (torch.Tensor, DynamicCache, ModelOutput, list, tuple, dict)
-                )
-                else value
-            )
-            for key, value in tensor.items()
-        }
-
-    elif hasattr(tensor, "to"):
-        return tensor.to(device)
-
-    else:
-        raise TypeError(f"Unsupported input type: {type(tensor)}")
-
-
-def enable_grad(tensor):
-    """
-    Enables gradient computation on floating-point Tensors within nested structures.
-    """
-    if isinstance(tensor, torch.Tensor):
-        # Enable grad if the tensor is a floating-point type
-        if tensor.is_floating_point():
-            return tensor.detach().clone().requires_grad_(True)
-        return tensor
-
-    elif isinstance(tensor, ModelOutput):
-        # Iterate through ModelOutput fields, enabling grad for any Tensors
-        for key in tensor.__dataclass_fields__:
-            value = getattr(tensor, key)
-            if isinstance(value, torch.Tensor) and value.is_floating_point():
-                tensor[key] = value.detach().clone().requires_grad_(True)
-        return tensor
-
-    elif isinstance(tensor, (list, tuple)):
-        # Recursively apply to each element in lists or tuples
-        return type(tensor)(enable_grad(t) for t in tensor)
-
-    elif isinstance(tensor, dict):
-        # Recursively apply to each item in dictionaries
-        return {key: enable_grad(value) for key, value in tensor.items()}
-
-    else:
-        return tensor
-
-
 def handle_output(tensor):
     """
-    Handle various output types from models, convert to their raw tensor form:
-    - Check for specific attributes like `logits` and `last_hidden_state`.
-    - If output is a tuple, return the first element (assumed to be the main output tensor).
-    - If output is a dictionary, check common keys or return the first tensor found.
-    - If it's already a tensor, return as-is.
+    Extract the primary tensor from a model output for backward pass storage
+    and intermediate tracking ONLY. Do NOT use this to preprocess forward inputs.
+
+    Returns the logits/last_hidden_state tensor, or the input unchanged if it's
+    already a plain tensor or tuple of tensors.
     """
-    if hasattr(tensor, "logits"):
-        return tensor.logits
-    elif hasattr(tensor, "last_hidden_state"):
-        return tensor.last_hidden_state
-    elif isinstance(tensor, (tuple, list)):
-        if len(tensor) == 1:
-            return tensor[0] if isinstance(tensor[0], torch.Tensor) else tensor
-        elif len(tensor) > 1:
-            return type(tensor)(t for t in tensor if isinstance(t, torch.Tensor))
+    if isinstance(tensor, torch.Tensor):
         return tensor
-    elif isinstance(tensor, dict):
-        # Look for common keys like 'logits' or 'last_hidden_state'
+
+    # ModelOutput: return logits or last_hidden_state for grad tracking
+    if isinstance(tensor, ModelOutput):
+        if hasattr(tensor, "logits") and isinstance(tensor.logits, torch.Tensor):
+            return tensor.logits
+        if hasattr(tensor, "last_hidden_state") and isinstance(
+            tensor.last_hidden_state, torch.Tensor
+        ):
+            return tensor.last_hidden_state
+        # Fallback: first tensor field
+        for v in tensor.values():
+            if isinstance(v, torch.Tensor):
+                return v
+
+    # Tuple/list: only unwrap if single-element containing a tensor
+    # Do NOT flatten multi-element tuples — they may be (input_ids, attention_mask, ...)
+    if isinstance(tensor, (tuple, list)):
+        tensors = [t for t in tensor if isinstance(t, torch.Tensor)]
+        if len(tensors) == 1:
+            return tensors[0]
+        return type(tensor)(tensors) if tensors else tensor
+
+    if isinstance(tensor, dict):
         for key in ["logits", "last_hidden_state"]:
             if key in tensor and isinstance(tensor[key], torch.Tensor):
                 return tensor[key]
-        # Fallback to first tensor found in dict
-        for value in tensor.values():
-            if isinstance(value, torch.Tensor):
-                return value
-    elif isinstance(tensor, torch.Tensor):
-        return tensor
-    raise ValueError("Unsupported output format: could not find a tensor.")
+        for v in tensor.values():
+            if isinstance(v, torch.Tensor):
+                return v
+
+    raise ValueError(f"handle_output: unsupported type {type(tensor)}")
+
+
+def detach_tensor(obj, clone: bool = False):
+    """
+    Recursively detach (and optionally clone) all tensors to CPU.
+    Preserves structure: ModelOutput, DynamicCache, tuple, list, dict.
+    Passes unsupported types through unchanged.
+    """
+    if isinstance(obj, torch.Tensor):
+        t = obj.detach().cpu()
+        return t.clone() if clone else t
+
+    if isinstance(obj, DynamicCache):
+        keys, vals = _get_cache_kv(obj)
+        new_cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(keys, vals)):
+            if k is not None and v is not None:
+                new_cache.update(
+                    detach_tensor(k, clone=clone),
+                    detach_tensor(v, clone=clone),
+                    i,
+                )
+        return new_cache
+
+    if isinstance(obj, ModelOutput):
+        return obj.__class__(
+            **{
+                k: detach_tensor(v, clone=clone) if v is not None else v
+                for k, v in obj.items()
+            }
+        )
+
+    if isinstance(obj, (list, tuple)):
+        result = [detach_tensor(v, clone=clone) for v in obj]
+        return type(obj)(result)
+
+    if isinstance(obj, dict):
+        return {k: detach_tensor(v, clone=clone) for k, v in obj.items()}
+
+    # Primitives, None, etc. are passed through
+    return obj
+
+
+def attach_tensor(obj, device):
+    """
+    Recursively move all tensors to device.
+    Preserves structure: ModelOutput, DynamicCache, tuple, list, dict.
+    Passes unsupported types through unchanged.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+
+    if isinstance(obj, DynamicCache):
+        keys, vals = _get_cache_kv(obj)
+        new_cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(keys, vals)):
+            if k is not None and v is not None:
+                new_cache.update(k.to(device), v.to(device), i)
+        return new_cache
+
+    if isinstance(obj, ModelOutput):
+        return obj.__class__(
+            **{
+                k: attach_tensor(v, device) if v is not None else v
+                for k, v in obj.items()
+            }
+        )
+
+    if isinstance(obj, (list, tuple)):
+        result = [attach_tensor(v, device) for v in obj]
+        return type(obj)(result)
+
+    if isinstance(obj, dict):
+        return {k: attach_tensor(v, device) for k, v in obj.items()}
+
+    # Primitives, None, etc. are passed through
+    return obj
+
+
+def enable_grad(obj):
+    """
+    Enable gradients on floating-point tensors within any supported structure.
+    Integer/bool tensors are passed through unchanged (they can't have grads).
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.is_floating_point():
+            return obj.detach().clone().requires_grad_(True)
+        return obj  # int/bool tensors: no grad, no error
+
+    if isinstance(obj, ModelOutput):
+        return obj.__class__(
+            **{k: enable_grad(v) if v is not None else v for k, v in obj.items()}
+        )
+
+    if isinstance(obj, DynamicCache):
+        keys, vals = _get_cache_kv(obj)
+        new_cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(keys, vals)):
+            if k is not None and v is not None:
+                new_cache.update(enable_grad(k), enable_grad(v), i)
+        return new_cache
+
+    if isinstance(obj, (list, tuple)):
+        result = [enable_grad(v) for v in obj]
+        return type(obj)(result)
+
+    if isinstance(obj, dict):
+        return {k: enable_grad(v) for k, v in obj.items()}
+
+    return obj
+
+
+def tensor_to_bytes(obj):
+    """
+    Safe serialization: safetensors for tensors, JSON for structure.
+    No pickle, no arbitrary code execution.
+
+    Supports:
+    - torch.Tensor
+    - HF ModelOutput
+    - dataclasses
+    - dict/list/tuple
+    - DynamicCache
+    - custom classes with __dict__
+    """
+
+    tensor_map = {}
+    counter = [0]
+
+    def _extract_tensors(o):
+        # Tensors
+        if isinstance(o, torch.Tensor):
+            key = f"__tensor_{counter[0]}__"
+            counter[0] += 1
+            tensor_map[key] = o.detach().cpu().contiguous().clone()
+            return {
+                "__tensor_ref__": key,
+                "dtype": DTYPE_STR_MAP[o.dtype],
+                "shape": list(o.shape),
+                "requires_grad": o.requires_grad,
+            }
+
+        # HF model outputs
+        elif isinstance(o, ModelOutput):
+            return {
+                "__hf_model_output__": True,
+                "module": o.__class__.__module__,
+                "class": o.__class__.__name__,
+                "data": _extract_tensors(dict(o)),
+            }
+
+        # HF DynamicCache
+        elif isinstance(o, DynamicCache):
+            keys, vals = _get_cache_kv(o)
+            populated = [
+                (i, k, v)
+                for i, (k, v) in enumerate(zip(keys, vals))
+                if k is not None and v is not None
+            ]
+            seen = o.get_seq_length() if hasattr(o, "get_seq_length") else 0
+
+            return {
+                "__dynamic_cache__": True,
+                "key_cache": _extract_tensors([k for _, k, _ in populated]),
+                "value_cache": _extract_tensors([v for _, _, v in populated]),
+                "layer_indices": [i for i, _, _ in populated],
+                "_seen_tokens": seen,
+            }
+
+        # Dataclasses
+        elif is_dataclass(o):
+            return {
+                "__dataclass__": True,
+                "module": o.__class__.__module__,
+                "class": o.__class__.__name__,
+                "data": _extract_tensors(asdict(o)),
+            }
+
+        # Custom classes
+        elif hasattr(o, "__dict__"):
+            return {
+                "__custom_object__": True,
+                "module": o.__class__.__module__,
+                "class": o.__class__.__name__,
+                "data": _extract_tensors(o.__dict__),
+            }
+
+        # dicts
+        elif isinstance(o, dict):
+            return {k: _extract_tensors(v) for k, v in o.items()}
+
+        # List/tuple
+        elif isinstance(o, (list, tuple)):
+            result = [_extract_tensors(v) for v in o]
+            if isinstance(o, tuple):
+                return {
+                    "__tuple__": True,
+                    "data": result,
+                }
+            return result
+
+        # Primitives
+        elif isinstance(o, (int, float, bool, str, type(None))):
+            return o
+
+        raise TypeError(f"Unsupported serialization type: {type(o)}")
+
+    structure = _extract_tensors(obj)
+    structure_bytes = json.dumps(structure).encode("utf-8")
+
+    # Pack: 4-byte length prefix for structure, then safetensors blob
+    if tensor_map:
+        tensor_bytes = st_save_bytes(tensor_map)
+    else:
+        tensor_bytes = b""
+
+    structure_len = len(structure_bytes).to_bytes(4, "big")
+    return structure_len + structure_bytes + tensor_bytes
+
+
+def bytes_to_tensor(data: bytes):
+    """
+    Safe deserialization matching tensor_to_bytes.
+    """
+    structure_len = int.from_bytes(data[:4], "big")
+    structure_bytes = data[4 : 4 + structure_len]
+    tensor_bytes = data[4 + structure_len :]
+
+    structure = json.loads(structure_bytes.decode("utf-8"))
+
+    tensor_map = {}
+
+    if tensor_bytes:
+        tensor_map = st_load_bytes(tensor_bytes)
+
+    def _restore(o):
+        # Lists
+        if isinstance(o, list):
+            return [_restore(v) for v in o]
+
+        # Dicts & other objects
+        elif isinstance(o, dict):
+            # Tensors
+            if "__tensor_ref__" in o:
+                t = tensor_map[o["__tensor_ref__"]]
+                dtype_str = o["dtype"]
+                if dtype_str not in DTYPE_OBJ_MAP:
+                    raise ValueError(f"Unsupported dtype: {dtype_str}")
+                t = t.to(dtype=DTYPE_OBJ_MAP[dtype_str])
+                t.requires_grad_(o.get("requires_grad", False))
+                return t
+
+            # Tuple
+            elif o.get("__tuple__"):
+
+                return tuple(_restore(v) for v in o["data"])
+
+            # HF model output
+            elif o.get("__hf_model_output__"):
+                module = importlib.import_module(o["module"])
+                cls = getattr(module, o["class"])
+                restored_data = _restore(o["data"])
+                return cls(**restored_data)
+
+            # Dyncamic Cache
+            elif o.get("__dynamic_cache__"):
+                cache = DynamicCache()
+                key_layers = _restore(o["key_cache"])
+                val_layers = _restore(o["value_cache"])
+                layer_indices = o.get("layer_indices", list(range(len(key_layers))))
+
+                for layer_idx, k, v in zip(
+                    layer_indices,
+                    key_layers,
+                    val_layers,
+                ):
+                    if k is not None and v is not None:
+                        cache.update(
+                            k,
+                            v,
+                            layer_idx,
+                        )
+
+                return cache
+
+            # Dataclass
+            elif o.get("__dataclass__"):
+                module = importlib.import_module(o["module"])
+                cls = getattr(module, o["class"])
+                restored_data = _restore(o["data"])
+
+                return cls(**restored_data)
+
+            # Custom classes
+            elif o.get("__custom_object__"):
+                module = importlib.import_module(o["module"])
+
+                cls = getattr(module, o["class"])
+
+                restored_data = _restore(o["data"])
+                obj = cls.__new__(cls)
+                obj.__dict__.update(restored_data)
+
+                return obj
+
+            return {k: _restore(v) for k, v in o.items()}
+
+        return o
+
+    return _restore(structure)
 
 
 def replace_output_with_custom_grad(combined_output, custom_grad_output):
@@ -566,100 +735,6 @@ def get_batch_size(inputs):
         raise ValueError("Unsupported input type")
 
 
-def tensor_to_bytes(obj):
-    """
-    Safe serialization: safetensors for tensors, JSON for structure.
-    No pickle, no arbitrary code execution.
-    """
-    # Flatten the object into a tensor map + structure skeleton
-    tensor_map = {}
-    counter = [0]
-
-    def _extract_tensors(o):
-        """Replace tensors with placeholder keys, collect into tensor_map"""
-        if isinstance(o, torch.Tensor):
-            key = f"__tensor_{counter[0]}__"
-            counter[0] += 1
-            # safetensors requires contiguous float tensors on CPU
-            tensor_map[key] = o.detach().cpu().contiguous().clone()
-            return {
-                "__tensor_ref__": key,
-                "dtype": str(o.dtype),
-                "shape": list(o.shape),
-            }
-        elif isinstance(o, dict):
-            return {k: _extract_tensors(v) for k, v in o.items()}
-        elif isinstance(o, (list, tuple)):
-            result = [_extract_tensors(v) for v in o]
-            return (
-                {"__tuple__": True, "data": result} if isinstance(o, tuple) else result
-            )
-        elif isinstance(o, (int, float, bool, str, type(None))):
-            return o
-        elif hasattr(o, '__class__') and o.__class__.__name__ == 'DynamicCache':
-            # Serialize DynamicCache as its key/value tensor lists
-            return {
-                "__dynamic_cache__": True,
-                "key_cache": _extract_tensors(o.key_cache),
-                "value_cache": _extract_tensors(o.value_cache),
-            }
-        else:
-            return None  # drop unserializable objects safely
-
-    structure = _extract_tensors(obj)
-    structure_bytes = json.dumps(structure).encode("utf-8")
-
-    # Pack: 4-byte length prefix for structure, then safetensors blob
-    if tensor_map:
-        tensor_bytes = st_save_bytes(tensor_map)
-    else:
-        tensor_bytes = b""
-
-    structure_len = len(structure_bytes).to_bytes(4, "big")
-    return structure_len + structure_bytes + tensor_bytes
-
-
-def bytes_to_tensor(data: bytes):
-    """
-    Safe deserialization matching tensor_to_bytes.
-    """
-    structure_len = int.from_bytes(data[:4], "big")
-    structure_bytes = data[4 : 4 + structure_len]
-    tensor_bytes = data[4 + structure_len :]
-
-    structure = json.loads(structure_bytes.decode("utf-8"))
-
-    # Load tensors from safetensors blob
-    tensor_map = {}
-    if tensor_bytes:
-        tensor_map = st_load_bytes(tensor_bytes)
-
-    def _restore(o):
-        if isinstance(o, dict):
-            if "__tensor_ref__" in o:
-                t = tensor_map[o["__tensor_ref__"]]
-                # Restore original dtype
-                dtype = getattr(torch, o["dtype"].replace("torch.", ""))
-                return t.to(dtype=dtype)
-            elif o.get("__dynamic_cache__"):
-                from transformers import DynamicCache
-
-                cache = DynamicCache()
-                cache.key_cache = _restore(o["key_cache"])
-                cache.value_cache = _restore(o["value_cache"])
-                return cache
-            elif o.get("__tuple__"):
-                return tuple(_restore(v) for v in o["data"])
-            else:
-                return {k: _restore(v) for k, v in o.items()}
-        elif isinstance(o, list):
-            return [_restore(v) for v in o]
-        else:
-            return o
-
-    return _restore(structure)
-
-
 def load_models_cache():
     try:
         with open(MODELS_CACHE_PATH, "r") as f:
@@ -825,41 +900,13 @@ def get_model_detailed_stats(model_name: str) -> Dict:
     }
 
 
-def get_nested_module(
-    model: torch.nn.Module, path: str, target_class_name: str = None
-) -> torch.nn.Module:
-    """
-    Navigate to a nested module using dot notation path.
-    Example: 'model.layers.0' -> returns model.layers[0]
-    """
-    parts = path.split('.')
-    current = model
-
-    for i in range(len(parts)):
-        part = parts[i]
-
-        if part == "model":
-            if not hasattr(current, "model") or (
-                len(parts) > i + 1 and not hasattr(current.model, parts[i + 1])
-            ):
-                continue
-
-        if part.isdigit():
-            # Handle list/ModuleList indexing
-            current = current[int(part)]
-        else:
-            # Handle attribute access
-            current = getattr(current, part)
-
-    return current
-
-
 def resolve_module_from_path(model: nn.Module, path: str):
     """Return (parent_module, child_module, child_name)."""
     parts = path.split(".")
     parent = model
-    for p in parts[:-1]:
-        if p == "model":
+    for i in range(len(parts[:-1])):
+        p = parts[i]
+        if i == 0 and p == "model":
             continue
         parent = getattr(parent, p)
     child_name = parts[-1]
@@ -887,30 +934,110 @@ def optimizer_to_spec(optimizer_cls):
     return optimizer_spec
 
 
-def load_model_skeleton(model_name: str, model_type: str = "chat"):
+def _get_cache_kv(cache):
     """
-    Load the HF model structure with empty weights.
+    Extract (key_list, value_list) from a DynamicCache regardless of
+    transformers version. New versions use cache.layers[i].keys/.values,
+    old versions expose cache.key_cache / cache.value_cache directly.
     """
-    # First, load the config
-    model_config = AutoConfig.from_pretrained(model_name)
+    if hasattr(cache, 'key_cache'):
+        return cache.key_cache, cache.value_cache
 
-    # Then create model from config with init_empty_weights
-    with init_empty_weights():
-        if model_type in ("causal", "chat"):
-            skeleton_model = AutoModelForCausalLM.from_config(model_config)
-        elif model_type == "seq2seq":
-            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
-        elif model_type == "vision2text":
-            skeleton_model = AutoModelForVision2Seq.from_config(model_config)
-        elif model_type == "audio2text":
-            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
-        else:
-            skeleton_model = AutoModel.from_config(model_config)
+    elif hasattr(cache, 'layers'):
+        if not cache.layers:
+            return [], []
 
-    skeleton_model.eval()  # Set to eval mode initially
+        # Probe attribute names on first layer
+        layer = cache.layers[0]
+        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
+        val_attr = 'values' if hasattr(layer, 'values') else 'value'
 
-    # Ensure no cached gradients or cached computations
-    for param in skeleton_model.parameters():
-        param.requires_grad = False
+        keys, vals = [], []
+        for l in cache.layers:
+            k = getattr(l, key_attr, None)
+            v = getattr(l, val_attr, None)
+            keys.append(k)
+            vals.append(v)
 
-    return skeleton_model
+        return keys, vals
+    else:
+        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
+
+
+def debug_structure(obj, name="root", indent=0, max_depth=6, visited=None):
+    """
+    Recursively prints structure/types/shapes of nested objects.
+    Useful for debugging transformer/model outputs.
+    """
+
+    if visited is None:
+        visited = set()
+
+    prefix = "  " * indent
+
+    # Prevent recursive loops
+    obj_id = id(obj)
+    if obj_id in visited:
+        print(f"{prefix}{name}: <recursive reference>")
+        return
+
+    visited.add(obj_id)
+
+    # Depth limit
+    if indent > max_depth:
+        print(f"{prefix}{name}: <max depth reached>")
+        return
+
+    # Tensors
+    if isinstance(obj, torch.Tensor):
+        print(
+            f"{prefix}{name}: "
+            f"Tensor(shape={tuple(obj.shape)}, "
+            f"dtype={obj.dtype}, "
+            f"device={obj.device}, "
+            f"requires_grad={obj.requires_grad})"
+        )
+
+    # Dict-like
+    elif isinstance(obj, Mapping):
+        print(f"{prefix}{name}: dict[{len(obj)}]")
+        for k, v in obj.items():
+            debug_structure(
+                v,
+                name=f"[{repr(k)}]",
+                indent=indent + 1,
+                max_depth=max_depth,
+                visited=visited,
+            )
+
+    # List/Tuple
+    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+        print(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
+
+        for i, v in enumerate(obj):
+            debug_structure(
+                v,
+                name=f"[{i}]",
+                indent=indent + 1,
+                max_depth=max_depth,
+                visited=visited,
+            )
+
+    # HF model outputs / dataclasses / custom objects
+    elif hasattr(obj, "__dict__"):
+        print(f"{prefix}{name}: {type(obj).__name__}")
+
+        for k, v in vars(obj).items():
+            debug_structure(
+                v, name=f".{k}", indent=indent + 1, max_depth=max_depth, visited=visited
+            )
+
+    # Primitive
+    else:
+        value = repr(obj)
+
+        # Truncate huge reprs
+        if len(value) > 120:
+            value = value[:120] + "..."
+
+        print(f"{prefix}{name}: {type(obj).__name__} = {value}")

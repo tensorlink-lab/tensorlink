@@ -1,18 +1,9 @@
-from accelerate import init_empty_weights
 from transformers import (
     PreTrainedModel,
-    AutoConfig,
-    AutoModel,
     AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
-    AutoModelForVision2Seq,
-    AutoModelForSpeechSeq2Seq,
 )
-from transformers.cache_utils import DynamicCache, Cache
-from typing import Generator, List, Optional, Type, Dict, Any, Union, Tuple
-from huggingface_hub import snapshot_download
+from typing import Generator, List, Optional, Type, Dict, Any, Union
 from contextlib import contextmanager
-from safetensors import safe_open
 import torch.optim as optim
 import torch.nn as nn
 import threading
@@ -21,16 +12,24 @@ import pickle
 import torch
 import types
 import queue
-import glob
 import time
 import json
 import gc
 import io
 import os
 
-from tensorlink.ml.injector import generate_new_forward_method, get_loop_io_signature
+from tensorlink.ml.utils.injector import (
+    generate_new_forward_method,
+    get_loop_io_signature,
+)
 from tensorlink.ml.optim import create_distributed_optimizer
-from tensorlink.ml.graphing import ModelParser
+from tensorlink.ml.utils.graphing import ModelParser
+from tensorlink.ml.utils.loading import (
+    load_model_skeleton,
+    ModelCacheManager,
+    load_module_weights,
+    get_nested_module,
+)
 from tensorlink.ml.utils import (
     get_gpu_memory,
     get_batch_size,
@@ -46,8 +45,7 @@ from tensorlink.ml.utils import (
     optimizer_to_spec,
     handle_output,
     attach_tensor,
-    load_model_skeleton,
-    get_nested_module,
+    resolve_module_from_path,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -180,60 +178,6 @@ def _collect_buffers(buffer_map, module_path, module_info):
     return collected
 
 
-def _apply_required_buffers(
-    module: torch.nn.Module, module_info: Dict[str, Any]
-) -> None:
-    """
-    Apply buffers that cannot be recovered from safetensors weights alone.
-    Mirrors DistributedWorker._apply_required_buffers for host-side modules.
-
-    Handles three cases:
-      1. Buffer already exists on module (overwrite with correct values)
-      2. Buffer missing (register it)
-      3. Nested buffer path (navigate to submodule)
-    """
-    required_buffers = module_info.get("required_buffers", {})
-    if not required_buffers:
-        return
-
-    for key, buf_spec in required_buffers.items():
-        try:
-            # Reconstruct tensor from serialized bytes
-            tensor = bytes_to_tensor(buf_spec.encode())
-
-            # Navigate to the correct submodule if key contains "."
-            parts = key.rsplit(".", 1)
-            if len(parts) == 2:
-                submodule_path, buf_name = parts
-                try:
-                    target = get_nested_module(module, submodule_path)
-                except Exception:
-                    logging.warning(
-                        f"Buffer submodule not found: {submodule_path}, skipping {key}"
-                    )
-                    continue
-            else:
-                target = module
-                buf_name = key
-
-            # Apply: prefer re-registering to preserve correct buffer semantics
-            existing_buffers = dict(target.named_buffers(recurse=False))
-            if hasattr(target, buf_name) and buf_name in existing_buffers:
-                existing = getattr(target, buf_name)
-                if existing.shape == tensor.shape:
-                    existing.copy_(tensor)
-                else:
-                    # Shape mismatch (e.g. seq_len changed) — re-register
-                    target.register_buffer(buf_name, tensor)
-            else:
-                target.register_buffer(buf_name, tensor)
-
-            logging.debug(f"Applied buffer {key} to host module")
-
-        except Exception as e:
-            logging.error(f"Failed to apply buffer {key} to host module: {e}")
-
-
 class DistributedModel(nn.Module):
     """
     A modular distributed model that supports offloading submodules
@@ -278,6 +222,7 @@ class DistributedModel(nn.Module):
             tokenizer: can be specified for inference
             config (dict): Optional tensorlink model distribution configuration
         """
+
         super().__init__()
 
         if isinstance(model, nn.Module):
@@ -288,6 +233,7 @@ class DistributedModel(nn.Module):
             self.model = None
 
         self.tokenizer = tokenizer
+        self.dtype = dtype
 
         # Store model and training resources
         self.user_memory = get_gpu_memory()
@@ -331,10 +277,7 @@ class DistributedModel(nn.Module):
         self.mpc_lock = self.node.mpc_lock
         self._thread_local = threading.local()
         self._generate_args = None
-
-        self.hf_cache_dir = os.environ.get(
-            'HF_HOME', os.path.join(os.path.expanduser('~'), '.cache', 'huggingface')
-        )
+        self.cache_manager = ModelCacheManager("./tmp/snapshots")
 
         self.job_id = None
 
@@ -752,6 +695,8 @@ class DistributedModel(nn.Module):
 
         assert isinstance(self.model, nn.Module), "Model Distribution Failed!"
 
+        self._patch_skeleton_device(self.device)
+
         self.model.n_batch = 0
         self.model.forward_queues = {}
         self.model.backward_queues = {}
@@ -765,8 +710,11 @@ class DistributedModel(nn.Module):
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
-        with _set_micro(self._thread_local, 0):
-            return self.model.generate(*args, **kwargs)
+        try:
+            with _set_micro(self._thread_local, 0):
+                return self.model.generate(*args, **kwargs)
+        except Exception as e:
+            raise e
 
     def wrap_module(self, module_id: list, worker_id):
         # Access the module and parent
@@ -896,13 +844,11 @@ class DistributedModel(nn.Module):
             offloaded_module.entire_model = True
             return
 
+        if module_path[0] == "model" and not hasattr(self.model, "model"):
+            module_path = module_path[1:]
+
         module_path_list = module_path.split(".")
-        target = self.model
-
-        if module_path_list[0] == "model" and not hasattr(self.model, "model"):
-            module_path_list.pop(0)
-
-        target = get_nested_module(target, ".".join(module_path_list[:-1]))
+        target = get_nested_module(self.model, ".".join(module_path_list[1:-1]))
 
         setattr(target, module_path_list[-1], offloaded_module)
 
@@ -932,8 +878,10 @@ class DistributedModel(nn.Module):
             module_info["expected_inputs"] = list(io_signature["all_inputs"])
             module_info["expected_outputs"] = list(io_signature["all_outputs"])
             module_info["loop_body_source"] = io_signature["loop_body_source"]
-            module_info["loop_iterator_name"] = io_signature["loop_iterator_name"]
-            module_info["module_path"] = io_signature["module_path"]
+            module_info["loop_structure"] = io_signature["loop_structure"]
+            module_info["module_path"] = module_info.get(
+                "module_path", module_info.get("parent_module_path")
+            )
 
             file_name = f"{module_id}_{worker_id}.pt"
             with open(file_name, "wb") as f:
@@ -1051,10 +999,6 @@ class DistributedModel(nn.Module):
                 logging.error(f"Failed to load tied host module {module_id}: {e}")
                 raise
 
-        if hasattr(self.model, "tie_weights"):
-            logging.info("Re-tying weights after host module loading")
-            self.model.tie_weights()
-
     def _load_single_host_module(self, module_id: str, module_info: Dict[str, Any]):
         """
         Load weights for a single host module
@@ -1068,152 +1012,21 @@ class DistributedModel(nn.Module):
 
         logging.info(f"Loading host module: {module_class} at {module_path}")
 
-        # Navigate to the target module in the skeleton
-        module_path_list = module_path.split(".")
-        target = self.model
+        host_module = get_nested_module(self.model, module_path)
+        model_path = self.cache_manager.load_model_path(self.model_name)
 
-        # Handle 'model' prefix
-        if module_path_list[0] == "model" and (
-            not hasattr(self.model, "model")
-            or (
-                len(module_path_list) > 1
-                and not hasattr(self.model.model, module_path_list[1])
-            )
-        ):
-            module_path_list.pop(0)
-
-        # Special case: entire model
-        if not module_path_list:
-            logging.info(
-                "Module path refers to full model; loading directly into root model"
-            )
-
-            self.model = self._load_full_model(self.model_name, module_info)
-            return
-
-        # Navigate to parent
-        for attr in module_path_list[:-1]:
-            target = getattr(target, attr)
-
-        # Get the actual module
-        module_name = module_path_list[-1]
-        host_module = getattr(target, module_name)
-
-        # Load weights for this module
-        logging.info(f"Loading weights for {module_path}")
-        state_dict = self._load_module_weights(self.model_name, [module_path])
-
-        # Convert module to empty weights on CPU first
-        host_module = host_module.to_empty(device=self.device)
-
-        # Load the state dict
-        missing_keys, unexpected_keys = host_module.load_state_dict(
-            state_dict, strict=False
+        load_module_weights(
+            model_path=model_path,
+            module_path=module_path,
+            target_module=host_module,
+            module_info=module_info,
+            device=self.device,
         )
 
-        if missing_keys:
-            logging.warning(f"Host module {module_path} - Missing keys: {missing_keys}")
-        if unexpected_keys:
-            logging.warning(
-                f"Host module {module_path} - Unexpected keys: {unexpected_keys}"
-            )
-
-        _apply_required_buffers(host_module, module_info)
-
-        # Move to device
-        host_module = host_module.to(self.device)
-
-        # Update the module in place
-        setattr(target, module_name, host_module)
-
+        # Put the loaded module back into the skeleton in-place
+        parent, _, child_name = resolve_module_from_path(self.model, module_path)
+        setattr(parent, child_name, host_module)
         logging.info(f"Successfully loaded host module {module_class}")
-
-    def _load_module_weights(
-        self, model_name: str, module_paths: List[str]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Load weights for specific modules from HuggingFace.
-        Similar to worker's _load_specific_layer_weights but adapted for user side.
-        """
-        state_dict = {}
-
-        try:
-            # Download model files
-            logging.info(f"Downloading weights for {model_name}")
-            model_path = snapshot_download(
-                repo_id=model_name,
-                cache_dir=self.hf_cache_dir,
-                allow_patterns=["*.safetensors", "*.bin"],
-                local_files_only=False,
-            )
-
-            # Find safetensors files
-            safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-            if safetensor_files:
-                logging.info(f"Found {len(safetensor_files)} safetensors files")
-
-                for shard_path in safetensor_files:
-                    with safe_open(shard_path, framework="pt", device="cpu") as f:
-                        keys_loaded = 0
-                        for key in f.keys():
-                            for module_path in module_paths:
-                                # Try the path as-is, and also strip one leading "model." for better coverage
-                                candidates = [module_path]
-                                if module_path.startswith("model."):
-                                    candidates.append(module_path[len("model.") :])
-
-                                for candidate in candidates:
-                                    prefix = candidate + "."
-                                    if key.startswith(prefix):
-                                        new_key = key[len(prefix) :]
-                                        state_dict[new_key] = f.get_tensor(key)
-                                        keys_loaded += 1
-                                        break
-                                else:
-                                    continue
-                                break
-
-                        if keys_loaded > 0:
-                            logging.info(
-                                f"Loaded {keys_loaded} tensors from "
-                                f"{os.path.basename(shard_path)}"
-                            )
-            else:
-                # Fallback to .bin files
-                logging.info("No safetensors found, trying .bin files")
-                bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
-
-                if not bin_files:
-                    raise ValueError(f"No weight files found in {model_path}")
-
-                for bin_path in bin_files:
-                    shard_dict = torch.load(bin_path, map_location="cpu")
-
-                    # FULL MODEL LOAD (no filtering, no prefix stripping)
-                    if module_paths == ["model"]:
-                        logging.info(
-                            f"Loading full state_dict from {os.path.basename(bin_path)}"
-                        )
-                        state_dict.update(shard_dict)
-                        continue
-
-                    # PARTIAL MODULE LOAD
-                    for key, value in shard_dict.items():
-                        for module_path in module_paths:
-                            prefix = module_path + "."
-                            if key.startswith(prefix):
-                                new_key = key[len(prefix) :]
-                                state_dict[new_key] = value
-                                break
-
-            logging.info(f"Loaded {len(state_dict)} weight tensors for host modules")
-
-        except Exception as e:
-            logging.error(f"Error loading module weights: {e}")
-            raise
-
-        return state_dict
 
     def _load_tied_host_module(self, module_id: str, module_info: Dict[str, Any]):
         """
@@ -1264,59 +1077,6 @@ class DistributedModel(nn.Module):
             f"(shape={source_module.weight.shape})"
         )
 
-    def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
-        """
-        Load a complete model from HuggingFace with optimal memory usage.
-        Uses HF's native loading which is more memory-efficient than manual skeleton+weights.
-        """
-        model_type = module_info.get('model_type', 'chat')
-        num_gpus = torch.cuda.device_count()
-
-        # Force garbage collection before loading
-        load_kwargs = {
-            "low_cpu_mem_usage": True,
-            "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
-        }
-
-        # Only use device_map for multi-GPU
-        if num_gpus > 1:
-            load_kwargs["device_map"] = "auto"
-        else:
-            # For single GPU, load to CPU first then move
-            load_kwargs["device_map"] = "cpu"
-
-        logging.info(f"Loading full model {model_name} with type {model_type}")
-
-        # Load model based on type
-        if model_type in ("causal", "chat"):
-            final_model = AutoModelForCausalLM.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "seq2seq":
-            final_model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "vision2text":
-            final_model = AutoModelForVision2Seq.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "audio2text":
-            final_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_name, **load_kwargs
-            )
-        else:
-            model_config = AutoConfig.from_pretrained(model_name)
-            final_model = AutoModel.from_pretrained(
-                model_name, config=model_config, **load_kwargs
-            )
-
-        # Move to GPU only after fully loaded (for single GPU)
-        if num_gpus == 1 and self.device.type == "cuda":
-            final_model = final_model.to(self.device)
-
-        logging.info(f"Successfully loaded full model {model_name}")
-        return final_model
-
     def _discover_buffers_via_forward(self) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Run a single dummy forward through the FULL skeleton model (before any
@@ -1338,7 +1098,7 @@ class DistributedModel(nn.Module):
         # Load real weights into skeleton so forward produces valid buffers
         full_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=self.dtype,
             device_map="cpu",
             low_cpu_mem_usage=True,
         )
@@ -1420,6 +1180,24 @@ class DistributedModel(nn.Module):
             gc.collect()
 
         return buffer_map
+
+    def _patch_skeleton_device(self, host_device: torch.device):
+        model_cls = type(self.model)
+
+        if getattr(model_cls, "_tensorlink_device_patched", False):
+            return
+
+        distributed_model_ref = self  # reference to the DistributedModel wrapper
+
+        patched_cls = type(
+            f"Distributed_{model_cls.__name__}",
+            (model_cls,),
+            {
+                "device": property(lambda self, ref=distributed_model_ref: ref.device),
+                "_tensorlink_device_patched": True,
+            },
+        )
+        self.model.__class__ = patched_cls
 
 
 class OffloadedModule(nn.Module):
@@ -1514,7 +1292,12 @@ class OffloadedModule(nn.Module):
             "generate", (self.worker_id, size, shm_name, stream)
         )
 
-        # Wait for response, change to appending waiting thread to list in master
+        if stream:
+            # Tokens are delivered via TOKEN/END__ messages to RemoteStreamer.
+            # Nothing to wait for, return immediately.
+            return None
+
+        # Non-streaming: poll for the full output tensor as before
         waiting = True
         start_time = time.time()
         while waiting:
@@ -1545,12 +1328,10 @@ class OffloadedModule(nn.Module):
                 [handle_output(args), self.module_id]
             )
 
-        args = handle_output(args)
         detached_args = detach_tensor(args, clone=True)
         args_bytes = tensor_to_bytes(detached_args)
         kwargs_bytes = tensor_to_bytes(kwargs)
         forward_bytes = len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
-
         size, shm_name = store_in_shared_memory(forward_bytes, encoded=True)
 
         # Relay forward pass to next roles
@@ -1561,7 +1342,7 @@ class OffloadedModule(nn.Module):
         # Wait for response, change to appending waiting thread to list in master
         waiting = True
         while waiting:
-            time.sleep(0.1)
+            time.sleep(0.01)
             key = (n_batch, n_micro, self.module_id)
             args = self.parent_model.send_request("check_forward", key)
 
@@ -1586,12 +1367,11 @@ class OffloadedModule(nn.Module):
 
         inter_storage = [
             self.module_id,
-            handle_output(output),
+            output,
         ]  # Store associated output
 
         # Store intermediates and connection for backwards pass
         self.parent_model.model.intermediates[n_micro].append(inter_storage)
-
         return output
 
     def add_distributed_parameter(self, name, distributed_param):

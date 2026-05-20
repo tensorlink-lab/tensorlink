@@ -1,13 +1,13 @@
-import json
-
-from tensorlink.ml.utils import estimate_memory, load_model_skeleton
-from tensorlink.ml.injector import find_loop_in_module_hierarchy
+from tensorlink.ml.utils.utils import estimate_memory
+from tensorlink.ml.utils.injector import find_loop_in_module_hierarchy
+from tensorlink.ml.utils.loading import load_model_skeleton
 from collections import defaultdict
 from typing import Union, Optional, Dict, List, Any
 import torch.nn as nn
 import textwrap
-import ast
 import inspect
+import torch
+import ast
 import re
 
 
@@ -241,6 +241,7 @@ class ModelParser:
         workers: dict,
         training: bool,
         trusted: bool,
+        dtype: torch.dtype = torch.float32,
         input_obfuscation: bool = False,
         optimizer_type: str = "adam",
         optimizer_spec: Optional[dict] = None,
@@ -289,6 +290,8 @@ class ModelParser:
             trusted : bool
                 Indicates whether workers are trusted. Used for downstream logic such as
                 security policies, encryption, or obfuscation decisions.
+
+            dtype: torch.dtype, optional (default=torch.float32)
 
             input_obfuscation : bool, optional (default=False)
                 Whether inputs should be obfuscated when sent to workers. This flag is

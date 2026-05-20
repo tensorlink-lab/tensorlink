@@ -1,29 +1,3 @@
-import gc
-import inspect
-import json
-import logging
-import os
-import pickle
-import time
-import glob
-
-from threading import Thread
-import torch
-import torch.amp as amp
-from typing import Optional, List, Dict, Any
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
-    AutoModelForSeq2SeqLM,
-    AutoModelForSpeechSeq2Seq,
-    Cache,
-)
-from transformers.generation.streamers import BaseStreamer
-from safetensors import safe_open
-from huggingface_hub import snapshot_download
-
 from tensorlink.ml.utils import (
     bytes_to_tensor,
     tensor_to_bytes,
@@ -31,45 +5,35 @@ from tensorlink.ml.utils import (
     attach_tensor,
     handle_output,
     enable_grad,
-    get_nested_module,
     get_optimizer_from_spec,
-    load_model_skeleton,
 )
-from tensorlink.ml.injector import LayerGroupModule
+from tensorlink.ml.utils.loading import (
+    TiedLinear,
+    load_full_model,
+    load_model_skeleton,
+    ModelCacheManager,
+    load_module_weights,
+    load_grouped_module_weights,
+    get_nested_module,
+)
+from tensorlink.ml.utils.injector import LayerGroupModule
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
 )
 
-
-def _find_module_path_by_class(
-    model: torch.nn.Module, class_name: str
-) -> Optional[str]:
-    """
-    Search the model for the first submodule whose class name matches class_name.
-    Returns the module path as returned by named_modules (empty string for root).
-    """
-    if not class_name:
-        return None
-
-    for name, mod in model.named_children():
-        # skip the root empty name if it is the same class as requested
-        if name == "":
-            # if root has the requested class, return empty string
-            if mod.__class__.__name__ == class_name:
-                return name
-            continue
-
-        if name == "model":
-            if hasattr(model, "model"):
-                return "model." + _find_module_path_by_class(model.model, class_name)
-            else:
-                return _find_module_path_by_class(model.model, class_name)
-
-        if mod.__class__.__name__ == class_name:
-            return name
-
-    return None
+import gc
+import inspect
+import json
+import logging
+import os
+import pickle
+import time
+from threading import Thread
+import torch
+import torch.amp as amp
+from typing import List, Dict, Any
+from transformers.generation.streamers import BaseStreamer
 
 
 def _create_layer_group_wrapper(
@@ -78,7 +42,7 @@ def _create_layer_group_wrapper(
     expected_inputs: List[str],
     expected_outputs: List[str],
     loop_body_source: str,
-    loop_iterator_name: str,
+    loop_structure: Dict,
 ) -> torch.nn.Module:
     """
     Create a wrapper module that processes multiple layers sequentially.
@@ -90,34 +54,12 @@ def _create_layer_group_wrapper(
     # Create and return the wrapper
     return LayerGroupModule(
         layers=layers,
+        parent_module=base_model,
         input_vars=expected_inputs,
         output_vars=expected_outputs,
         loop_body_source=loop_body_source,
-        loop_iterator_name=loop_iterator_name,
+        loop_structure=loop_structure,
     )
-
-
-def normalize_past_key_values(pkv):
-    """
-    Ensures past_key_values has shape:
-    Tuple[Tuple[Tensor, Tensor], ...]
-    """
-    if pkv is None:
-        return None
-
-    if isinstance(pkv, Cache):
-        return pkv
-
-    # unwrap accidental singleton nesting
-    while (
-        isinstance(pkv, (list, tuple))
-        and len(pkv) == 1
-        and isinstance(pkv[0], (list, tuple))
-    ):
-        pkv = pkv[0]
-
-    # enforce tuple-of-tuples
-    return tuple(tuple(layer) for layer in pkv)
 
 
 class TensorlinkWorkerStreamer(BaseStreamer):
@@ -150,7 +92,9 @@ class DistributedWorker:
         self.node_requests = node.node_requests
         self.node_responses = node.node_responses
         self.mpc_lock = node.mpc_lock
-        self.storage_path = "./tmp/snapshots"
+        self.cache_manager = ModelCacheManager(
+            "./tmp/snapshots",
+        )
 
         self.modules = {}
         self.optimizers = {}
@@ -173,10 +117,6 @@ class DistributedWorker:
             self.default_stream = torch.cuda.Stream()
             self.compute_stream = torch.cuda.Stream()
             self.memory_stream = torch.cuda.Stream()
-
-        self.hf_cache_dir = os.environ.get(
-            'HF_HOME', os.path.join(os.path.expanduser('~'), '.cache', 'huggingface')
-        )
 
     def cleanup_memory(self):
         """Aggressively clean up memory"""
@@ -303,10 +243,10 @@ class DistributedWorker:
         args_len = int.from_bytes(data[:8], "big")
         args_bytes = data[8 : 8 + args_len]
         kwargs_bytes = data[8 + args_len :]
+
         args = bytes_to_tensor(args_bytes)
         kwargs = bytes_to_tensor(kwargs_bytes)
 
-        # Move tensors to device
         inp = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
@@ -316,11 +256,6 @@ class DistributedWorker:
 
         if not isinstance(inp, (list, tuple)):
             inp = (inp,)
-
-        if "past_key_values" in kwargs:
-            kwargs["past_key_values"] = normalize_past_key_values(
-                kwargs.get("past_key_values")
-            )
 
         # Forward pass
         if self.use_amp and module.training:
@@ -342,7 +277,11 @@ class DistributedWorker:
             }
 
         # Detach and store output
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         detached_out = detach_tensor(out)
+
         output_bytes = tensor_to_bytes(detached_out)
         size, name = store_in_shared_memory(output_bytes)
 
@@ -365,7 +304,6 @@ class DistributedWorker:
         payload = get_from_shared_memory(size, name, encoded=True)
 
         # Deserialize
-
         args_bytes, kwargs_bytes = payload.split(b"::")
         args = bytes_to_tensor(args_bytes)
         kwargs = bytes_to_tensor(kwargs_bytes)
@@ -396,10 +334,7 @@ class DistributedWorker:
         host_id = module.host
 
         try:
-            if (
-                not stream
-                or "streamer" not in inspect.signature(module.generate).parameters
-            ):
+            if not stream:
                 with torch.no_grad():
                     output = module.generate(**kwargs)
 
@@ -533,109 +468,20 @@ class DistributedWorker:
 
         except Exception as e:
             # Make sure skeleton is cleaned up on error
-            del skeleton_module
-            self.cleanup_memory()
-
-            logging.error(f"Failed to load model from HuggingFace: {str(e)}")
-            raise ValueError(f"Failed to load model from HuggingFace: {str(e)}")
-
-    def _load_grouped_layer_weights(
-        self,
-        model_name: str,
-        layer_paths: list[str],
-        target_module: torch.nn.Module,
-    ) -> None:
-        """
-        Load weights for a grouped LayerGroupModule directly into the target
-        grouped layer module.
-        """
-        model_path = snapshot_download(
-            repo_id=model_name,
-            cache_dir=self.hf_cache_dir,
-            allow_patterns=["*.safetensors", "*.bin"],
-            local_files_only=False,
-        )
-
-        # Map full HF layer prefix → local index
-        layer_prefix_to_local_idx = {
-            layer_path: i for i, layer_path in enumerate(layer_paths)
-        }
-
-        safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-        if not safetensor_files:
-            raise RuntimeError(
-                "No safetensors found; .bin fallback not implemented here"
-            )
-
-        loaded_keys = []
-        missing_keys = set(target_module.state_dict().keys())
-
-        # Keep track of which layers have been loaded
-        layers_loaded = set()
-
-        for shard_idx, shard_path in enumerate(safetensor_files):
+            err = f"Failed to load model from HuggingFace: {str(e)}"
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedWorker -> Loading shard {shard_idx + 1}/{len(safetensor_files)}",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            shard_state_dict = {}
-
-            with safe_open(shard_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    for layer_prefix, local_idx in layer_prefix_to_local_idx.items():
-                        full_prefix = layer_prefix + "."
-                        if not key.startswith(full_prefix):
-                            if not key.startswith(full_prefix.split(".", 1)[-1]):
-                                if not key.startswith(full_prefix.split(".", 2)[-1]):
-                                    continue
-                                else:
-                                    full_prefix = full_prefix.split(".", 2)[-1]
-                            else:
-                                full_prefix = full_prefix.split(".", 1)[-1]
-
-                        # Strip "model.layers.XX."
-                        subkey = key[len(full_prefix) :]
-
-                        # Remap to local ModuleList index
-                        new_key = f"layers.{local_idx}.{subkey}"
-
-                        shard_state_dict[new_key] = f.get_tensor(key)
-                        loaded_keys.append(new_key)
-                        missing_keys.discard(new_key)
-                        layers_loaded.add(new_key)
-                        break
-
-            # Load this shard into the model
-            if shard_state_dict:
-                target_module.load_state_dict(shard_state_dict, strict=False)
-                del shard_state_dict
-                self.cleanup_memory()
-
-        if missing_keys:
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Missing keys after loading: {missing_keys}",
-                    "yellow",
+                    err,
+                    "red",
                     logging.ERROR,
                 ),
             )
+            del skeleton_module
+            self.cleanup_memory()
 
-        self.send_request(
-            "debug_print",
-            (
-                "DistributedWorker -> "
-                f"Loaded {len(loaded_keys)} weight tensors across {len(safetensor_files)} shards",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
+            logging.error(err)
+            raise ValueError(err)
 
     def _load_grouped_layers(
         self,
@@ -648,68 +494,37 @@ class DistributedWorker:
         Load a group of layers as a single module. Uses empty weights initialization
         and only loads required layer weights.
         """
-        layer_paths = module_info.get('layer_paths', [])
-        layer_range = module_info.get('layer_range', [])
-        expected_inputs = module_info.get('expected_inputs', [])
-        expected_outputs = module_info.get('expected_outputs', [])
-        loop_body_source = module_info.get('loop_body_source')
-        loop_iterator_name = module_info.get('loop_iterator_name')
+        layer_paths = module_info.get("layer_paths", [])
+        expected_inputs = module_info.get("expected_inputs", [])
+        expected_outputs = module_info.get("expected_outputs", [])
+        loop_body_source = module_info.get("loop_body_source")
+        loop_structure = module_info.get("loop_structure")
 
         if not layer_paths:
             raise ValueError("layer_paths must be provided for grouped layer loading")
 
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading grouped layers {layer_range[0]}-{layer_range[1]} from {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        # Create the layer group wrapper with the skeleton's layers
-        # Extract references quickly before cleanup
         grouped_module = _create_layer_group_wrapper(
             base_model,
             layer_paths,
             expected_inputs,
             expected_outputs,
             loop_body_source,
-            loop_iterator_name,
+            loop_structure,
         )
 
-        # Aggressively cleanup skeleton immediately after extraction
         del base_model
         self.cleanup_memory()
 
-        # Convert grouped module to empty tensors on CPU to clear any weight references
-        grouped_module = grouped_module.to_empty(device="cpu")
+        model_path = self.cache_manager.load_model_path(model_name)
 
-        # Now load only the weights for the assigned layers
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading weights for layers {layer_range[0]}-{layer_range[1]}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        self._load_grouped_layer_weights(model_name, layer_paths, grouped_module)
-
-        self.cleanup_memory()
-
-        self._debug_move_to_device(grouped_module, device=self.device)
-
-        self._apply_required_buffers(grouped_module, module_info)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded {len(layer_paths)} layers with weights",
-                "blue",
-                logging.DEBUG,
-            ),
+        # resolves each layer's prefix, remaps to layers.<idx>, applies
+        # buffers, and moves to device (layer by layer to avoid OOM).
+        load_grouped_module_weights(
+            model_path=model_path,
+            layer_paths=layer_paths,
+            target_module=grouped_module,
+            module_info=module_info,
+            device=self.device,
         )
 
         return grouped_module
@@ -854,153 +669,6 @@ class DistributedWorker:
                 ),
             )
 
-    def _load_specific_layer_weights(
-        self,
-        model_name: str,
-        layer_paths: List[str],
-        single: bool = False,
-        base_model_prefix: str = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Load only the weights for specific layers from HuggingFace.
-        Uses safetensors for efficient weight loading without loading entire model.
-
-        If layer_paths contains 'model' or is empty, loads all weights.
-        """
-        state_dict = {}
-
-        try:
-            # Use snapshot_download for efficient caching
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Checking cache for {model_name}",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-            model_path = snapshot_download(
-                repo_id=model_name,
-                cache_dir=self.hf_cache_dir,
-                allow_patterns=[
-                    "*.safetensors",
-                    "*.bin",
-                    "*.json",
-                ],
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-                local_files_only=False,
-            )
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Model located at: {model_path}",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            # Find all safetensors files
-            safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-            if safetensor_files:
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> Found {len(safetensor_files)} safetensors files",
-                        "blue",
-                        logging.DEBUG,
-                    ),
-                )
-
-                # Load only specific layers
-                layer_path_to_idx = {path: idx for idx, path in enumerate(layer_paths)}
-
-                for shard_path in safetensor_files:
-                    self.send_request(
-                        "debug_print",
-                        (
-                            f"DistributedWorker -> Reading weights from {os.path.basename(shard_path)}",
-                            "blue",
-                            logging.DEBUG,
-                        ),
-                    )
-
-                    with safe_open(shard_path, framework="pt", device="cpu") as f:
-                        keys_loaded = 0
-                        for key in f.keys():
-                            for layer_path, layer_idx in layer_path_to_idx.items():
-                                layer_prefix = layer_path + '.'
-
-                                # Try matching with progressively shorter prefixes if not initially found
-                                matched_prefix = None
-                                trimmed_key = layer_prefix
-                                for _ in range(2):
-                                    if not key.startswith(layer_prefix):
-                                        trimmed_key = trimmed_key.split("model.", 1)[-1]
-
-                                        if not key.startswith(trimmed_key):
-                                            continue
-                                        else:
-                                            matched_prefix = trimmed_key
-
-                                if not key.startswith(layer_prefix):
-                                    if matched_prefix is None:
-                                        continue
-                                    else:
-                                        layer_prefix = matched_prefix
-
-                                # Extract the part after the matched prefix
-                                new_key = key[len(layer_prefix) :]
-
-                                if single and '.' in new_key:
-                                    new_key = new_key.split('.', 1)[1]
-                                elif len(new_key.split(".")) > 1:
-                                    new_key = key.split('.', 1)[1]
-
-                                state_dict[new_key] = f.get_tensor(key)
-                                keys_loaded += 1
-                                break
-
-                        if keys_loaded > 0:
-                            self.send_request(
-                                "debug_print",
-                                (
-                                    f"DistributedWorker -> Loaded {keys_loaded} tensors from this shard",
-                                    "blue",
-                                    logging.DEBUG,
-                                ),
-                            )
-
-                    if self.device == "cuda":
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> Total: Loaded {len(state_dict)} weight tensors for {len(layer_paths)} layers",
-                        "blue",
-                        logging.DEBUG,
-                    ),
-                )
-
-            else:
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"DistributedWorker -> No safetensors found, trying pytorch_model.bin",
-                        "yellow",
-                        logging.ERROR,
-                    ),
-                )
-                raise ValueError(f"No weight files found in {model_path}")
-
-        except Exception as e:
-            logging.error(f"Error loading weights: {e}")
-            raise ValueError(f"Failed to load layer weights: {str(e)}")
-
-        return state_dict
-
     def _load_single_module(
         self, model_name: str, base_model: torch.nn.Module, module_info: Dict[str, Any]
     ) -> torch.nn.Module:
@@ -1008,115 +676,51 @@ class DistributedWorker:
         Load a single module (e.g., just the RMSNorm layer).
         Uses empty weights initialization and only loads required module weights.
         """
-        parent_module_path = module_info.get('parent_module_path', '')
-        module_class_name = module_info.get('module', '')
-        module_id = module_info.get("module_id")
+        module_path = module_info.get("module_path", "")
+        module_class_name = module_info.get("module", "")
 
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading single module {module_class_name} from {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        if parent_module_path == "":
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedWorker -> Parent module is entire model — loading full model.",
-                    "blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            # aggressive cleanup before full model load
-            if module_id in self.modules:
-                del self.modules[module_id]
-
+        if not module_path or module_path == "model":
             del base_model
             self.cleanup_memory()
+            return self._load_full_model(model_name, module_info)
 
-            final_model = self._load_full_model(model_name, module_info)
-            return final_model
-
-        # Extract the specific module with empty weights
-        try:
-            # Fall through to class-based lookup
-            effective_layer_path = _find_module_path_by_class(
-                base_model, module_class_name
-            )
-            if effective_layer_path is None:
-                target_module = base_model
-                effective_layer_path = parent_module_path or "model"
-            else:
-                target_module = get_nested_module(base_model, effective_layer_path)
-
-        except Exception as e:
-            target_module = get_nested_module(base_model, module_info["module_path"])
-            effective_layer_path = module_info["module_path"]
-
-        # Get name of model for loading weights
-        base_model_prefix = getattr(base_model, "base_model_prefix", None)
-
-        # Load only the weights for this specific module
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading weights for {parent_module_path}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        if module_info.get("tied_to"):
-            effective_layer_path = module_info["tied_to"]
-
-        state_dict = self._load_specific_layer_weights(
-            model_name,
-            [effective_layer_path],
-            single=True,
-            base_model_prefix=base_model_prefix,
-        )
+        # Otherwise proceed with submodule extraction
+        tied_to = module_info.get("tied_to", "")
+        effective_path = tied_to or module_path
+        target_module = get_nested_module(base_model, effective_path)
 
         del base_model
         self.cleanup_memory()
 
-        target_module = target_module.to_empty(device="cpu")
+        model_path = self.cache_manager.load_model_path(model_name)
 
-        # Load the state dict
-        missing_keys, unexpected_keys = target_module.load_state_dict(
-            state_dict, strict=False
-        )
-
-        self._apply_required_buffers(target_module, module_info)
-
-        del state_dict
-        self.cleanup_memory()
-
-        if missing_keys:
-            self.send_request(
+        load_module_weights(
+            model_path=model_path,
+            module_path=effective_path,
+            target_module=target_module,
+            module_info=module_info,
+            device=self.device,
+            log_fn=lambda x: self.send_request(
                 "debug_print",
                 (
-                    f"DistributedWorker -> Error loading single module weights on model: {model_name}"
-                    f"\n Module: {effective_layer_path}\n Missing keys: {missing_keys}\n Unexpected keys: {unexpected_keys}",
-                    "bright_red",
-                    logging.CRITICAL,
+                    x,
+                    "cyan",
+                    logging.DEBUG,
                 ),
-            )
-
-        # Move to device
-        target_module = target_module.to(self.device)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded single module {module_class_name}",
-                "blue",
-                logging.DEBUG,
+            ),
+            warn_fn=lambda x: self.send_request(
+                "debug_print",
+                (
+                    x,
+                    "red",
+                    logging.WARNING,
+                ),
             ),
         )
+
+        if tied_to and module_class_name == "Linear":
+            return TiedLinear(target_module.weight)
+
         return target_module
 
     def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
@@ -1125,145 +729,8 @@ class DistributedWorker:
         Uses HF's native loading which is more memory-efficient than manual skeleton+weights.
         """
         model_type = module_info.get('model_type', 'chat')
-        num_gpus = torch.cuda.device_count()
-
-        # Force garbage collection before loading
         self.cleanup_memory()
-
-        load_kwargs = {
-            "low_cpu_mem_usage": True,
-            "torch_dtype": torch.float16,  # TODO route quantization params through job requests, should also be done for module loading
-        }
-
-        # Only use device_map for multi-GPU
-        if num_gpus > 1:
-            load_kwargs["device_map"] = "auto"
-        else:
-            # For single GPU, load to CPU first then move
-            load_kwargs["device_map"] = "cpu"
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Loading full model {model_name} with type {model_type}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-
-        # Load model based on type
-        if model_type in ("causal", "chat"):
-            final_model = AutoModelForCausalLM.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "seq2seq":
-            final_model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "vision2text":
-            final_model = AutoModelForVision2Seq.from_pretrained(
-                model_name, **load_kwargs
-            )
-        elif model_type == "audio2text":
-            final_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_name, **load_kwargs
-            )
-        else:
-            model_config = AutoConfig.from_pretrained(model_name)
-            final_model = AutoModel.from_pretrained(
-                model_name, config=model_config, **load_kwargs
-            )
-
-        # Move to GPU only after fully loaded (for single GPU)
-        if num_gpus == 1 and self.device.type == "cuda":
-            self.cleanup_memory()
-            final_model = final_model.to(self.device)
-
-        self.send_request(
-            "debug_print",
-            (
-                f"DistributedWorker -> Successfully loaded full model {model_name}",
-                "blue",
-                logging.DEBUG,
-            ),
-        )
-        return final_model
-
-    def _apply_required_buffers(
-        self,
-        module: torch.nn.Module,
-        module_info: Dict[str, Any],
-    ) -> None:
-        """
-        Apply buffers that cannot be recovered from safetensors weights alone.
-        Handles three cases:
-          1. Buffer already exists on module (overwrite with correct values)
-          2. Buffer missing (register it)
-          3. Nested buffer path (navigate to submodule)
-        """
-        required_buffers = module_info.get("required_buffers", {})
-        if not required_buffers or required_buffers == b"{}":
-            return
-
-        for key, buf_spec in required_buffers.items():
-            try:
-                # Reconstruct tensor
-                tensor = bytes_to_tensor(buf_spec)
-
-                # Navigate to the correct submodule if key contains "."
-                parts = key.rsplit(".", 1)
-                if len(parts) == 2:
-                    submodule_path, buf_name = parts
-                    try:
-                        target = get_nested_module(module, submodule_path)
-                    except Exception:
-                        # Submodule doesn't exist — skip gracefully
-                        self.send_request(
-                            "debug_print",
-                            (
-                                f"Buffer submodule not found: {submodule_path}, skipping {key}",
-                                "yellow",
-                                logging.WARNING,
-                            ),
-                        )
-                        continue
-                else:
-                    target = module
-                    buf_name = key
-
-                # Apply: prefer re-registering to preserve correct buffer semantics
-                if hasattr(target, buf_name) and buf_name in dict(
-                    target.named_buffers(recurse=False)
-                ):
-                    # Buffer exists — just update data in-place
-                    existing = getattr(target, buf_name)
-                    if existing.shape == tensor.shape:
-                        existing.copy_(tensor)
-                    else:
-                        # Shape mismatch (e.g. seq_len changed) — re-register
-                        target.register_buffer(buf_name, tensor)
-                else:
-                    # Buffer not registered — register it now
-                    target.register_buffer(buf_name, tensor)
-
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"Applied buffer {key}",
-                        "cyan",
-                        logging.DEBUG,
-                    ),
-                )
-
-            except Exception as e:
-                self.send_request(
-                    "debug_print",
-                    (
-                        f"Failed to apply buffer {key}: {e}",
-                        "red",
-                        logging.ERROR,
-                    ),
-                )
+        return load_full_model(model_name, model_type, self.device)
 
     def process_state_update(self, module_id, state_update):
         """Process optimizer state updates"""
@@ -1422,9 +889,11 @@ class DistributedWorker:
                 if forward_task:
                     key, args = forward_task
                     if len(args) == 3:
+                        # len(arg) of 3 includes stream arg for generate requests
                         size, name, stream = args
                         self._handle_generate(module_id, size, name, stream)
                     else:
+                        # len(arg) of 2 for basic forward requests
                         size, name = args
                         self._handle_forward(module_id, key, size, name)
 

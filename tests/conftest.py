@@ -14,7 +14,6 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
 PRINT_LEVEL = 5  # Custom logging print level for VERBOSE
 ON_CHAIN = False
 LOCAL = True

@@ -16,7 +16,7 @@ import time
 import os
 
 
-FREE_JOB_MAX_TIME = 60 * 60  # 60 minutes in seconds for a free job
+FREE_JOB_MAX_TIME = 12 * 60 * 60  # 12 hours in seconds for a free job
 
 
 class ValidatorThread(Torchnode):

@@ -40,7 +40,7 @@ class BaseNodeConfig:
     max_connections: int = 0
     on_chain: bool = True
     local_test: bool = False
-    print_level: int = logging.INFO
+    print_level: int = logging.WARNING
     priority_nodes: Optional[List[List[str]]] = None
     seed_validators: Optional[List[List[str]]] = None
 

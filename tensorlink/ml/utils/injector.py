@@ -67,27 +67,55 @@ class VariableUsageAnalyzer(ast.NodeVisitor):
 
 
 class LoopFinder(ast.NodeVisitor):
-    """Find the layer iteration loop"""
+    """
+    Find loops iterating over module layer containers.
+    """
+
+    LAYER_ATTRS = {
+        "layers",
+        "h",
+        "blocks",
+        "decoder_layers",
+        "encoder_layers",
+        "transformer_blocks",
+    }
 
     def __init__(self):
         self.loop_node = None
 
     def visit_For(self, node):
-        """Find loop that iterates over layers"""
-        # Look for patterns like: for ... in self.layers
-        if isinstance(node.iter, ast.Attribute):
-            if node.iter.attr in ['layers', 'h', 'blocks', 'decoder_layers']:
-                self.loop_node = node
-                return
-
-        # Look for: for ... in self.layers[:...]
-        if isinstance(node.iter, ast.Subscript):
-            if isinstance(node.iter.value, ast.Attribute):
-                if node.iter.value.attr in ['layers', 'h', 'blocks', 'decoder_layers']:
-                    self.loop_node = node
-                    return
+        if self._contains_layer_iteration(node.iter):
+            self.loop_node = node
+            return
 
         self.generic_visit(node)
+
+    def _contains_layer_iteration(self, node):
+        """
+        Recursively inspect iterator expression.
+        """
+
+        # self.layers
+        if isinstance(node, ast.Attribute):
+            return node.attr in self.LAYER_ATTRS
+
+        # self.layers[:...]
+        if isinstance(node, ast.Subscript):
+            return self._contains_layer_iteration(node.value)
+
+        # enumerate(self.layers), reversed(self.layers), list(self.layers), etc.
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                if self._contains_layer_iteration(arg):
+                    return True
+
+        # tuple/list generators
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                if self._contains_layer_iteration(elt):
+                    return True
+
+        return False
 
 
 class LayerCallExtractor(ast.NodeVisitor):
@@ -160,22 +188,35 @@ class LayerGroupModule(torch.nn.Module):
     def __init__(
         self,
         layers: List[torch.nn.Module],
+        parent_module: torch.nn.Module,
         input_vars: List[str],
         output_vars: List[str],
         loop_body_source: str,
-        loop_iterator_name: str,
+        loop_structure: Dict,
+        layer_offset: int = 0,
         debug: bool = True,
     ):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
+        self.parent_module = parent_module
         self.input_vars = input_vars
         self.output_vars = output_vars
-        self.loop_iterator_name = loop_iterator_name
+        self.loop_structure = loop_structure
         self.num_layers = len(layers)
+        self.layer_offset = layer_offset  # global index of first layer in this group
         self.debug = debug
 
         # Generate the forward function from the loop body
         self.forward_func = self._generate_forward_from_loop(loop_body_source)
+
+    def __getattr__(self, name):
+        """
+        Fallback missing attributes to original parent module.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.parent_module, name)
 
     def _generate_forward_from_loop(
         self, loop_body_source: str, debug: bool = False
@@ -184,6 +225,12 @@ class LayerGroupModule(torch.nn.Module):
         Generate a forward function that executes the original loop body
         for each layer in self.layers.
 
+        The key design principle: expose ALL incoming kwargs into the loop body
+        namespace, not just the variables the AST identified as input_vars.
+        This handles model-specific aliasing (e.g. past_key_value=past_key_values)
+        where the loop body uses a different name than the function argument without
+        any model-specific hardcoding.
+
         Args:
             loop_body_source: The source code of the original loop body
             debug: If True, add print statements for debugging
@@ -191,72 +238,104 @@ class LayerGroupModule(torch.nn.Module):
         # Build function signature
         func_lines = [
             "def forward(self, **kwargs):",
-            "    # Extract input variables",
+            "    # ---- Expose all incoming kwargs as local variables ----",
+            "    # This is the model-agnostic key: the loop body may reference",
+            "    # variables under names that differ from the outer function args",
+            "    # (e.g. past_key_value vs past_key_values). By unpacking every",
+            "    # kwarg into the local namespace we handle any such aliasing",
+            "    # without knowing the model's variable naming convention.",
+            "    _ns = {k: v for k, v in kwargs.items()}",
         ]
 
         if debug:
             func_lines.append(
-                "    print(f'[LayerGroupModule] Forward called with {len(kwargs)} kwargs')"
-            )
-            func_lines.append(
-                "    print(f'[LayerGroupModule] Input kwargs keys: {list(kwargs.keys())}')"
+                "    print(f'[LayerGroupModule] Forward called with kwargs: {list(kwargs.keys())}')"
             )
 
-        # Extract each input variable from kwargs
+        # Extract the named input_vars the AST found (may be aliases / subsets).
+        func_lines.append("")
+        func_lines.append("    # ---- Extract loop-body variables from kwargs ----")
         for var in self.input_vars:
-            if var.endswith('_kwargs') or var == 'flash_attn_kwargs':
-                func_lines.append(f"    {var} = kwargs.get('{var}', {{}})")
+            if var.endswith('_kwargs'):
+                func_lines.append(f"    {var} = _ns.get('{var}', {{}})")
             else:
-                func_lines.append(f"    {var} = kwargs.get('{var}')")
+                func_lines.append(f"    {var} = _ns.get('{var}')")
 
             if debug:
                 func_lines.append(
-                    f"    print(f'[LayerGroupModule] Extracted {var}: {{type({var})}}{{f\" shape={{list({var}.shape)}}\" if hasattr({var}, \"shape\") else \"\"}}')"
+                    f"    print(f'[LayerGroupModule] {var} = {{type({var})}}'"
+                    f"  f'{{\" shape=\" + str(list({var}.shape)) if hasattr({var}, \"shape\") else \"\"}}')"
                 )
 
         func_lines.append("")
         func_lines.append("    # Process through layers")
-        if debug:
-            func_lines.append(
-                f"    print(f'[LayerGroupModule] Processing {{len(self.layers)}} layers')"
-            )
 
-        func_lines.append(
-            f"    for layer_idx, {self.loop_iterator_name} in enumerate(self.layers):"
+        target_src = self.loop_structure["target_source"]
+        iter_src = self.loop_structure["iter_source"]
+
+        # Rewrite the layer container reference
+        iter_src = iter_src.replace(
+            "self.layers[: self.config.num_hidden_layers]", "self.layers"
         )
 
-        if debug:
-            func_lines.append(
-                f"        print(f'[LayerGroupModule] Layer {{layer_idx}}/{{len(self.layers)}}')"
-            )
-            func_lines.append(
-                f"        print(f'[LayerGroupModule]   hidden_states before: {{hidden_states.shape if hasattr(hidden_states, \"shape\") else type(hidden_states)}} min={{hidden_states.min().item() if hasattr(hidden_states, \"min\") else \"N/A\"}} max={{hidden_states.max().item() if hasattr(hidden_states, \"max\") else \"N/A\"}} mean={{hidden_states.mean().item() if hasattr(hidden_states, \"mean\") else \"N/A\"}}')"
-            )
+        iter_src = iter_src.replace(
+            "self.layers[:self.config.num_hidden_layers]", "self.layers"
+        )
 
-        # Add the original loop body (indented appropriately)
+        loop_header = f"    for {target_src} in {iter_src}:"
+        func_lines.append(loop_header)
+
+        # Inject global index helper if loop already has an index variable.
+        target_ast = ast.parse(target_src).body[0].value
+        index_var = None
+
+        if isinstance(target_ast, ast.Tuple):
+            if len(target_ast.elts) >= 1:
+                first = target_ast.elts[0]
+                if isinstance(first, ast.Name):
+                    index_var = first.id
+
+        if index_var:
+            func_lines.append(f"        layer_idx = {index_var} + self.layer_offset")
+
+        if debug:
+            if index_var:
+                func_lines.append(
+                    f"        print(f'[LayerGroupModule] Layer {{{index_var}}}/{{len(self.layers)}} (global {{layer_idx}})')"
+                )
+            else:
+                func_lines.append(
+                    f"        print(f'[LayerGroupModule] Processing layer')"
+                )
+
+        # Add the original loop body (indented inside the for loop)
         loop_lines = loop_body_source.strip().split('\n')
         for line in loop_lines:
             func_lines.append(f"        {line}")
 
-        if debug:
-            func_lines.append(
-                f"        print(f'[LayerGroupModule]   hidden_states after: {{hidden_states.shape if hasattr(hidden_states, \"shape\") else type(hidden_states)}} min={{hidden_states.min().item() if hasattr(hidden_states, \"min\") else \"N/A\"}} max={{hidden_states.max().item() if hasattr(hidden_states, \"max\") else \"N/A\"}} mean={{hidden_states.mean().item() if hasattr(hidden_states, \"mean\") else \"N/A\"}}')"
-            )
-            func_lines.append(
-                f"        if hasattr(hidden_states, 'isnan') and hidden_states.isnan().any():"
-            )
-            func_lines.append(
-                f"            print(f'[LayerGroupModule]   WARNING: NaN detected in hidden_states after layer {{layer_idx}}')"
-            )
-
         func_lines.append("")
         func_lines.append(
-            "    # Return all inputs plus computed outputs (outputs take priority)"
+            "    # Build output: start with all original kwargs, then overlay"
+        )
+        func_lines.append(
+            "    # every local variable that exists in the loop body namespace."
+        )
+        func_lines.append(
+            "    # Each var is stored under its own name AND its ±'s alias so that"
+        )
+        func_lines.append(
+            "    # the host generated forward can find it regardless of naming."
         )
         func_lines.append("    _output = {}")
-        func_lines.append("    _output.update(kwargs)")
-        for var in sorted(self.output_vars):
-            func_lines.append(f"    _output['{var}'] = {var}")
+
+        # Return every variable we know about under its name AND its alias
+        all_vars = sorted(set(self.output_vars))
+        for var in all_vars:
+            func_lines.append(f"    try:")
+            func_lines.append(f"        _output['{var}'] = {var}")
+            func_lines.append(f"    except NameError:")
+            func_lines.append(f"        pass  # var was never assigned, skip")
+
         func_lines.append("    return _output")
 
         forward_source = '\n'.join(func_lines)
@@ -270,6 +349,7 @@ class LayerGroupModule(torch.nn.Module):
 
         # Compile and return
         namespace = {'self': self, 'torch': torch}
+        print(forward_source)
         exec(forward_source, namespace)
         return namespace['forward']
 
@@ -278,7 +358,10 @@ class LayerGroupModule(torch.nn.Module):
         Execute the generated forward function.
         This gets replaced by _generate_forward_from_loop.
         """
-        return self.forward_func(self, **kwargs)
+        outputs = self.forward_func(self, **kwargs)
+        if isinstance(outputs, dict):
+            return {k: v for k, v in outputs.items() if k in self.output_vars}
+        return outputs
 
 
 def _determine_loop_variables(
@@ -287,6 +370,7 @@ def _determine_loop_variables(
     function_args: Set[str],
     pre_loop_vars: Set[str],
     kwarg_name: str = None,
+    layer_call_kwargs_values: set = None,
 ) -> Dict:
     """
     Determine which variables need to be passed to workers and returned.
@@ -321,9 +405,9 @@ def _determine_loop_variables(
             variables_written.add(v)
 
     # A variable must exist before the loop if:
-    # 1. It's first accessed via READ (not write), OR
+    # 1. It's first accessed via read (not write), OR
     # 2. It's a function argument, OR
-    # 3. It was created before the loop (NEW)
+    # 3. It was created before the loop
     read_before_write = set()
     for var in variables_read:
         if var in var_analyzer.first_access:
@@ -347,6 +431,13 @@ def _determine_loop_variables(
         | (function_args & variables_written)
         | pre_loop_written_in_loop
     )
+
+    # Any variable passed by value into the layer call that exists before
+    # the loop may be mutated via object aliasing inside the layer.
+    # Force those into passthrough so they're exported back to the caller.
+    if layer_call_kwargs_values:
+        alias_targets = layer_call_kwargs_values & pre_loop_vars
+        passthrough_vars.update(alias_targets)
 
     # Input-only: read but never written
     input_only_vars = (read_before_write - variables_written) | (
@@ -390,6 +481,7 @@ def _generate_new_forward_source(
     layer_call_info: Dict,
     loop_vars: Dict,
     offloaded_modules: List,
+    var_kwarg_name: str = None,
 ) -> str:
     """Generate new forward source with loop replaced by worker calls"""
     lines = original_source.split('\n')
@@ -444,7 +536,7 @@ def _generate_new_forward_source(
 
     # Generate worker calls
     worker_calls = _generate_worker_calls(
-        layer_call_info, loop_vars, indent_str, offloaded_modules
+        layer_call_info, loop_vars, indent_str, offloaded_modules, var_kwarg_name
     )
 
     # Combine
@@ -505,8 +597,29 @@ def _manually_construct_signature(func_node: ast.FunctionDef) -> str:
     return f"def {func_node.name}({', '.join(args_parts)}):"
 
 
+def _analyze_forward(fn):
+    """
+    Extract source, parse AST, extract args, and locate loop node.
+    """
+    source = inspect.getsource(fn)
+    source = textwrap.dedent(source)
+    tree = ast.parse(source)
+
+    arg_extractor = FunctionArgExtractor()
+    arg_extractor.visit(tree)
+
+    loop_finder = LoopFinder()
+    loop_finder.visit(tree)
+
+    return source, tree, arg_extractor, loop_finder
+
+
 def _generate_worker_calls(
-    layer_call_info: Dict, loop_vars: Dict, indent: str, offloaded_modules: List
+    layer_call_info: Dict,
+    loop_vars: Dict,
+    indent: str,
+    offloaded_modules: List,
+    var_kwarg_name: str = None,
 ) -> List[str]:
     """Generate worker calls with proper variable passing and unpacking"""
     calls = []
@@ -523,54 +636,30 @@ def _generate_worker_calls(
         arg_parts = []
         for var in all_inputs:
             arg_parts.append(f"{indent}    {var}={var}")
-        for kw_arg, kw_value in layer_call_info.get('kwargs', {}).items():
-            if kw_arg not in all_inputs:
-                arg_parts.append(f"{indent}    {kw_arg}={kw_value}")
-        if layer_call_info.get('has_var_kwargs'):
-            arg_parts.append(f"{indent}    **flash_attn_kwargs")
+
+        if layer_call_info.get('has_var_kwargs') and var_kwarg_name:
+            # Only spread **var_kwarg if it isn't already passed as a named arg.
+            # Passing both causes a duplicate keyword argument TypeError.
+            if var_kwarg_name not in all_inputs:
+                arg_parts.append(f"{indent}    **{var_kwarg_name}")
 
         if arg_parts:
             call_str += "\n" + ",\n".join(arg_parts) + f"\n{indent}"
+
         call_str += ")"
         calls.append(call_str)
 
-        # Unpack explicitly computed output vars first
+        # Unpack explicitly computed output vars first (also try alias)
         for var in all_outputs:
+            calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
             calls.append(
-                f"{indent}if isinstance(_worker_output_{idx}, dict) and '{var}' in _worker_output_{idx}:"
+                f"{indent}    _val_{var}_out = _worker_output_{idx}.get('{var}')"
             )
-            calls.append(f"{indent}    {var} = _worker_output_{idx}['{var}']")
-
-        # update ANY input variable that appears in the
-        # worker output dict — catches in-place mutations like
-        # past_key_values that the AST analyzer missed entirely.
-        calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
-        for var in all_inputs:
-            calls.append(
-                f"{indent}    if '{var}' in _worker_output_{idx} and _worker_output_{idx}['{var}'] is not None:"
-            )
-            calls.append(f"{indent}        {var} = _worker_output_{idx}['{var}']")
+            calls.append(f"{indent}    {var} = _val_{var}_out")
 
         calls.append(f"{indent}")
 
     return calls
-
-
-def _analyze_forward(fn):
-    """
-    Extract source, parse AST, extract args, and locate loop node.
-    """
-    source = inspect.getsource(fn)
-    source = textwrap.dedent(source)
-    tree = ast.parse(source)
-
-    arg_extractor = FunctionArgExtractor()
-    arg_extractor.visit(tree)
-
-    loop_finder = LoopFinder()
-    loop_finder.visit(tree)
-
-    return source, tree, arg_extractor, loop_finder
 
 
 def generate_new_forward_method(
@@ -601,7 +690,7 @@ def generate_new_forward_method(
     for stmt in loop_finder.loop_node.body:
         loop_analyzer.visit(stmt)
 
-    # Analyze variables created BEFORE the loop
+    # Analyze variables created before the loop
     func_node = tree.body[0]
     pre_loop_analyzer = VariableUsageAnalyzer()
     for stmt in func_node.body:
@@ -610,9 +699,15 @@ def generate_new_forward_method(
         pre_loop_analyzer.visit(stmt)
 
     pre_loop_vars = pre_loop_analyzer.variables_written
-
     # Extract the layer call to preserve kwargs
     layer_call_info = _extract_layer_call(loop_finder.loop_node)
+
+    # Extract plain-identifier values from layer call kwargs
+    # These are variables passed by alias (e.g. past_key_value=past_key_values)
+    # whose underlying objects get mutated
+    layer_call_kwargs_values = {
+        v for v in layer_call_info.get('kwargs', {}).values() if v.isidentifier()
+    }
 
     # Determine input and output variables
     loop_vars = _determine_loop_variables(
@@ -621,6 +716,7 @@ def generate_new_forward_method(
         arg_extractor.args,
         pre_loop_vars,
         arg_extractor.kwarg_name,
+        layer_call_kwargs_values,
     )
 
     # Generate new forward code
@@ -630,12 +726,14 @@ def generate_new_forward_method(
         layer_call_info,
         loop_vars,
         offloaded_modules,
+        arg_extractor.kwarg_name,
     )
 
     # Prepare namespace
     namespace = _get_model_module_globals(parent_module, original_forward)
 
     try:
+        print(new_forward_code)
         exec(new_forward_code, namespace)
         return namespace["forward"]
     except Exception as e:
@@ -660,7 +758,7 @@ def get_loop_io_signature(parent_module) -> Dict:
     - 'all_outputs': All variables that should be returned
     - 'layer_call_info': Information about the original layer call signature
     - 'loop_body_source': The exact source code of the loop body
-    - 'loop_iterator_name': Name of the loop iterator variable
+    - 'loop_structure': dict of the loop variables
     """
     # Find the module that contains the loop
     module_with_loop, loop_node, module_path = find_loop_in_module_hierarchy(
@@ -712,6 +810,10 @@ def get_loop_io_signature(parent_module) -> Dict:
         call_extractor.layer_calls[0] if call_extractor.layer_calls else {}
     )
 
+    layer_call_kwargs_values = {
+        v for v in layer_call_info.get('kwargs', {}).values() if v.isidentifier()
+    }
+
     # Determine input and output variables
     loop_vars = _determine_loop_variables(
         loop_analyzer,
@@ -719,18 +821,19 @@ def get_loop_io_signature(parent_module) -> Dict:
         arg_extractor.args,
         pre_loop_vars,
         arg_extractor.kwarg_name,
+        layer_call_kwargs_values,
     )
 
     # Extract loop body source and iterator name
     loop_body_source = _extract_loop_body_source(loop_finder.loop_node, source)
-    loop_iterator_name = _extract_loop_iterator_name(loop_finder.loop_node)
+    loop_structure = _extract_loop_structure(loop_finder.loop_node)
 
     # Add all extracted info
     result = {
         **loop_vars,
         'layer_call_info': layer_call_info,
         'loop_body_source': loop_body_source,
-        'loop_iterator_name': loop_iterator_name,
+        'loop_structure': loop_structure,
         'module_with_loop': module_with_loop,
         'module_path': module_path,
     }
@@ -811,15 +914,15 @@ def _extract_loop_body_source(loop_node: ast.For, original_source: str) -> str:
     return ''
 
 
-def _extract_loop_iterator_name(loop_node: ast.For) -> str:
+def _extract_loop_structure(loop_node: ast.For) -> Dict:
     """
-    Extract the name of the loop iterator variable.
+    Extract the name of the original loop iterator variable.
     Example: for decoder_layer in self.layers: -> 'decoder_layer'
     """
-    if isinstance(loop_node.target, ast.Name):
-        return loop_node.target.id
-    else:
-        return ast.unparse(loop_node.target)
+    return {
+        "target_source": ast.unparse(loop_node.target),
+        "iter_source": ast.unparse(loop_node.iter),
+    }
 
 
 def find_loop_in_module_hierarchy(parent_module, max_depth=2):
