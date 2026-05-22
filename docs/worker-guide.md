@@ -101,7 +101,7 @@ Rewards are accrued to the wallet address defined in your configuration. Enter y
 
 ## Troubleshooting
 
-If you encounter issues, please open a [GitHub Issue](https://github.com/tensorlink-lab/tensorlink/issues) and include:
+If you encounter issues, please open a [GitHub Issue](https://github.com/tensorlink-lab/tensorlink/tree/main/issues) and include:
 
 * Steps to reproduce the problem
 * Relevant node logs
@@ -119,4 +119,4 @@ Check that your internet connection is stable and ensure no firewall is blocking
 Reduce `max_vram_gb` in `config.json` to leave additional headroom for system processes.
 
 **Other issues**
-Join the [Discord](https://discord.gg) for support or open a [GitHub Issue](https://github.com/tensorlink-lab/tensorlink/issues).
+Join the [Discord](https://discord.gg) for support or open a [GitHub Issue](https://github.com/tensorlink-lab/tensorlink/tree/main/issues).
