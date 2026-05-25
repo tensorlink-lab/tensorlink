@@ -10,7 +10,7 @@ from collections import deque
 from transformers import AutoTokenizer
 from tensorlink.ml import DistributedModel
 
-MODEL_NAME = "Qwen/Qwen3-8B-Instruct"
+MODEL_NAME = "Qwen/Qwen3-8B"
 
 MAX_HISTORY_TURNS = 6
 MAX_NEW_TOKENS = 256
