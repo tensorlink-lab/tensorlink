@@ -96,7 +96,7 @@ if __name__ == "__main__":
         )
 
     # Decode only the newly generated tokens
-    new_tokens = output_ids[0][inputs["input_ids"].shape[-1]:]
+    new_tokens = output_ids[0][inputs["input_ids"].shape[-1] :]
     reply = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print("Assistant:", reply)
 
@@ -116,6 +116,6 @@ if __name__ == "__main__":
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    new_tokens = output_ids[0][inputs["input_ids"].shape[-1]:]
+    new_tokens = output_ids[0][inputs["input_ids"].shape[-1] :]
     reply = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print("Assistant:", reply)
