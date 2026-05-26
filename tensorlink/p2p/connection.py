@@ -1,4 +1,5 @@
 from datetime import datetime
+from multiprocessing import shared_memory
 import threading
 import logging
 import hashlib
@@ -351,3 +352,53 @@ class Connection(threading.Thread):
                         break
 
             time.sleep(10)
+
+    def send_tensor_from_shm(
+        self,
+        shm_name: str,
+        payload_size: int,
+        header: bytes,
+        trailer: bytes = b"",
+    ):
+        """
+        Stream a tensor payload directly from a shared memory block.
+
+        Wire format:  header | payload (zero-copy memoryview) | trailer | EOT_CHAR
+
+        The header contains everything before the tensor bytes (e.g. b"FORWARD7::").
+        The trailer contains everything after (e.g. the JSON context bytes).
+        This matches the existing receiver parsing:  prefix + size:: + tensor + json
+        """
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name, create=False)
+            try:
+                self.sock.sendall(header)
+
+                view = memoryview(shm.buf[:payload_size])
+                num_chunks = (payload_size + self.chunk_size - 1) // self.chunk_size
+
+                for chunk_number, offset in enumerate(
+                    range(0, payload_size, self.chunk_size), start=1
+                ):
+                    self.sock.sendall(view[offset : offset + self.chunk_size])
+                    if chunk_number % 100 == 0:
+                        self.main_node.debug_print(
+                            f"Sent chunk {chunk_number} of {num_chunks}",
+                            colour="magenta",
+                            tag="Connection",
+                        )
+
+                # Trailer (JSON context) + EOT in one syscall
+                self.sock.sendall(trailer + self.EOT_CHAR)
+
+            finally:
+                del view
+                shm.close()
+
+        except Exception as e:
+            self.main_node.debug_print(
+                f"Connection send_tensor_from_shm error: {e}",
+                level=logging.ERROR,
+                tag="Connection",
+            )
+            self.stop()

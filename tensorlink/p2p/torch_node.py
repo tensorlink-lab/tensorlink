@@ -64,6 +64,45 @@ def format_size(size_bytes):
         return f"{size_bytes} bytes"
 
 
+def send_forward(node: Connection, size: int, shm_name: str, context, module_id):
+    """
+    Send a forward-pass tensor to a peer node directly from shared memory.
+
+    Builds only the small framing header in Python; the payload is streamed
+    zero-copy from the SHM block by Connection.send_tensor_from_shm.
+
+    Args:
+        node:      Destination Connection.
+        size:      Byte length of the serialized tensor in the SHM block.
+        shm_name:  Name of the SharedMemory block holding the payload.
+        context:   Routing key (list/tuple of [n_batch, n_micro, module_id]).
+        module_id: ID of the module this forward pass belongs to.
+    """
+    payload = {"module_id": module_id, "key": context}
+    # Header: prefix + decimal-size marker + json context
+    header = b"FORWARD" + str(size).encode() + b"::"
+    # trailer: everything after the tensor bytes — matches data[eos+2+size:] on receiver
+    trailer = json.dumps(payload).encode()
+    node.send_tensor_from_shm(shm_name, size, header, trailer)
+
+
+def send_backward(node: Connection, size: int, shm_name: str, context):
+    """
+    Send a backward-pass gradient tensor directly from shared memory.
+
+    Same zero-copy approach as send_forward.
+
+    Args:
+        node:      Destination Connection.
+        size:      Byte length of the serialized tensor in the SHM block.
+        shm_name:  Name of the SharedMemory block holding the payload.
+        context:   Routing key passed through as JSON.
+    """
+    header = b"BACKWARD" + str(size).encode() + b"::"
+    trailer = json.dumps(context).encode()
+    node.send_tensor_from_shm(shm_name, size, header, trailer)
+
+
 class Torchnode(Smartnode):
     """"""
 
@@ -535,8 +574,7 @@ class Torchnode(Smartnode):
         # Send forward pass tensor from shared mpc to a node
         worker_id, module_id, size, shm_name, tag = request["args"]
         node = self.nodes[worker_id]
-        forward_bytes = get_from_shared_memory(size, shm_name, encoded=True)
-        self.send_forward(node, forward_bytes, tag, module_id)
+        send_forward(node, size, shm_name, tag, module_id)
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_send_generate(self, request):
@@ -573,8 +611,7 @@ class Torchnode(Smartnode):
         # Send backwards pass from shared mpc to a node
         worker_id, size, shm_name, tag = request["args"]
         node = self.nodes[worker_id]
-        backward_bytes = get_from_shared_memory(size, shm_name, encoded=True)
-        self.send_backward(node, backward_bytes, tag)
+        send_backward(node, size, shm_name, tag)
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_send_parameters(self, request):
@@ -832,19 +869,6 @@ class Torchnode(Smartnode):
         self.debug_print(message, colour=colour, level=level, tag=tag)
         self.response_queue.put({"status": "SUCCESS", "return": False})
 
-    def send_forward(self, node: Connection, forward_bytes, context, module_id):
-        """Send forward pass to node, must contain args (module args) and context (module + epoch id)"""
-
-        # Inject module_id into context
-        payload = {
-            "module_id": module_id,
-            "key": context,
-        }
-
-        size = str(len(forward_bytes)).encode() + b"::"
-        json_data = b"FORWARD" + size + forward_bytes + json.dumps(payload).encode()
-        self.send_to_node(node, json_data)
-
     def _store_tensor_in_shared_memory(self, key, tensor: bytes, backward=False):
         id_hash = key[2]
         size = len(tensor)
@@ -871,12 +895,6 @@ class Torchnode(Smartnode):
 
         self.modules[module_id]["parameters"][key] = (size, shm.name)
         self.memory_manager[key] = shm.name
-
-    def send_backward(self, node: Connection, backward_bytes, context):
-        """Send backward pass to node, must contain args (module args) and context (module + epoch id)"""
-        size = str(len(backward_bytes)).encode() + b"::"
-        json_data = b"BACKWARD" + size + backward_bytes + json.dumps(context).encode()
-        self.send_to_node(node, json_data)
 
     def send_parameters_req(self, node: Connection, module_id: str):
         """Request parameters from a specific worker"""
