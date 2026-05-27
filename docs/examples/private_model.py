@@ -58,7 +58,7 @@ import torch
 from collections import deque
 from transformers import AutoTokenizer
 from tensorlink.ml import DistributedModel
-from node_setup import connect_nodes, launch_nodes
+from helpers import connect_nodes, launch_nodes
 
 MODEL_NAME = "Qwen/Qwen3-8B"
 

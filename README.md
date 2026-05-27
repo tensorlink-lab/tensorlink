@@ -11,7 +11,7 @@
   <a href="https://discord.gg/aCW2kTNzJ2">
     <img src="https://img.shields.io/badge/Join%20Discord-5865F2?logo=discord&logoColor=white" alt="Join us on Discord"/>
   </a>
-  <a href="https://smartnodes.ca/tensorlink/docs" target="_blank">
+  <a href="https://smartnodes.ca/tensorlink/tree/main/docs" target="_blank">
     <img src="https://img.shields.io/badge/Documentation-1d72b8?logo=readthedocs&logoColor=white" alt="Documentation"/>
   </a>
 </p>
@@ -96,7 +96,7 @@ optimizer.step()
 optimizer.zero_grad()
 ```
 
-> For private clusters, custom architectures, and full parameter reference, see [**docs/distributed-models.md**](https://github.com/tensorlink-lab/tensorlink/docs/distributed-models.md).
+> For private clusters, custom architectures, and full parameter reference, see [**docs/distributed-models.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/distributed-models.md).
 
 ---
 
@@ -141,7 +141,7 @@ response = requests.post(
 print(response.json()["choices"][0]["message"]["content"])
 ```
 
-> For all endpoints, streaming, the responses API, and model preloading, see [**docs/api.md**](https://github.com/tensorlink-lab/tensorlink/docs/api.md).
+> For all endpoints, streaming, the responses API, and model preloading, see [**docs/api.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/api.md).
 
 ---
 
@@ -156,8 +156,8 @@ Run worker or validator nodes to contribute compute to the public network, host 
 The default config runs a public worker node, where your GPU will process network jobs and earn rewards on the public
 network via [Smartnodes](https://smartnodes.ca).
 
-> For configuration reference, private cluster setup, and network architecture patterns, see [**docs/nodes.md**](https://github.com/tensorlink-lab/tensorlink/docs/nodes.md).  
-> To contribute your GPU in the fastest way possible, see [**docs/worker-guide.md**](https://github.com/tensorlink-lab/tensorlink/docs/worker-guide.md).
+> For configuration reference, private cluster setup, and network architecture patterns, see [**docs/nodes.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/nodes.md).  
+> To contribute your GPU in the fastest way possible, see [**docs/worker-guide.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/worker-guide.md).
 
 ---
 
@@ -165,14 +165,14 @@ network via [Smartnodes](https://smartnodes.ca).
 
 | Resource                                                                                      | Description                                                  |
 |-----------------------------------------------------------------------------------------------|--------------------------------------------------------------|
-| [Getting Started](https://github.com/tensorlink-lab/tensorlink/docs/getting-started.md)       | Installation, requirements, and first steps                  |
-| [Distributed Models](https://github.com/tensorlink-lab/tensorlink/docs/distributed-models.md) | `DistributedModel`, `DistributedOptimizer`, private clusters |
-| [API Reference](https://github.com/tensorlink-lab/tensorlink/docs/api.md)                     | HTTP endpoints, parameters, and examples                     |
-| [Node Setup](https://github.com/tensorlink-lab/tensorlink/docs/nodes.md)                      | Workers, validators, config reference, network topologies    |
-| [Worker Quick Start](https://github.com/tensorlink-lab/tensorlink/docs/worker-guide.md)       | Contribute GPU compute in minutes                            |
+| [Getting Started](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/getting-started.md)       | Installation, requirements, and first steps                  |
+| [Distributed Models](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/distributed-models.md) | `DistributedModel`, `DistributedOptimizer`, private clusters |
+| [API Reference](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/api.md)                     | HTTP endpoints, parameters, and examples                     |
+| [Node Setup](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/nodes.md)                      | Workers, validators, config reference, network topologies    |
+| [Worker Quick Start](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/worker-guide.md)       | Contribute GPU compute in minutes                            |
 | [Discord Community](https://discord.gg/aCW2kTNzJ2)                                            | Get help and connect with developers                         |
 | [Live Demo](https://tensorlink.io)                                                            | Try a chatbot powered by Tensorlink                          |
-| [Litepaper](https://github.com/tensorlink-lab/tensorlink/docs/LITEPAPER.md)                   | Technical overview and architecture                          |
+| [Litepaper](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/LITEPAPER.md)                   | Technical overview and architecture                          |
 
 ---
 
