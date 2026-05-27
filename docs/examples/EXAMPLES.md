@@ -123,7 +123,7 @@ from tensorlink.nodes import User, UserConfig
 # Must explicitly create a node to connect to validator node
 node = User(
   UserConfig(
-    priority_nodes=[["192.168.2.42", 38751]]
+    priority_nodes=[["192.168.2.42", 38752]]
   )
 )
 
@@ -349,7 +349,7 @@ response = requests.post(
     "mining": false,
     "mining_script": "path/to/mining.executable",
     "seed_validators": [
-      ["smartnodes.ddns.net", 38751, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
+      ["smartnodes.ddns.net", 38752, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
     ]
   },
   "ml": {

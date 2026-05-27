@@ -1,10 +1,15 @@
-from tensorlink.ml.utils import get_popular_model_stats
+from tensorlink.ml.utils.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
     GenerationRequest,
     ModelStatusResponse,
     ChatCompletionRequest,
+    AnyResponseRequest,
+    TextResponseRequest,
+    ImageResponseRequest,
+    EmbeddingResponseRequest,
 )
+from tensorlink.ml.utils.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from collections import defaultdict
@@ -13,9 +18,7 @@ import logging
 import uvicorn
 import asyncio
 import random
-import queue
 import time
-import json
 
 
 def build_hf_job_data(
@@ -24,7 +27,7 @@ def build_hf_job_data(
     author: str,
     model_type: str = "hf",
     payment: int = 0,
-    time: int = 0,
+    duration: int = 0,
     hosted: bool = True,
     training: bool = False,
     seed_validators=None,
@@ -39,7 +42,7 @@ def build_hf_job_data(
         "hosted": hosted,
         "training": training,
         "payment": payment,
-        "time": time,
+        "time": duration,
         "capacity": 0,
         "n_pipelines": 1,
         "dp_factor": 1,
@@ -51,7 +54,73 @@ def build_hf_job_data(
     }
 
 
+def _parse_chat_messages(messages):
+    """
+    Parse chat messages into system messages, history, and last user message.
+    Returns: (system_messages, history, last_user_message)
+    """
+    system_messages = []
+    conversation = []
+
+    for msg in messages:
+        if msg.role not in ("system", "user", "assistant"):
+            continue
+
+        if msg.role == "system":
+            system_messages.append(msg.content)
+        else:
+            conversation.append({"role": msg.role, "content": msg.content})
+
+    # Find last user message
+    last_user_message = None
+    last_user_idx = None
+
+    for idx in range(len(conversation) - 1, -1, -1):
+        if conversation[idx]["role"] == "user":
+            last_user_message = conversation[idx]["content"]
+            last_user_idx = idx
+            break
+
+    if last_user_message is None:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    # Build history (everything before the last user message)
+    history = conversation[:last_user_idx]
+
+    # Prepend system message to history if present
+    if system_messages:
+        combined_system = "\n".join(system_messages)
+        history.insert(0, {"role": "system", "content": combined_system})
+
+    return system_messages, history, last_user_message
+
+
+def _build_generation_request(request) -> GenerationRequest:
+    """Shared factory: ChatCompletionRequest or TextResponseRequest → GenerationRequest."""
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+    _, history, last_user_message = _parse_chat_messages(request.messages)
+    return GenerationRequest(
+        hf_name=request.model,
+        message=last_user_message,
+        history=history,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_new_tokens=request.max_tokens,
+        stream=request.stream,
+        input_format="chat",
+        output_format="openai",
+        do_sample=(request.temperature or 0) > 0,
+        is_chat_completion=True,
+    )
+
+
 class TensorlinkAPI:
+    """
+    Supports API requests to request and interact with models, along with
+    probing node & job information.
+    """
+
     def __init__(self, smart_node, host="0.0.0.0", port=64747):
         self.smart_node = smart_node
         self.host = host
@@ -65,146 +134,54 @@ class TensorlinkAPI:
         # Track models requested via API for prioritization
         self.api_requested_models = set()
         self.streaming_responses = {}
-
+        self.pending_requests: dict[int, asyncio.Future] = {}
+        self.api_loop: asyncio.AbstractEventLoop = None
+        self._cancelled_requests: set = set()
         self.server_loop = None
 
         self._define_routes()
         self._start_server()
 
     def _define_routes(self):
-        @self.router.post("/v1/generate")
-        async def generate(request: GenerationRequest):
-            """Updated /v1/generate endpoint"""
-            try:
-                start_time = time.time()
-                request.input_format = getattr(request, "input_format", "raw")
-                request.output_format = getattr(request, "output_format", "simple")
+        """Register all API routes by delegating to specialized methods"""
+        self._register_generate_routes()
+        self._register_model_routes()
+        self._register_stats_routes()
+        self._register_network_routes()
+        self.app.include_router(self.router)
 
-                # Log model request
-                current_time = time.time()
-                self.model_request_timestamps[request.hf_name].append(current_time)
-                cutoff = current_time - 300
-                self.model_request_timestamps[request.hf_name] = [
-                    ts
-                    for ts in self.model_request_timestamps[request.hf_name]
-                    if ts > cutoff
-                ]
-
-                if request.hf_name not in self.model_name_to_request:
-                    self.model_name_to_request[request.hf_name] = 1
-                self.model_name_to_request[request.hf_name] += 1
-
-                request.output = None
-                request_id = f"req_{hash(random.random())}"
-                request.id = hash(request_id)
-
-                # Model status checks
-                model_status = self._check_model_status(request.hf_name)
-                if model_status["status"] == "not_loaded":
-                    self._trigger_model_load(request.hf_name)
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Model '{request.hf_name}' has been requested on the network. "
-                        f"Please try again in a few moments.",
-                    )
-                elif model_status["status"] == "loading":
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Model {request.hf_name} is still loading. Please try again.",
-                    )
-
-                stream = getattr(request, 'stream', False)
-
-                if stream:
-                    return StreamingResponse(
-                        self._generate_stream(request, request_id, start_time),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    # Non-streaming
-                    self.smart_node.endpoint_requests["incoming"].append(request)
-                    request = await self._wait_for_result(request)
-
-                    # Return formatted response (not just output text)
-                    if hasattr(request, 'formatted_response'):
-                        return request.formatted_response
-                    else:
-                        # Fallback for legacy compatibility
-                        return {"text": request.output}
-
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-
+    def _register_generate_routes(self):
         @self.router.post("/v1/chat/completions")
         async def chat_completions(request: ChatCompletionRequest):
-            """
-            OpenAI-compatible chat completions endpoint.
-            Maps OpenAI request into Tensorlink GenerationRequest.
-            """
             try:
-                if not request.messages:
-                    raise HTTPException(
-                        status_code=400, detail="messages cannot be empty"
-                    )
-
-                # Separate system messages from conversation
-                system_messages = []
-                conversation = []
-
-                for msg in request.messages:
-                    if msg.role not in ("system", "user", "assistant"):
-                        continue
-
-                    if msg.role == "system":
-                        system_messages.append(msg.content)
-                    else:
-                        conversation.append({"role": msg.role, "content": msg.content})
-
-                # Find last user message
-                last_user_message = None
-                last_user_idx = None
-
-                for idx in range(len(conversation) - 1, -1, -1):
-                    if conversation[idx]["role"] == "user":
-                        last_user_message = conversation[idx]["content"]
-                        last_user_idx = idx
-                        break
-
-                if last_user_message is None:
-                    raise HTTPException(status_code=400, detail="No user message found")
-
-                # Build history (everything before the last user message)
-                history = conversation[:last_user_idx]
-
-                # Prepend system message to history if present
-                if system_messages:
-                    combined_system = "\n".join(system_messages)
-                    history.insert(0, {"role": "system", "content": combined_system})
-
-                # Create GenerationRequest
-                gen_request = GenerationRequest(
-                    hf_name=request.model,
-                    message=last_user_message,
-                    history=history,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    max_new_tokens=request.max_tokens,
-                    stream=request.stream,
-                    input_format="chat",
-                    output_format="openai",
-                    do_sample=request.temperature > 0,
-                    is_chat_completion=True,
-                )
-
-                # Call generate endpoint
-                return await generate(gen_request)
-
+                return await self._dispatch_text(_build_generation_request(request))
             except HTTPException:
                 raise
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
+
+        @self.router.post("/v1/responses")
+        async def responses(request: AnyResponseRequest):
+            handlers = {
+                "text": self._handle_text_response,
+                "image": self._handle_image_response,
+                "embedding": self._handle_embedding_response,
+            }
+            handler = handlers.get(request.type)
+            if not handler:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unsupported response type: '{request.type}'",
+                )
+            try:
+                return await handler(request)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+    def _register_model_routes(self):
+        """Register model management endpoints"""
 
         @self.router.post("/request-model", response_model=ModelStatusResponse)
         def request_model(job_request: JobRequest, request: Request):
@@ -241,7 +218,7 @@ class TensorlinkAPI:
                     model_name=model_name,
                     author=self.smart_node.rsa_key_hash,
                     payment=job_request.payment,
-                    time=job_request.time,
+                    duration=job_request.time,
                     model_type=job_request.model_type,
                 )
 
@@ -280,35 +257,28 @@ class TensorlinkAPI:
             """Return current API demand statistics"""
             return get_popular_model_stats(days=days, limit=limit)
 
-        @self.router.get("/available-models")
+        @self.router.get("/models")
         def list_available_models():
             """List all currently loaded models"""
             try:
-                loaded_models = []
-                loading_models = []
-
-                # Query the node's worker for model status
-                response = self.smart_node.request_queue.put(
-                    {"type": "get_loaded_models", "args": None}
+                jobs = [self.smart_node.dht.query(a) for a in self.smart_node.jobs]
+                public_models = set(
+                    [
+                        j.get("model_name")
+                        for j in jobs
+                        if isinstance(j, dict) and j.get("public") and j.get("active")
+                    ]
                 )
 
-                # Wait for response
-                try:
-                    result = self.smart_node.response_queue.get(timeout=5)
-                    if result.get("status") == "SUCCESS":
-                        model_info = result.get("return", {})
-                        loaded_models = model_info.get("loaded", [])
-                        loading_models = model_info.get("loading", [])
-                except queue.Empty:
-                    pass
-
                 return {
-                    "loaded_models": loaded_models,
-                    "loading_models": loading_models,
-                    "api_requested_models": list(self.api_requested_models),
+                    "active_models": list(public_models),
                 }
+
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
+
+    def _register_stats_routes(self):
+        """Register statistics and monitoring endpoints"""
 
         @self.app.get("/stats")
         async def get_network_stats():
@@ -332,6 +302,9 @@ class TensorlinkAPI:
             Retrieve historical proposals from the node's archive cache.
             """
             return self.smart_node.keeper.get_proposals(limit=limit)
+
+    def _register_network_routes(self):
+        """Register network and node information endpoints"""
 
         @self.app.get("/node-info")
         async def get_node_info(node_id: str):
@@ -367,85 +340,131 @@ class TensorlinkAPI:
             """Get claim information for a specific worker node"""
             return self.smart_node.contract_manager.get_worker_claim_data(node_address)
 
-        self.app.include_router(self.router)
+    async def _dispatch_text(self, gen_request: GenerationRequest):
+        start_time = time.time()
+        self._log_model_request(gen_request.hf_name)
+        gen_request.output = None
+        gen_request.id = hash(f"req_{random.random()}")
+
+        model_status = self._check_model_status(gen_request.hf_name)
+        if model_status["status"] == "not_loaded":
+            self._trigger_model_load(gen_request.hf_name)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
+            )
+        if model_status["status"] == "loading":
+            raise HTTPException(
+                status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
+            )
+
+        if gen_request.stream:
+            return StreamingResponse(
+                self._generate_stream(gen_request, str(gen_request.id), start_time),
+                media_type="text/event-stream",
+            )
+        gen_request = await self._wait_for_result(gen_request)
+        if getattr(gen_request, "formatted_response", None):
+            return gen_request.formatted_response
+        return {"text": gen_request.output}
+
+    async def _handle_text_response(self, request: TextResponseRequest):
+        return await self._dispatch_text(_build_generation_request(request))
+
+    async def _handle_image_response(self, request: ImageResponseRequest):
+        raise HTTPException(
+            status_code=501, detail="Image generation is not yet implemented."
+        )
+
+    async def _handle_embedding_response(self, request: EmbeddingResponseRequest):
+        raise HTTPException(
+            status_code=501, detail="Embeddings are not yet implemented."
+        )
+
+    def _log_model_request(self, model_name: str):
+        """Log and track model requests for prioritization"""
+        current_time = time.time()
+        self.model_request_timestamps[model_name].append(current_time)
+
+        # Keep only requests from last 5 minutes
+        cutoff = current_time - 300
+        self.model_request_timestamps[model_name] = [
+            ts for ts in self.model_request_timestamps[model_name] if ts > cutoff
+        ]
+
+        if model_name not in self.model_name_to_request:
+            self.model_name_to_request[model_name] = 1
+        self.model_name_to_request[model_name] += 1
 
     async def _generate_stream(self, request, request_id, start_time):
         """Generator function for streaming tokens"""
+        loop = asyncio.get_running_loop()
+        self.api_loop = loop
+
+        token_queue = asyncio.Queue()
+        self.streaming_responses[request.id] = token_queue
+
+        request.stream = True
+        request.start_time = start_time
+        self.smart_node.endpoint_requests["incoming"].append(request)
+
         try:
-            # Create queue for this request to receive tokens
-            token_queue = asyncio.Queue()
-            self.streaming_responses[request.id] = token_queue
-
-            # Mark request as streaming
-            request.stream = True
-            request.start_time = start_time  # Make sure start_time is set
-
-            # Add to processing queue
-            self.smart_node.endpoint_requests["incoming"].append(request)
-
-            # Stream tokens as they arrive
             while True:
                 try:
-                    # Wait for next token with timeout
                     token_data = await asyncio.wait_for(token_queue.get(), timeout=30.0)
 
                     if token_data.get("done"):
-                        # Send final chunk if provided
-                        final_chunk = token_data.get("final_chunk")
-                        if final_chunk:
-                            yield final_chunk
-                        # Also check if there's a token in the done message
-                        elif token_data.get("token"):
-                            yield token_data.get("token")
-                        else:
-                            # Fallback
-                            yield "data: [DONE]\n\n"
+                        sse_chunk = token_data.get("token", "data: [DONE]\n\n")
+                        yield sse_chunk
                         break
 
-                    # Pull fully-formatted SSE string from 'token'
                     sse_chunk = token_data.get("token")
                     if sse_chunk:
                         yield sse_chunk
-                    else:
-                        # Skip empty chunks
-                        continue
 
                 except asyncio.TimeoutError:
-                    error_chunk = {
-                        "error": {
-                            "message": "Generation timed out",
-                            "type": "timeout_error",
-                        }
-                    }
-                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield ResponseFormatter.format_stream_error(
+                        error_message="Generation timed out", error_type="timeout_error"
+                    )
                     break
 
+        except asyncio.CancelledError:
+            # Client disconnected
+            request.cancelled = True
+            raise
+
         except Exception as e:
-            error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
-            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield ResponseFormatter.format_stream_error(
+                error_message=str(e), error_type="internal_error"
+            )
+
         finally:
-            # Clean up
-            if request.id in self.streaming_responses:
-                del self.streaming_responses[request.id]
+            self.streaming_responses.pop(request.id, None)
 
     def send_token_to_stream(self, request_id, token=None, done=False, **kwargs):
-        """
-        Push pre-formatted streaming chunks to the SSE queue.
-        The 'token' here is the full SSE chunk string prepared by the validator.
-        """
-        if request_id not in self.streaming_responses:
+        """Push pre-formatted streaming chunks to the SSE queue"""
+        # Drop tokens for cancelled/disconnected requests
+        if getattr(self, '_cancelled_requests', set()).__contains__(request_id):
             return
 
         if not self.server_loop:
             return
 
-        response_queue = self.streaming_responses[request_id]
+        queue = self.streaming_responses.get(request_id)
+        if not queue:
+            return
 
-        # Build data dictionary to put into the asyncio queue
         data = {"token": token, "done": done, **kwargs}
+        asyncio.run_coroutine_threadsafe(queue.put(data), self.server_loop)
 
-        # Safely enqueue for StreamingResponse
-        asyncio.run_coroutine_threadsafe(response_queue.put(data), self.server_loop)
+    def resolve_pending_request(self, response):
+        """Resolve a non-streaming Future from the ML thread"""
+        if not self.api_loop:
+            return
+
+        fut = self.pending_requests.get(response.id)
+        if fut and not fut.done():
+            self.api_loop.call_soon_threadsafe(fut.set_result, response)
 
     def _check_model_status(self, model_name: str) -> dict:
         """Check if a model is loaded, loading, or not loaded"""
@@ -454,12 +473,18 @@ class TensorlinkAPI:
 
         try:
             # Check if there is a public job with this module
-            for module_id, module in self.smart_node.modules.items():
-                if module.get("model_name", "") == model_name:
-                    if module.get("public", False):
-                        status = "loaded"
-                        message = f"Model {model_name} is loaded and ready"
-                        break
+            for job_id in self.smart_node.jobs:
+                job_data = self.smart_node.dht.query(job_id)
+                if (
+                    job_data.get("model_name", "") == model_name
+                    and job_data.get("hosted")
+                    and job_data.get("api")
+                    and job_data.get("public")
+                    and job_data.get("active")
+                ):
+                    status = "loaded"
+                    message = f"Model {model_name} is loaded and ready"
+                    break
 
         except Exception as e:
             logging.error(f"Error checking model status: {e}")
@@ -483,18 +508,21 @@ class TensorlinkAPI:
             logging.error(f"Error triggering model load: {e}")
 
     async def _wait_for_result(self, request: GenerationRequest, timeout: int = 300):
-        """Wait for the generation result with timeout"""
-        start_time = time.time()
+        """Wait for the generation result using a Future instead of polling outgoing list"""
+        loop = asyncio.get_running_loop()
+        self.api_loop = loop
 
-        while time.time() - start_time < timeout:
-            # Check if result is ready
-            for idx, req in enumerate(self.smart_node.endpoint_requests["outgoing"]):
-                if req.id == request.id:
-                    return self.smart_node.endpoint_requests["outgoing"].pop(idx)
+        fut = loop.create_future()
+        self.pending_requests[request.id] = fut
+        self.smart_node.endpoint_requests["incoming"].append(request)
 
-            await asyncio.sleep(0.1)
-
-        raise HTTPException(status_code=504, detail="Request timed out")
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            request.cancelled = True
+            raise HTTPException(status_code=504, detail="Request timed out")
+        finally:
+            self.pending_requests.pop(request.id, None)
 
     def _start_server(self):
         """Start the FastAPI server in a separate thread"""

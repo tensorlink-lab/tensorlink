@@ -13,6 +13,7 @@ from tensorlink.ml import DistributedModel
 import torch.optim as optim
 import torch
 
+
 # Variables for nodes and distributed models
 LOCAL = True
 UPNP = False

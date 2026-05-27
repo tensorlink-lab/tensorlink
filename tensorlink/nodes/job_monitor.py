@@ -432,7 +432,7 @@ class JobMonitor:
     def _cleanup_workers(self, job_data: Dict):
         """Clean up worker resources and send shutdown signals."""
         for module_id, module_info in job_data["distribution"].items():
-            if module_info["type"] == "offloaded":
+            if "offloaded" in module_info["type"]:
                 for worker_id in module_info["assigned_workers"]:
                     try:
                         node = self.node.nodes[worker_id]
