@@ -11,7 +11,7 @@
   <a href="https://discord.gg/aCW2kTNzJ2">
     <img src="https://img.shields.io/badge/Join%20Discord-5865F2?logo=discord&logoColor=white" alt="Join us on Discord"/>
   </a>
-  <a href="https://smartnodes.ca/tensorlink/tree/main/docs" target="_blank">
+  <a href="https://smartnodes.ca/tensorlink/docs" target="_blank">
     <img src="https://img.shields.io/badge/Documentation-1d72b8?logo=readthedocs&logoColor=white" alt="Documentation"/>
   </a>
 </p>
