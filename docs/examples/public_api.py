@@ -91,7 +91,6 @@ def chat_completion_stream():
 def responses_text():
     payload = {
         "model": MODEL_NAME,
-        "type": "text",
         "messages": [
             {
                 "role": "user",

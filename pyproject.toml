@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tensorlink"
-version = "0.3.0"
+version = "0.3.1"
 description = "Tensorlink is a decentralized Python library for distributed PyTorch models, providing easy Hugging Face API access and enabling users to share compute resources across a global network."
 authors = [
     "Tensorlink Lab <smartnodes-lab@proton.me>",
