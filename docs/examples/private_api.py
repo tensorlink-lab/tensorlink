@@ -50,7 +50,7 @@ Connects to the validator by specifying its IP:PORT:
 }
 """
 
-from helpers import connect_nodes, launch_nodes_no_user
+from helpers import connect_nodes, launch_nodes_no_user, request_model
 import requests
 
 SERVER_URL = "http://127.0.0.1:64747"

@@ -81,7 +81,7 @@ def send_forward(node: Connection, size: int, shm_name: str, context, module_id)
     payload = {"module_id": module_id, "key": context}
     # Header: prefix + decimal-size marker + json context
     header = b"FORWARD" + str(size).encode() + b"::"
-    # trailer: everything after the tensor bytes — matches data[eos+2+size:] on receiver
+    # trailer: everything after the tensor bytes, matches data[eos+2+size:] on receiver
     trailer = json.dumps(payload).encode()
     node.send_tensor_from_shm(shm_name, size, header, trailer)
 

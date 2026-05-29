@@ -225,7 +225,7 @@ def handle_output(tensor):
                 return v
 
     # Tuple/list: only unwrap if single-element containing a tensor
-    # Do NOT flatten multi-element tuples — they may be (input_ids, attention_mask, ...)
+    # Do NOT flatten multi-element tuples, they may be (input_ids, attention_mask, ...)
     if isinstance(tensor, (tuple, list)):
         tensors = [t for t in tensor if isinstance(t, torch.Tensor)]
         if len(tensors) == 1:

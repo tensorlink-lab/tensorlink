@@ -186,7 +186,7 @@ def format_chat_prompt(
         except Exception:
             pass
 
-    # Universal fallback — no model-specific logic
+    # Universal fallback, no model-specific logic
     prompt = _universal_chat_prompt_fallback(
         current_message, history, enable_thinking=enable_thinking
     )
@@ -320,7 +320,7 @@ class ResponseFormatter:
                 "processing_time": processing_time,
             }
 
-        # "raw" — minimal plain-text response
+        # "raw" - minimal plain-text response
         response: Dict[str, Any] = {"text": output_text}
         if reasoning_text:
             response["reasoning"] = reasoning_text
@@ -348,7 +348,7 @@ class ResponseFormatter:
                 ],
             }
         else:
-            # "raw" — lightweight token event
+            # "raw" - lightweight token event
             chunk_data = {
                 "id": str(request.id),
                 "token": token_text,

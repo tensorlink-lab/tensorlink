@@ -15,7 +15,7 @@ class JobRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Internal generation request — used by the ML pipeline only.
+# Internal generation request, used by the ML pipeline only.
 # Not exposed directly as an API request body.
 # ---------------------------------------------------------------------------
 class GenerationRequest(BaseModel):
@@ -57,7 +57,7 @@ class GenerationRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# v1/chat/completions — OpenAI-compatible chat completion request
+# v1/chat/completions, OpenAI-compatible chat completion request
 # ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
@@ -88,16 +88,16 @@ class ChatCompletionRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# v1/responses — Multi-modal response API (layout; handlers TBD)
+# v1/responses - Multi-modal response API (layout; handlers TBD)
 #
 # Modality is declared via `type`. Each type will have its own request/
 # response pair below. Add new modalities here as the API grows.
 #
 # Supported types (planned):
-#   "text"        — chat / text-generation  (maps to ChatCompletionRequest)
-#   "image"       — text-to-image generation
-#   "embedding"   — text embeddings
-#   "audio"       — text-to-speech / speech-to-text  (future)
+#   "text"        - chat / text-generation  (maps to ChatCompletionRequest)
+#   "image"       - text-to-image generation
+#   "embedding"   - text embeddings
+#   "audio"       - text-to-speech / speech-to-text  (future)
 # ---------------------------------------------------------------------------
 class _BaseResponseRequest(BaseModel):
     """Shared fields inherited by every modality request"""

@@ -143,7 +143,7 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
 
     Works by progressively stripping leading path components until a prefix
     is found that actually exists in the weight files. This is entirely
-    architecture-agnostic — no hardcoded model family names.
+    architecture-agnostic.
 
     Examples (Qwen3 weight keys: "model.embed_tokens.weight", "lm_head.weight"):
       module_path="model.model"              -> "model"
@@ -174,7 +174,7 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
         if any(key.startswith(candidate + ".") for key in sampled):
             return candidate
 
-    # Nothing matched — signal a root/full load
+    # Nothing matched, signal a root/full load
     return ""
 
 
@@ -368,7 +368,7 @@ def load_module_weights(
 
     if prefix is None:
         warn_fn(
-            f"Could not resolve weight prefix for '{module_path}' — "
+            f"Could not resolve weight prefix for '{module_path}' - "
             f"falling back to full scan. Module may load with missing keys."
         )
         # Last resort: load everything and let load_state_dict filter

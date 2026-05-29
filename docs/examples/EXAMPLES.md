@@ -2,330 +2,59 @@
 
 Comprehensive examples for using Tensorlink across different interfaces and deployment scenarios.
 
-## 📚 Table of Contents
+## Table of Contents
 
 - [Python Examples](#python-examples)
-  - [Basic Model Usage](#basic-model-usage)
-  - [Distributed Training](#distributed-training)
-  - [Private Clusters & Custom Models](#private-clusters-and-custom-models)
-- [HTTP API Examples](#http-api-examples)
-  - [Simple Generation](#simple-generation)
-  - [Streaming Response](#streaming-response)
-  - [Chat Completions (OpenAI-Compatible)](#chat-completions-openai-compatible)
-  - [Model Requesting](#model-preloading)
+  - [Public Network Chatbot](#public-network-chatbot)
+  - [Private Cluster - Python API](#private-cluster--python-api)
+  - [Private Cluster - HTTP API](#private-cluster--http-api)
 - [Node Configuration Examples](#node-configuration-examples)
   - [Public Compute Provider](#public-compute-provider)
   - [Private LAN Cluster](#private-lan-cluster)
   - [Local Development](#local-development)
-
-## Python Examples
- 
-### Basic Model Usage
-
-Run a distributed model on the public network with minimal setup:
-
-```python
-from tensorlink.ml import DistributedModel
-from transformers import AutoTokenizer
-
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-
-# Initialize distributed model
-model = DistributedModel(
-    model=MODEL_NAME,
-    training=False
-)
-
-# Tokenize input
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-inputs = tokenizer("Explain the theory of relativity.", return_tensors="pt")
-
-# Generate response
-outputs = model.generate(**inputs, max_new_tokens=100)
-response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-print(response)
-```
-
-**What's happening:**
-- Tensorlink finds available workers with capacity for this model
-- Automatically shards the model across GPUs if needed
-- Executes forward passes across the network
-- Returns outputs as standard PyTorch tensors
-
-### Distributed Training
-
-Train models across multiple GPUs on the network:
-
-```python
-from tensorlink.ml import DistributedModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from torch.utils.data import DataLoader
-
-MODEL_NAME = "gpt2"
-
-# Initialize for training
-model = DistributedModel(
-    model=MODEL_NAME,
-    training=True,
-    device="cuda"
-)
-
-model.train()
-
-# Setup distributed optimizer
-optimizer = model.create_optimizer(
-    lr=0.001, 
-    weight_decay=0.01,
-    optimizer_type="adamw"
-)
-
-# Training loop
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-train_loader = DataLoader(your_dataset, batch_size=8)
-
-for epoch in range(3):
-    for batch in train_loader:
-        inputs = tokenizer(batch["text"], return_tensors="pt", padding=True)
-        
-        # Forward pass (distributed)
-        outputs = model(**inputs, labels=inputs["input_ids"])
-        loss = outputs.loss
-        
-        # Backward pass (gradients aggregated across workers)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        
-        print(f"Loss: {loss.item():.4f}")
-
-# Save trained model
-model.save_pretrained("./fine-tuned-model")
-```
-
-**What's happening:**
-- Model requested on initialization and sent to worker(s)
-- Gradients automatically synchronized
-- Works with any PyTorch optimizer
-- Checkpointing supported
-
-### Private Clusters and Custom Models
-
-Run your own models on personal hardware. Currently custom models can only be run on "trusted"
-mode which excludes public jobs:
-
-```python
-from custom_model import CustomModel
-import torch
-
-from tensorlink.ml import DistributedModel
-from tensorlink.nodes import User, UserConfig
-
-# Must explicitly create a node to connect to validator node
-node = User(
-  UserConfig(
-    priority_nodes=[["192.168.2.42", 38752]]
-  )
-)
-
-# Upload and distribute your model
-model = DistributedModel(
-    model=CustomModel(),  # Can also specify a path to model weights
-    training=False,
-    trusted=True,
-    node=node
-)
-
-# Use like any PyTorch model
-input_ids = torch.randint(0, 50000, (1, 128))
-outputs = model(input_ids)
-```
-
-**Requirements:**
-- Validator & Worker nodes must be running with `"trusted": true` in config
-- Model must be serializable
-- Forward method defines compute graph
+- [Security Considerations](#security-considerations)
 
 ---
 
-## HTTP API Examples
+## Python Examples
 
-### Simple Generation
+### Public Network Chatbot
 
-Basic text generation via HTTP:
+**[`examples/public_model.py`](examples/public_model.py)**
 
-```python
-import requests
+Runs a multi-turn chatbot on the public Tensorlink network with no node setup required. `DistributedModel` automatically finds available workers and shards the model across them.
 
-response = requests.post(
-    "http://localhost:64747/v1/generate",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "message": "Explain quantum computing in one sentence.",
-        "max_new_tokens": 50,
-        "temperature": 0.7,
-        "top_p": 0.95,
-        "stream": False,
-    }
-)
+- Uses a rolling `deque` to cap context at a fixed number of turns
+- Drives generation directly with `model.generate()` and a manually built prompt
+- No `User` node needed, the default public validator handles routing
 
-result = response.json()
-print(result["generated_text"])
-```
+---
 
-**Response Format:**
-```json
-{
-  "generated_text": "Quantum computing uses quantum bits...",
-  "tokens_generated": 42,
-  "execution_time_ms": 1847
-}
-```
+### Private Cluster - Python API
 
-### Streaming Response
+**[`examples/private_model.py`](examples/private_model.py)**
 
-Stream tokens incrementally for real-time output:
+Runs the same chatbot pattern against a private cluster of devices you control. Useful when you want full PyTorch access (custom sampling, logit processing, etc.) rather than going through the HTTP API.
 
-```python
-import requests
+**How it differs from the public example:**
 
-response = requests.post(
-    "http://localhost:64747/v1/generate",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "message": "Write a haiku about distributed computing.",
-        "max_new_tokens": 100,
-        "stream": True,
-    },
-    stream=True,
-)
+- Requires an explicit `User` node connected to your validator
+- Uses proper chat-template formatting (`<|im_start|>` / `<|im_end|>`) rather than plain-text turns, important for instruction-tuned models like Qwen3
+- Validator and Worker nodes are spun up via `launch_nodes()` / `connect_nodes()` helpers, or you can start them separately with the node binary
 
-print("Response: ", end="", flush=True)
-for line in response.iter_lines():
-    if line:
-        decoded = line.decode()
-        if decoded.strip() == "data: [DONE]":
-            break
-        if decoded.startswith("data: "):
-            token = decoded[6:]  # Remove "data: " prefix
-            print(token, end="", flush=True)
-print()
-```
+**Node config for this setup**: see [Private LAN Cluster](#private-lan-cluster) below.
 
-**Stream Format (SSE):**
-```
-data: Bits
-data:  and
-data:  qubits
-data:  dance
-data: ,
-data: [DONE]
-```
+---
 
-### Chat Completions (OpenAI-Compatible)
+### Private Cluster - HTTP API
 
-Use the OpenAI-compatible endpoint for easy integration:
+**[`examples/private_api.py`](examples/private_api.py)**
 
-```python
-import requests
+Same private cluster, but accessed through the HTTP endpoint instead of directly from Python. No `User` node is needed on the client side, just point your HTTP client at the validator.
 
-response = requests.post(
-    "http://localhost:64747/v1/chat/completions",
-    json={
-        "model": "Qwen/Qwen2.5-7B-Instruct",
-        "messages": [
-            {"role": "system", "content": "You are a helpful AI assistant."},
-            {"role": "user", "content": "What are the benefits of distributed computing?"}
-        ],
-        "max_tokens": 150,
-        "temperature": 0.8,
-        "stream": False
-    }
-)
-
-result = response.json()
-print(result["choices"][0]["message"]["content"])
-```
-
-**OpenAI Format Response:**
-```json
-{
-  "id": "chatcmpl-xyz123",
-  "object": "chat.completion",
-  "created": 1704067200,
-  "model": "Qwen/Qwen2.5-7B-Instruct",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Distributed computing offers several advantages..."
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 28,
-    "completion_tokens": 94,
-    "total_tokens": 122
-  }
-}
-```
-
-**Streaming Chat:**
-```python
-response = requests.post(
-    "http://localhost:64747/v1/chat/completions",
-    json={
-        "model": "meta-llama/Llama-3.2-3B-Instruct",
-        "messages": [
-            {"role": "user", "content": "Tell me a joke"}
-        ],
-        "stream": True
-    },
-    stream=True
-)
-
-for line in response.iter_lines():
-    if line:
-        decoded = line.decode()
-        if "data: [DONE]" in decoded:
-            break
-        # Process SSE chunk
-        print(decoded)
-```
-
-### Model Preloading
-
-Preload models for faster first-request latency:
-
-```python
-import requests
-
-# Request model be loaded across the network
-requests.post(
-    "http://localhost:64747/request-model",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "model_type": "causal"
-    }
-)
-
-# Model is now sharded and ready
-# Subsequent requests will be faster
-response = requests.post(
-    "http://localhost:64747/v1/generate",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "message": "Hello!",
-        "max_new_tokens": 50
-    }
-)
-```
-
-**Use cases:**
-- Warm up models before traffic
-- Prepare multiple models in parallel
-- Reduce cold-start latency
+- Uses `POST /v1/models/request` to preload the model before inference
+- Drives multi-turn conversation by appending assistant replies to the `messages` list and re-posting to `/v1/chat/completions`
+- Works from any language or tool that can make HTTP requests
 
 ---
 
@@ -333,9 +62,9 @@ response = requests.post(
 
 ### Public Compute Provider
 
-**Scenario:** Contribute your GPU to the public network and earn rewards.
+Contribute your GPU to the public network and earn rewards.
 
-**config.json:**
+**`config.json`:**
 ```json
 {
   "node": {
@@ -347,7 +76,6 @@ response = requests.post(
   "crypto": {
     "address": "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336",
     "mining": false,
-    "mining_script": "path/to/mining.executable",
     "seed_validators": [
       ["smartnodes.ddns.net", 38752, "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e"]
     ]
@@ -359,54 +87,23 @@ response = requests.post(
 }
 ```
 
-**What happens:**
-- Node connects to Tensorlink's public network
-- Accepts inference jobs from anyone
-- Earns rewards based on compute contributed
-- Only runs verified/safe models (`trusted: false`)
-- Mining can be set to true if you have a GPU-heavy workload to run when your device has no active jobs.
+- Accepts inference jobs from anyone on the public network
+- `trusted: false` means only verified safe models are executed, never set this to `true` on a public node
+- Set `mining: true` to run a mining workload when the node has no active jobs
+- Monitor earnings for your wallet address on the Smartnodes network dashboard
 
-**Start node:**
+**Start the node:**
 ```bash
 ./run-node.sh
 ```
 
-**Monitor earnings:**
-Check your wallet address on the Smartnodes network dashboard.
+---
 
 ### Private LAN Cluster
 
-**Scenario:** You have 3 machines on your local network and want to run models privately.
+Run models across multiple machines on your local network without touching the public network.
 
-**Worker Node 1** (`config.json` on `192.168.1.101`):
-```json
-{
-  "node": {
-    "type": "worker",
-    "mode": "private"
-  },
-  "ml": {
-    "trusted": true,
-    "max_vram_gb": 24
-  }
-}
-```
-
-**Worker Node 2** (`config.json` on `192.168.1.102`):
-```json
-{
-  "node": {
-    "type": "worker",
-    "mode": "private"
-  },
-  "ml": {
-    "trusted": true,
-    "max_vram_gb": 24
-  }
-}
-```
-
-**Validator Node** (`config.json` on `192.168.1.100`):
+**Validator** (`192.168.1.100`, `config.json`):
 ```json
 {
   "node": {
@@ -417,11 +114,39 @@ Check your wallet address on the Smartnodes network dashboard.
     "endpoint_port": 64747,
     "priority_nodes": [
       ["192.168.1.101", 38752],
-      ["192.168.2.102", 38753]
+      ["192.168.1.102", 38753]
     ]
   },
   "ml": {
     "trusted": true
+  }
+}
+```
+
+**Worker 1** (`192.168.1.101`, `config.json`):
+```json
+{
+  "node": {
+    "type": "worker",
+    "mode": "private"
+  },
+  "ml": {
+    "trusted": true,
+    "max_vram_gb": 24
+  }
+}
+```
+
+**Worker 2** (`192.168.1.102`, `config.json`):
+```json
+{
+  "node": {
+    "type": "worker",
+    "mode": "private"
+  },
+  "ml": {
+    "trusted": true,
+    "max_vram_gb": 12
   }
 }
 ```
@@ -436,29 +161,32 @@ Client → http://192.168.1.100:64747
     24GB VRAM     12GB VRAM
 ```
 
-**API Usage:**
+Two ways to connect devices: add the validator's IP:PORT to each worker's `priority_nodes`, or add all worker IP:PORT pairs to the validator's `priority_nodes`. Either direction works.
+
+Once running, hit the validator endpoint from any client:
+
 ```python
 import requests
 
-# All traffic goes through validator
 response = requests.post(
-    "http://192.168.1.100:64747/v1/generate",
+    "http://192.168.1.100:64747/v1/chat/completions",
     json={
-        "hf_name": "Qwen/Qwen3-14B",
-        "message": "Hello from my private cluster!",
-        "max_new_tokens": 100
+        "model": "Qwen/Qwen3-14B",
+        "messages": [{"role": "user", "content": "Hello from my private cluster!"}],
+        "max_tokens": 100
     }
 )
 ```
 
-or see [Private Clusters & Custom Models](#private-clusters-and-custom-models) for connecting
-within Python.
+Or connect a `User` node from Python: see [`examples/private_model.py`](examples/private_model.py).
+
+---
 
 ### Local Development
 
-**Scenario:** Test Tensorlink locally without any network connectivity.
+Test Tensorlink entirely on one machine without any network connectivity.
 
-**config.json:**
+**`config.json`:**
 ```json
 {
   "node": {
@@ -476,47 +204,34 @@ within Python.
 }
 ```
 
-**Use case:**
-- Offline development
-- Testing custom models
-- Debugging before deploying to cluster
-
-**Example:**
 ```python
 from tensorlink.ml import DistributedModel
 from tensorlink.nodes import User, UserConfig
 
-node = User(
-  UserConfig(
-    upnp=False,
-    local_test=True,
-    priority_nodes=[["127.0.0.1", 38752]]
-  )
-)
-# Runs entirely on local node
-model = DistributedModel(
-    model="gpt2",
-    training=False
-)
+node = User(UserConfig(upnp=False, local_test=True, priority_nodes=[["127.0.0.1", 38752]]))
+model = DistributedModel(model="gpt2", training=False)
 ```
+
+Good for offline development, testing custom models, and debugging before deploying to a cluster.
 
 ---
 
 ## Security Considerations
 
 **Private networks:**
-- Use firewall rules to restrict access to validator endpoints
-- Enable `trusted: true` only on nodes you control
-- May require port forwarding for public access
+- Use firewall rules to restrict access to the validator endpoint
+- Enable `trusted: true` only on nodes you personally control
+- May require port forwarding for access outside your LAN
 
 **Public networks:**
 - Never set `trusted: true` on public nodes
 - Don't send sensitive data through public validators
-- Validate model outputs (public nodes are untrusted) (determinate outputs coming soon!)
+- Validate model outputs, deterministic output verification is coming soon
+
+---
 
 ## Need Help?
 
 - 💬 **[Join our Discord](https://discord.gg/aCW2kTNzJ2)** for community support
 - 📚 **[Read the docs](https://smartnodes.ca/tensorlink/docs)** for API reference
 - 🐛 **[Report issues](https://github.com/mattjhawken/tensorlink/issues)** on GitHub
-- 

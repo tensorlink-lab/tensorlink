@@ -991,7 +991,7 @@ class DistributedModel(nn.Module):
                 logging.error(f"Failed to load host module {module_id}: {e}")
                 raise
 
-        # Now resolve tied modules — share the tensor directly, no weight download needed
+        # Now resolve tied modules, share the tensor directly, no weight download needed
         for module_id, module_info in tied.items():
             try:
                 self._load_tied_host_module(module_id, module_info)
@@ -1048,7 +1048,7 @@ class DistributedModel(nn.Module):
         source_module = get_nested_module(self.model, tied_to_path)
         if source_module is None:
             raise RuntimeError(
-                f"Cannot resolve tied_to path '{tied_to_path}' — "
+                f"Cannot resolve tied_to path '{tied_to_path}', "
                 f"ensure it is loaded before tied modules."
             )
 
@@ -1057,7 +1057,7 @@ class DistributedModel(nn.Module):
         if target_module is None:
             raise RuntimeError(f"Cannot resolve module_path '{module_path}' for tying.")
 
-        # Share the weight tensor — standard HF tie_weights() pattern
+        # Share the weight tensor -> standard HF tie_weights() pattern
         if not hasattr(source_module, "weight"):
             raise RuntimeError(
                 f"Source module at '{tied_to_path}' has no 'weight' attribute to tie."
@@ -1069,7 +1069,7 @@ class DistributedModel(nn.Module):
             source_weight, requires_grad=source_module.weight.requires_grad
         )
 
-        # Tie: assign the same Parameter object — not a copy
+        # Tie: assign the same Parameter object
         target_module.weight = source_module.weight
 
         logging.info(
@@ -1085,14 +1085,14 @@ class DistributedModel(nn.Module):
 
         Returns: Dict mapping module_path -> {buf_name: tensor}
 
-        Requires the full model to be loaded on CPU — only viable if host has
+        Requires the full model to be loaded on CPU, only viable if host has
         enough RAM (e.g. 128GB). Must be called BEFORE distribute_model()
         replaces modules with OffloadedModules.
         """
         assert isinstance(self.model, nn.Module), "Must be called before distribution"
 
         # Temporarily materialize the full model off meta for the forward pass
-        # This is the expensive step — requires full model RAM
+        # This is the expensive step, requires full model RAM
         logging.info("Materializing full model for buffer discovery...")
 
         # Load real weights into skeleton so forward produces valid buffers
@@ -1110,11 +1110,11 @@ class DistributedModel(nn.Module):
         hooks = []
 
         def make_pre_forward_hook(module_path: str):
-            """Capture buffer state BEFORE forward — catches all registered buffers."""
+            """Capture buffer state BEFORE forward, catches all registered buffers."""
 
             def hook(module, args, kwargs):
                 buffers = {}
-                # recurse=False — only this module's own buffers
+                # recurse=False only this module's own buffers
                 for buf_name, buf in module.named_buffers(recurse=False):
                     if buf is not None and buf.device.type != "meta":
                         buffers[buf_name] = buf.detach().cpu().clone()
@@ -1127,7 +1127,7 @@ class DistributedModel(nn.Module):
             return hook
 
         def make_post_forward_hook(module_path: str):
-            """Capture buffer state AFTER forward — catches lazily created buffers
+            """Capture buffer state AFTER forward, catches lazily created buffers
             like cos_cached/sin_cached that only exist after first compute."""
 
             def hook(module, args, kwargs, output):
@@ -1160,7 +1160,7 @@ class DistributedModel(nn.Module):
                 )
             )
 
-        # Run minimal dummy forward — just 4 tokens, no grad
+        # Run minimal dummy forward, just 4 tokens no grad
         try:
             logging.info("Running dummy forward for buffer discovery...")
             dummy_input = torch.zeros(1, 2, dtype=torch.long)
@@ -1175,7 +1175,7 @@ class DistributedModel(nn.Module):
         finally:
             for hook in hooks:
                 hook.remove()
-            # Free the full model immediately — we only needed it for this pass
+            # Free the full model immediately
             del full_model
             gc.collect()
 

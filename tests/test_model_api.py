@@ -64,7 +64,7 @@ def model_env(request, connected_wwv_nodes):
     payload = {"hf_name": cfg["name"], "model_type": "causal", "time": 300}
 
     response = requests.post(
-        url=f"{SERVER_URL}/request-model",
+        url=f"{SERVER_URL}/v1/models/request",
         json=payload,
         timeout=cfg["timeout"],
     )
@@ -77,7 +77,7 @@ def model_env(request, connected_wwv_nodes):
     yield cfg, (worker, worker2, validator)
 
 
-# /v1/chat/completions — non-streaming
+# /v1/chat/completions - non-streaming
 def test_chat_completions(model_env):
     """
     Non-streaming OpenAI-compatible chat completions.
@@ -137,7 +137,7 @@ def test_chat_completions(model_env):
     print(f"   Tokens : {usage['total_tokens']}")
 
 
-# /v1/chat/completions — streaming
+# /v1/chat/completions - streaming
 def test_chat_completions_stream(model_env):
     """
     Streaming chat completions via SSE.
@@ -206,7 +206,7 @@ def test_chat_completions_stream(model_env):
     print(f"   Tokens : {tokens}")
 
 
-# /v1/responses — text-to-text
+# /v1/responses - text-to-text
 def test_responses_text(model_env):
     """
     /v1/responses with type='text' should behave identically to
@@ -242,7 +242,7 @@ def test_responses_text(model_env):
     print(f"   Output : {result['choices'][0]['message']['content'][:60]}...")
 
 
-# /v1/responses — invalid type
+# /v1/responses - invalid type
 def test_responses_invalid_type():
     """
     Submitting an unknown type to /v1/responses should return 422.
@@ -261,7 +261,7 @@ def test_responses_invalid_type():
     )
 
     # FastAPI rejects unknown Literal values at the schema layer (422)
-    # or handler returns 422 explicitly — either is correct
+    # or handler returns 422 explicitly
     assert response.status_code in (
         422,
         400,

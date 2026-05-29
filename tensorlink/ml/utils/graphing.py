@@ -583,7 +583,7 @@ class ModelParser:
 
                     if self.verbose:
                         why = "obfuscation boundary" if force_host else "host budget"
-                        print(f"{indent}  Kept on host ({why}) — {memory / 1e6:.2f}MB")
+                        print(f"{indent}  Kept on host ({why}) - {memory / 1e6:.2f}MB")
 
                     return config, None, obfuscation_layer_assigned
 
