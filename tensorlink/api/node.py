@@ -9,12 +9,12 @@ from tensorlink.api.models import (
     ImageResponseRequest,
     EmbeddingResponseRequest,
 )
+from tensorlink.nodes.job_monitor import JobStatus
 from tensorlink.ml.utils.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from collections import defaultdict
 from threading import Thread
-import logging
 import uvicorn
 import asyncio
 import random
@@ -25,20 +25,17 @@ def build_hf_job_data(
     *,
     model_name: str,
     author: str,
-    model_type: str = "hf",
     payment: int = 0,
     duration: int = 0,
     hosted: bool = True,
     training: bool = False,
-    seed_validators=None,
+    model_type: str = None,
 ):
-    if seed_validators is None:
-        seed_validators = [author]
-
     return {
         "author": author,
         "api": True,
-        "active": True,
+        "loading": True,
+        "status": JobStatus.INITIALIZING,
         "hosted": hosted,
         "training": training,
         "payment": payment,
@@ -49,7 +46,7 @@ def build_hf_job_data(
         "distribution": {"model_name": model_name},
         "n_workers": 0,
         "model_name": model_name,
-        "seed_validators": seed_validators,
+        "seed_validators": [author],
         "model_type": model_type,
     }
 
@@ -183,12 +180,17 @@ class TensorlinkAPI:
     def _register_model_routes(self):
         """Register model management endpoints"""
 
-        @self.router.post("/request-model", response_model=ModelStatusResponse)
+        @self.router.post("/v1/models/request", response_model=ModelStatusResponse)
         def request_model(job_request: JobRequest, request: Request):
             """
             Explicitly request a model to be loaded on the network. Currently, models
             are only publicly accessible. Paid jobs for private use are unavailable at
             this time.
+
+            Returns a ModelStatusResponse with status:
+              - "active"   : validator and all workers have fully loaded the model
+              - "loading"  : model job exists but worker(s) are still loading modules
+              - "inactive" : model not found; loading has been initiated
             """
             try:
                 client_ip = request.client.host
@@ -200,20 +202,20 @@ class TensorlinkAPI:
                 # Check current status
                 status = self._check_model_status(model_name)
 
-                if status["status"] == "loaded":
+                if status["status"] == "active":
                     return ModelStatusResponse(
-                        model_name=model_name,
-                        status="loaded",
+                        model=model_name,
+                        status="active",
                         message="Model is already loaded and ready to use.",
                     )
-                elif status["status"] == "loading":
+                elif status["status"] == "initializing":
                     return ModelStatusResponse(
-                        model_name=model_name,
-                        status="loading",
-                        message="Model is currently being loaded.",
+                        model=model_name,
+                        status="initializing",
+                        message="Model is currently being loaded by worker(s).",
                     )
 
-                # Trigger the loading process
+                # Model not present, trigger the loading process
                 job_data = build_hf_job_data(
                     model_name=model_name,
                     author=self.smart_node.rsa_key_hash,
@@ -225,31 +227,45 @@ class TensorlinkAPI:
                 self.smart_node.create_hf_job(job_data, client_ip)
 
                 return ModelStatusResponse(
-                    model_name=model_name,
-                    status="loading",
-                    message=f"Model {model_name} loading has been initiated",
+                    model=model_name,
+                    status="inactive",
+                    message=f"Model {model_name} not found. Loading has been initiated.",
                 )
 
             except Exception as e:
                 return ModelStatusResponse(
-                    model_name=job_request.hf_name,
-                    status="error",
+                    model=job_request.hf_name,
+                    status="inactive",
                     message=f"Error requesting model: {str(e)}",
                 )
 
-        @self.router.get(
-            "/model-status/{model_name}", response_model=ModelStatusResponse
-        )
-        def get_model_status(model_name: str):
-            """Check the loading status of a specific model"""
-            status = self._check_model_status(model_name)
+        @self.router.get("/v1/models/status", response_model=ModelStatusResponse)
+        def get_model_status(
+            model: str = Query(
+                ..., description="HuggingFace model name, e.g. Qwen/Qwen3-8B"
+            )
+        ):
+            """
+            Check the loading status of a specific model.
+
+            Pass the model name as a query parameter to avoid path-routing issues
+            with model names that contain forward slashes (e.g. Qwen/Qwen3-8B).
+
+            Example: GET /v1/models/status?model_name=Qwen/Qwen3-8B
+
+            Returns status:
+              - "active"   : validator and all workers have fully loaded the model
+              - "loading"  : job exists but worker(s) are still loading their modules
+              - "inactive" : model not found on the network
+            """
+            status = self._check_model_status(model)
             return ModelStatusResponse(
-                model_name=model_name,
+                model=model,
                 status=status["status"],
                 message=status["message"],
             )
 
-        @self.router.get("/model-demand")
+        @self.router.get("/v1/models/demand")
         async def get_api_demand_stats(
             days: int = Query(30, ge=1, le=90),
             limit: int = Query(10, ge=1, le=50),
@@ -257,21 +273,22 @@ class TensorlinkAPI:
             """Return current API demand statistics"""
             return get_popular_model_stats(days=days, limit=limit)
 
-        @self.router.get("/models")
+        @self.router.get("/v1/models/available")
         def list_available_models():
-            """List all currently loaded models"""
+            """List all currently active (fully loaded) models"""
             try:
                 jobs = [self.smart_node.dht.query(a) for a in self.smart_node.jobs]
-                public_models = set(
-                    [
-                        j.get("model_name")
-                        for j in jobs
-                        if isinstance(j, dict) and j.get("public") and j.get("active")
-                    ]
+                active_models = set(
+                    j.get("model_name")
+                    for j in jobs
+                    if isinstance(j, dict)
+                    and j.get("status") == "active"
+                    and j.get("api")
+                    and j.get("hosted")
                 )
 
                 return {
-                    "active_models": list(public_models),
+                    "active_models": list(active_models),
                 }
 
             except Exception as e:
@@ -347,15 +364,17 @@ class TensorlinkAPI:
         gen_request.id = hash(f"req_{random.random()}")
 
         model_status = self._check_model_status(gen_request.hf_name)
-        if model_status["status"] == "not_loaded":
+        if model_status["status"] == "inactive":
             self._trigger_model_load(gen_request.hf_name)
             raise HTTPException(
                 status_code=503,
-                detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
+                detail=f"Model '{gen_request.hf_name}' is not available. "
+                f"Loading has been requested, try again shortly.",
             )
         if model_status["status"] == "loading":
             raise HTTPException(
-                status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
+                status_code=503,
+                detail=f"Model '{gen_request.hf_name}' is still loading. Try again shortly.",
             )
 
         if gen_request.stream:
@@ -467,31 +486,56 @@ class TensorlinkAPI:
             self.api_loop.call_soon_threadsafe(fut.set_result, response)
 
     def _check_model_status(self, model_name: str) -> dict:
-        """Check if a model is loaded, loading, or not loaded"""
-        status = "not_loaded"
-        message = "Model is not currently loaded"
-
+        """
+        Check whether a model is active, loading, or inactive.
+        This intentionally doesn't rely on the ML-process-side model_state dict
+        (which lives in DistributedValidator and is not directly accessible from the
+        node process).
+        """
         try:
-            # Check if there is a public job with this module
+            best_status = None
+
             for job_id in self.smart_node.jobs:
                 job_data = self.smart_node.dht.query(job_id)
-                if (
-                    job_data.get("model_name", "") == model_name
+
+                if not isinstance(job_data, dict):
+                    continue
+
+                matches_model = (
+                    job_data.get("model_name") == model_name
                     and job_data.get("hosted")
                     and job_data.get("api")
-                    and job_data.get("public")
-                    and job_data.get("active")
-                ):
-                    status = "loaded"
-                    message = f"Model {model_name} is loaded and ready"
-                    break
+                )
+
+                if not matches_model:
+                    continue
+
+                status = job_data.get("status", JobStatus.INACTIVE)
+
+                if status == JobStatus.ACTIVE:
+                    return {
+                        "status": JobStatus.ACTIVE,
+                        "message": f"Model {model_name} is loaded and ready.",
+                    }
+
+                # Keep the best non-active status we've seen so far
+                best_status = best_status or status
+
+            if best_status:
+                return {
+                    "status": best_status,
+                    "message": f"Model {model_name} has status: {best_status}.",
+                }
 
         except Exception as e:
-            logging.error(f"Error checking model status: {e}")
-            status = "error"
-            message = f"Error checking model status: {str(e)}"
+            self.smart_node._log_error(
+                f"Error checking model status: {e}", "TensorlinkAPI"
+            )
 
-        return {"status": status, "message": message}
+        return {
+            "status": JobStatus.INACTIVE,
+            "message": f"Model {model_name} not found on the network.",
+        }
 
     def _trigger_model_load(self, model_name: str):
         """Trigger the ML validator to load a specific model"""
@@ -505,7 +549,9 @@ class TensorlinkAPI:
             self.smart_node.create_hf_job(job_data)
 
         except Exception as e:
-            logging.error(f"Error triggering model load: {e}")
+            self.smart_node._log_error(
+                f"Error triggering model load: {e}", "TensorlinkAPI"
+            )
 
     async def _wait_for_result(self, request: GenerationRequest, timeout: int = 300):
         """Wait for the generation result using a Future instead of polling outgoing list"""

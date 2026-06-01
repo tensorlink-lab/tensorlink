@@ -58,7 +58,7 @@ def request_model(server_url: str, model_name: str):
     }
 
     response = requests.post(
-        url=f"{server_url}/request-model",
+        url=f"{server_url}/v1/models/request",
         json=payload,
         timeout=30,
     )

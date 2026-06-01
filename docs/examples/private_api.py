@@ -50,8 +50,9 @@ Connects to the validator by specifying its IP:PORT:
 }
 """
 
-from helpers import connect_nodes, launch_nodes_no_user
+from helpers import connect_nodes, launch_nodes_no_user, request_model
 import requests
+import time
 
 SERVER_URL = "http://127.0.0.1:64747"
 MODEL_NAME = "Qwen/Qwen3-8B"
@@ -68,8 +69,18 @@ if __name__ == "__main__":
 
     # Request model via API
     payload = {"hf_name": MODEL_NAME}
-    response = requests.post(f"{SERVER_URL}/request-model", json=payload)
+    response = requests.post(f"{SERVER_URL}/v1/models/request", json=payload)
     assert response.status_code == 200
+
+    # Await model initialization
+    while True:
+        response = requests.get(
+            f"{SERVER_URL}/v1/models/status",
+            params={"model": MODEL_NAME},
+        ).json()
+        if response["status"] == "active":
+            break
+        time.sleep(1)
 
     # Chat loop using the OpenAI-compatible endpoint
     history = [
