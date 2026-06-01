@@ -1,5 +1,6 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
+from tensorlink.nodes.job_monitor import JobStatus
 
 import hashlib
 import json
@@ -294,7 +295,8 @@ class UserThread(Torchnode):
 
             job_request = {
                 "author": self.rsa_key_hash,
-                "active": True,
+                "loading": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": False,
                 "capacity": capacity,
                 "payment": 0,
@@ -308,7 +310,8 @@ class UserThread(Torchnode):
             # The case where we have a huggingface model name for inference
             job_request = {
                 "author": self.rsa_key_hash,
-                "active": True,
+                "loading": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": False,
                 "training": training,
                 "payment": 0,

@@ -15,6 +15,7 @@ from tensorlink.ml.utils.utils import (
     attach_tensor,
 )
 from tensorlink.api.models import GenerationRequest
+from tensorlink.nodes.job_monitor import JobStatus
 
 from transformers import AutoTokenizer, TextIteratorStreamer
 from collections import defaultdict
@@ -492,7 +493,7 @@ class DistributedValidator(DistributedWorker):
                         model_name = model.model_name
                         if self._is_model_ready(job_id):
                             is_active = self.send_request(
-                                "check_job", (model_name, job_id)
+                                "check_job_status", (model_name, job_id)
                             )
                             if not is_active:
                                 self._remove_hosted_job(job_id)
@@ -557,33 +558,6 @@ class DistributedValidator(DistributedWorker):
             )
 
         self.CHECK_COUNTER += 1
-
-    # def _handle_check_model_status(self, model_name: str):
-    #     """Check the loading status of a model"""
-    #     if model_name in self.models:
-    #         if self._is_model_ready(model_name):
-    #             # Model is fully loaded
-    #             return {
-    #                 "status": "loaded",
-    #                 "message": f"Model {model_name} is loaded and ready",
-    #             }
-    #         else:
-    #             # Model is in the process of loading
-    #             return {
-    #                 "status": "loading",
-    #                 "message": f"Model {model_name} is currently loading",
-    #             }
-    #
-    #     elif model_name in self.models_initializing:
-    #         return {
-    #             "status": "loading",
-    #             "message": f"Model {model_name} initialization in progress",
-    #         }
-    #     else:
-    #         return {
-    #             "status": "not_loaded",
-    #             "message": f"Model {model_name} is not loaded",
-    #         }
 
     def _prepare_generation(self, request, job_id):
         distributed_model = self.models[job_id]
@@ -947,7 +921,7 @@ class DistributedValidator(DistributedWorker):
             # Prepare job data for inspection
             defaults = {
                 "author": None,
-                "active": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": True,
                 "api": True,
                 "training": False,
@@ -1063,6 +1037,8 @@ class DistributedValidator(DistributedWorker):
                     logging.INFO,
                 ),
             )
+
+            self.send_request("update_job_status", (job_id, "active"))
 
             return True
 

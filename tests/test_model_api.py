@@ -35,6 +35,7 @@ MODELS = [
     pytest.param(
         {
             "name": "sshleifer/tiny-gpt2",
+            "model_type": "causal",
             "timeout": 60,
             "sleep": 15,
             "parsed": False,
@@ -44,6 +45,7 @@ MODELS = [
     pytest.param(
         {
             "name": "HuggingFaceTB/SmolLM2-135M",
+            "model_type": "causal",
             "timeout": 60,
             "sleep": 15,
             "parsed": True,
@@ -51,6 +53,27 @@ MODELS = [
         id="smollm2-135m",
     ),
 ]
+
+
+def request_model(
+    model_name: str, model_type: str = "causal", timeout: int = 60
+) -> requests.Response:
+    """POST /v1/models/request for the given model name."""
+    payload = {"hf_name": model_name, "model_type": model_type, "time": 300}
+    return requests.post(
+        url=f"{SERVER_URL}/v1/models/request",
+        json=payload,
+        timeout=timeout,
+    )
+
+
+def get_model_status(model_name: str, timeout: int = 10) -> requests.Response:
+    """GET /v1/models/status for the given model name."""
+    return requests.get(
+        url=f"{SERVER_URL}/v1/models/status",
+        params={"model": model_name},
+        timeout=timeout,
+    )
 
 
 @pytest.fixture(params=MODELS, scope="module")
@@ -61,23 +84,98 @@ def model_env(request, connected_wwv_nodes):
     cfg = request.param
     worker, worker2, validator, _ = connected_wwv_nodes
 
-    payload = {"hf_name": cfg["name"], "model_type": "causal", "time": 300}
-
-    response = requests.post(
-        url=f"{SERVER_URL}/v1/models/request",
-        json=payload,
-        timeout=cfg["timeout"],
-    )
+    response = request_model(cfg["name"], cfg["model_type"], cfg["timeout"])
 
     assert response.status_code == 200
-
-    # Let model load/shard
-    time.sleep(cfg["sleep"])
 
     yield cfg, (worker, worker2, validator)
 
 
-# /v1/chat/completions - non-streaming
+# ========== Model Status Tests ==========
+
+
+@pytest.mark.order(1)
+def test_status_before_request(connected_wwv_nodes):
+    """
+    Query status before any model request has been made.
+    """
+    for param in MODELS:
+        cfg = param.values[0]
+        response = get_model_status(cfg["name"])
+        assert response.status_code == 200, (
+            f"[{cfg['name']}] Status check failed with "
+            f"{response.status_code}: {response.text}"
+        )
+
+        result = response.json()
+        assert (
+            "status" in result
+        ), f"[{cfg['name']}] Response missing 'status' field: {result}"
+        assert result["status"] == "inactive", (
+            f"[{cfg['name']}] Expected 'inactive' before model request, "
+            f"got '{result['status']}'"
+        )
+        print(f"✅ [{cfg['name']}] status before request: '{result['status']}'")
+
+
+@pytest.mark.order(2)
+def test_status_loading(model_env):
+    """Query status immediately after requesting the model (no sleep).
+
+    Workers have been assigned modules but haven't finished loading yet, so
+    the expected response is status == 'initializing'.
+    """
+    cfg, _ = model_env
+    result = None
+    for _ in range(5):
+        # Check a few times as the job takes a second to be added to the validator
+        response = get_model_status(cfg["name"])
+        assert response.status_code == 200, (
+            f"[{cfg['name']}] Status check failed with "
+            f"{response.status_code}: {response.text}"
+        )
+        result = response.json()
+        if result.get("status") != "inactive":
+            break
+        time.sleep(1)
+
+    assert (
+        "status" in result
+    ), f"[{cfg['name']}] Response missing 'status' field: {result}"
+    assert result["status"] == "initializing", (
+        f"[{cfg['name']}] Expected 'initializing' immediately after model request, "
+        f"got '{result['status']}'"
+    )
+    print(f"✅ [{cfg['name']}] status immediately after request: '{result['status']}'")
+
+
+@pytest.mark.order(3)
+def test_status_active(model_env):
+    """
+    Query status after waiting for the model to fully load.
+    """
+    cfg, _ = model_env
+    print(f"   [{cfg['name']}] Waiting {cfg['sleep']}s for model to finish loading...")
+    time.sleep(cfg["sleep"])
+    response = get_model_status(cfg["name"])
+    assert response.status_code == 200, (
+        f"[{cfg['name']}] Status check failed with "
+        f"{response.status_code}: {response.text}"
+    )
+    result = response.json()
+    assert (
+        "status" in result
+    ), f"[{cfg['name']}] Response missing 'status' field: {result}"
+    assert result["status"] == "active", (
+        f"[{cfg['name']}] Expected 'active' after load wait, "
+        f"got '{result['status']}'"
+    )
+    print(f"✅ [{cfg['name']}] status long after request: '{result['status']}'")
+
+
+# ========= Model Inference Tests =========
+
+
 def test_chat_completions(model_env):
     """
     Non-streaming OpenAI-compatible chat completions.
@@ -137,7 +235,6 @@ def test_chat_completions(model_env):
     print(f"   Tokens : {usage['total_tokens']}")
 
 
-# /v1/chat/completions - streaming
 def test_chat_completions_stream(model_env):
     """
     Streaming chat completions via SSE.
@@ -206,7 +303,6 @@ def test_chat_completions_stream(model_env):
     print(f"   Tokens : {tokens}")
 
 
-# /v1/responses - text-to-text
 def test_responses_text(model_env):
     """
     /v1/responses with type='text' should behave identically to
@@ -242,7 +338,6 @@ def test_responses_text(model_env):
     print(f"   Output : {result['choices'][0]['message']['content'][:60]}...")
 
 
-# /v1/responses - invalid type
 def test_responses_invalid_type():
     """
     Submitting an unknown type to /v1/responses should return 422.

@@ -14,12 +14,22 @@ if TYPE_CHECKING:
     from validator_thread import Validator
 
 
-class JobStatus(Enum):
+class JobStatus:
     ACTIVE = "active"
+    INITIALIZING = "initializing"
+    INACTIVE = "inactive"
     PENDING_OFFLINE = "pending_offline"
     OFFLINE = "offline"
     FAILED = "failed"
     COMPLETED = "completed"
+
+    @classmethod
+    def values(cls):
+        return {
+            v
+            for k, v in vars(cls).items()
+            if not k.startswith("_") and isinstance(v, str)
+        }
 
 
 class ResourceUsage(Enum):
@@ -115,7 +125,7 @@ class JobMonitor:
             self._handle_job_failure(job_id, "Failed to retrieve job data")
             return
 
-        job_status = JobStatus.ACTIVE
+        job_status = job_data.get("status", JobStatus.PENDING_OFFLINE)
 
         try:
             while not self.terminate_flag.is_set():
@@ -126,7 +136,7 @@ class JobMonitor:
                     return
 
                 try:
-                    job_status = self._check_job_health(job_id, job_data)
+                    job_status = self._check_job_health(job_data)
 
                     if job_status != JobStatus.ACTIVE:
                         if self._should_terminate_job(job_data, job_status):
@@ -152,7 +162,7 @@ class JobMonitor:
         finally:
             self._cleanup_job(job_data, job_status)
 
-    def _check_job_health(self, job_id: str, job_data: Dict) -> JobStatus:
+    def _check_job_health(self, job_data: Dict) -> str:
         """Comprehensive health check of the job and its components."""
         # Check if job is expired
         if job_data.get("last_seen", 15) - job_data.get("timestamp", 0) > job_data.get(
@@ -172,7 +182,7 @@ class JobMonitor:
 
         # TODO Proof of learning
 
-        return JobStatus.ACTIVE
+        return job_data.get("status", JobStatus.ACTIVE)
 
     def _check_single_worker(self, worker: str, module_id: str) -> bool:
         """Enhanced worker check with ML proof of work verification."""
@@ -341,7 +351,7 @@ class JobMonitor:
             return None
 
     def _check_user_status(self, job_data: Dict) -> bool:
-        """Verify user connection and job activity status."""
+        """Verify both user connection and job activity status."""
         try:
             if job_data["author"] != self.node.rsa_key_hash:
                 user_data = self.node.dht.query(job_data["author"])
@@ -354,7 +364,9 @@ class JobMonitor:
                         job_data["id"], self.node.nodes[job_data["author"]]
                     )
 
-                    return job_status is not None and job_status.get("active", False)
+                    return job_status is not None and job_status.get(
+                        "status", JobStatus.PENDING_OFFLINE
+                    )
 
                 return False
 
@@ -399,7 +411,7 @@ class JobMonitor:
         """Perform comprehensive job cleanup."""
         try:
             # Update job status
-            job_data["active"] = False
+            job_data["status"] = JobStatus.PENDING_OFFLINE
             job_data["end_time"] = time.time()
             job_data["final_status"] = final_status.value
 
@@ -510,8 +522,7 @@ class JobMonitor:
                 return
 
             # Update job status
-            job_data["active"] = False
-            job_data["status"] = JobStatus.FAILED.value
+            job_data["status"] = JobStatus.FAILED
             job_data["failure_reason"] = reason
             job_data["failure_time"] = datetime.now().isoformat()
 

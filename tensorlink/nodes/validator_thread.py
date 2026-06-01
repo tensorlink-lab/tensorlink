@@ -1,7 +1,7 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
 from tensorlink.nodes.contract_manager import ContractManager
-from tensorlink.nodes.job_monitor import JobMonitor
+from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
 
@@ -326,8 +326,9 @@ class ValidatorThread(Torchnode):
 
             handlers = {
                 "get_jobs": self._handle_get_jobs,
-                "check_job": self._handle_check_job,
+                "check_job_status": self._handle_check_job,
                 "check_token": self._handle_check_token,
+                "update_job_status": self._handle_update_job,
                 "update_stream": self._handle_update_stream,
                 "send_job_request": self.create_base_job,
                 "update_api_request": self._handle_update_api,
@@ -464,72 +465,23 @@ class ValidatorThread(Torchnode):
         model_name, job_id = request
 
         job_data = self.dht.query(job_id)
-        return_val = job_data.get("active", False)
+        return_val = (
+            job_data.get("status", JobStatus.PENDING_OFFLINE) == JobStatus.ACTIVE
+        )
 
         self.response_queue.put({"status": "SUCCESS", "return": return_val})
 
-    # def _handle_send_job(self, job_data: dict):
-    #     distribution = job_data.get("distribution", {})
-    #
-    #     if distribution:
-    #         worker = distribution
+    def _handle_update_job(self, request):
+        job_id, loading_status = request
+        job_data = self.dht.query(job_id)
 
-    # # Send the updated job data with worker info to the user
-    # self.send_to_node(
-    #     requesting_node,
-    #     b"ACCEPT-JOB" + job_id.encode() + json.dumps(job_data).encode(),
-    # )
-    #
-    # self.jobs.append(job_id)
-    #
-    # for module, module_info in job_data["distribution"].items():
-    #     # Remove worker info and just replace with id
-    #     worker_ids = list(a[0] for a in module_info["workers"])
-    #     module_info["workers"] = worker_ids
-    #
-    # job_data["timestamp"] = time.time()
-    # job_data["last_seen"] = time.time()
-    #
-    # self.dht.store(job_id, job_data)
-    #
-    # # Start monitor_job as a background task and store it in the list
-    # job_monitor = JobMonitor(self)
-    # t = threading.Thread(target=job_monitor.monitor_job, args=(job_id,))
-    # t.start()
+        response_status = "FAILURE"
+        if job_data:
+            if loading_status in JobStatus.values():
+                job_data["status"] = loading_status
+                response_status = "SUCCESS"
 
-    def create_hf_job(self, job_info: dict, requesters_ip: str = None):
-        """
-        This can be invoked directly from the API endpoint for a hosted HF model, or via a User
-        request for hosting on the user's device. This will trigger HF model inspection in the
-        Validator ML process and will create a config of eligible workers and their assigned modules.
-        """
-
-        # Rate limitation checks for requested jobs
-        if requesters_ip:
-            if self.rate_limiter.is_blocked(requesters_ip):
-                self.debug_print(
-                    f"Job declined! Reason: UserIPBlocked ({requesters_ip})",
-                    tag="Validator",
-                )
-                return False
-
-            self.rate_limiter.record_attempt(requesters_ip)
-
-        if job_info.get("payment", 0) == 0:
-            _time = min(job_info.get("time", FREE_JOB_MAX_TIME), FREE_JOB_MAX_TIME)
-        else:
-            _time = job_info.get("time", FREE_JOB_MAX_TIME)
-
-        job_data = job_info
-
-        if not job_data.get("id"):
-            job_data["time"] = _time
-            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
-            job_data["id"] = job_id
-
-        # Hand off model dissection and worker assignment to DistributedValidator process
-        request_value = "HF-JOB-REQ" + json.dumps(job_data)
-        self._store_request(self.rsa_key_hash, request_value)
+        self.response_queue.put({"status": response_status, "return": None})
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""
@@ -582,8 +534,7 @@ class ValidatorThread(Torchnode):
 
     def _handle_job_req(self, data: bytes, node: Connection):
         """
-        This method is invoked by a job request directly from a User. If a model name
-        was provided, we call create_hf_job, otherwise we create_base_job
+        This method is invoked by a job request directly from a User.
         """
         job_req = json.loads(data[7:])
 
@@ -601,12 +552,8 @@ class ValidatorThread(Torchnode):
             node.role != "U" or not node_info or node_info["reputation"] < 50
         ):  # TODO reputation
             node.ghosts += 1
-        elif job_req.get("model_name"):
-            threading.Thread(
-                target=self.create_hf_job, args=(job_req, node.host)
-            ).start()
-        else:
-            threading.Thread(target=self.create_base_job, args=(job_req,)).start()
+
+        threading.Thread(target=self.create_base_job, args=(job_req,)).start()
 
     def _handle_decline_job(self, data: bytes, node: Connection):
         self.debug_print(
@@ -640,24 +587,6 @@ class ValidatorThread(Torchnode):
 
         else:
             node.ghosts += 1
-
-    def check_job_availability(self, job_data: dict):
-        """Asserts that the specified user does not have an active job."""
-        user_id = job_data.get("author")
-
-        if user_id and user_id != self.rsa_key_hash:
-            # Check that user doesn't have an active job already
-            user_info = self.dht.query(user_id, keys_to_exclude=[self.rsa_key_hash])
-
-            # Check for active job
-            if user_info:
-                current_user_job_id = user_info.get("job")
-
-                if current_user_job_id:
-                    current_user_job = self.dht.query(current_user_job_id)
-
-                    if current_user_job and current_user_job["active"]:
-                        return False
 
     def create_base_job(self, job_data: dict):
         modules, job_id, author, n_pipelines = self._prepare_job(job_data)
@@ -708,6 +637,61 @@ class ValidatorThread(Torchnode):
             self._setup_hosted_job(job_id, job_data)
 
         self._finalize_job(job_id, job_data)
+
+    def create_hf_job(self, job_info: dict, requesters_ip: str = None):
+        """
+        This can be invoked directly from the API endpoint for a hosted HF model, or via a User
+        request for hosting on the user's device. This will trigger HF model inspection in the
+        Validator ML process and will create a config of eligible workers and their assigned modules.
+        """
+
+        # Rate limitation checks for requested jobs
+        if requesters_ip:
+            if self.rate_limiter.is_blocked(requesters_ip):
+                self.debug_print(
+                    f"Job declined! Reason: UserIPBlocked ({requesters_ip})",
+                    tag="Validator",
+                )
+                return False
+
+            self.rate_limiter.record_attempt(requesters_ip)
+
+        if job_info.get("payment", 0) == 0:
+            _time = min(job_info.get("time", FREE_JOB_MAX_TIME), FREE_JOB_MAX_TIME)
+        else:
+            _time = job_info.get("time", FREE_JOB_MAX_TIME)
+
+        job_data = job_info
+
+        if not job_data.get("id"):
+            job_data["time"] = _time
+            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
+            job_data["id"] = job_id
+
+        # Store job info in DHT
+        self.dht.store(job_data.get("id"), job_data)
+
+        # Hand off model dissection and worker assignment to DistributedValidator process
+        request_value = "HF-JOB-REQ" + json.dumps(job_data)
+        self._store_request(self.rsa_key_hash, request_value)
+
+    def check_job_availability(self, job_data: dict):
+        """Asserts that the specified user does not have an active job."""
+        user_id = job_data.get("author")
+
+        if user_id and user_id != self.rsa_key_hash:
+            # Check that user doesn't have an active job already
+            user_info = self.dht.query(user_id, keys_to_exclude=[self.rsa_key_hash])
+
+            # Check for active job
+            if user_info:
+                current_user_job_id = user_info.get("job")
+
+                if current_user_job_id:
+                    current_user_job = self.dht.query(current_user_job_id)
+
+                    if current_user_job and current_user_job["active"]:
+                        return False
 
     def _prepare_job(self, job_data):
         modules = job_data.get("distribution").copy()

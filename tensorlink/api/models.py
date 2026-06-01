@@ -87,18 +87,6 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# v1/responses - Multi-modal response API (layout; handlers TBD)
-#
-# Modality is declared via `type`. Each type will have its own request/
-# response pair below. Add new modalities here as the API grows.
-#
-# Supported types (planned):
-#   "text"        - chat / text-generation  (maps to ChatCompletionRequest)
-#   "image"       - text-to-image generation
-#   "embedding"   - text embeddings
-#   "audio"       - text-to-speech / speech-to-text  (future)
-# ---------------------------------------------------------------------------
 class _BaseResponseRequest(BaseModel):
     """Shared fields inherited by every modality request"""
 
@@ -150,12 +138,9 @@ AnyResponseRequest = Annotated[
 ]
 
 
-# ---------------------------------------------------------------------------
-# Shared status / info responses
-# ---------------------------------------------------------------------------
 class ModelStatusResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    model_name: str
+    model: str
     status: str
     message: str
