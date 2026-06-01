@@ -208,10 +208,10 @@ class TensorlinkAPI:
                         status="active",
                         message="Model is already loaded and ready to use.",
                     )
-                elif status["status"] == "loading":
+                elif status["status"] == "initializing":
                     return ModelStatusResponse(
                         model=model_name,
-                        status="loading",
+                        status="initializing",
                         message="Model is currently being loaded by worker(s).",
                     )
 
@@ -282,7 +282,7 @@ class TensorlinkAPI:
                     j.get("model_name")
                     for j in jobs
                     if isinstance(j, dict)
-                    and j.get("active")
+                    and j.get("status") == "active"
                     and j.get("api")
                     and j.get("hosted")
                 )

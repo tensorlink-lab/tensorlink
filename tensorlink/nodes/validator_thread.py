@@ -552,8 +552,14 @@ class ValidatorThread(Torchnode):
             node.role != "U" or not node_info or node_info["reputation"] < 50
         ):  # TODO reputation
             node.ghosts += 1
-
-        threading.Thread(target=self.create_base_job, args=(job_req,)).start()
+        # Trigger HF model loading path
+        elif job_req.get("model_name"):
+            threading.Thread(
+                target=self.create_hf_job, args=(job_req, node.host)
+            ).start()
+        # Trigger generic torch model loading path
+        else:
+            threading.Thread(target=self.create_base_job, args=(job_req,)).start()
 
     def _handle_decline_job(self, data: bytes, node: Connection):
         self.debug_print(
@@ -589,6 +595,10 @@ class ValidatorThread(Torchnode):
             node.ghosts += 1
 
     def create_base_job(self, job_data: dict):
+        """
+        Initializes job creation and model distribution. This pathway is
+        triggered both by distributed torch models and HF API models.
+        """
         modules, job_id, author, n_pipelines = self._prepare_job(job_data)
         requesting_node = self._get_requesting_node(job_data, author)
         distribution = job_data.get("distribution", {})
@@ -681,17 +691,16 @@ class ValidatorThread(Torchnode):
 
         if user_id and user_id != self.rsa_key_hash:
             # Check that user doesn't have an active job already
-            user_info = self.dht.query(user_id, keys_to_exclude=[self.rsa_key_hash])
-
-            # Check for active job
-            if user_info:
-                current_user_job_id = user_info.get("job")
-
-                if current_user_job_id:
-                    current_user_job = self.dht.query(current_user_job_id)
-
-                    if current_user_job and current_user_job["active"]:
+            for job_id in self.jobs:
+                if job_id != job_data.get("id"):
+                    job_info = self.dht.query(job_id)
+                    if job_info.get("author") == user_id and job_info.get("status") in [
+                        JobStatus.INITIALIZING,
+                        JobStatus.ACTIVE,
+                    ]:
                         return False
+
+        return True
 
     def _prepare_job(self, job_data):
         modules = job_data.get("distribution").copy()

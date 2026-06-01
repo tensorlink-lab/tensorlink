@@ -27,7 +27,6 @@ MODELS = [
     #     {
     #         "name": "Qwen/Qwen3-0.6B-MLX-8bit",
     #         "timeout": 600,
-    #         "sleep": 15,
     #         "parsed": False,
     #     },
     #     id="Qwen3-0.6B",
@@ -37,7 +36,6 @@ MODELS = [
             "name": "sshleifer/tiny-gpt2",
             "model_type": "causal",
             "timeout": 60,
-            "sleep": 15,
             "parsed": False,
         },
         id="tiny-gpt2",
@@ -47,7 +45,6 @@ MODELS = [
             "name": "HuggingFaceTB/SmolLM2-135M",
             "model_type": "causal",
             "timeout": 60,
-            "sleep": 15,
             "parsed": True,
         },
         id="smollm2-135m",
@@ -120,7 +117,7 @@ def test_status_before_request(connected_wwv_nodes):
 
 @pytest.mark.order(2)
 def test_status_loading(model_env):
-    """Query status immediately after requesting the model (no sleep).
+    """Query status immediately after requesting the model.
 
     Workers have been assigned modules but haven't finished loading yet, so
     the expected response is status == 'initializing'.
@@ -155,22 +152,31 @@ def test_status_active(model_env):
     Query status after waiting for the model to fully load.
     """
     cfg, _ = model_env
-    print(f"   [{cfg['name']}] Waiting {cfg['sleep']}s for model to finish loading...")
-    time.sleep(cfg["sleep"])
-    response = get_model_status(cfg["name"])
-    assert response.status_code == 200, (
-        f"[{cfg['name']}] Status check failed with "
-        f"{response.status_code}: {response.text}"
-    )
-    result = response.json()
-    assert (
-        "status" in result
-    ), f"[{cfg['name']}] Response missing 'status' field: {result}"
-    assert result["status"] == "active", (
-        f"[{cfg['name']}] Expected 'active' after load wait, "
-        f"got '{result['status']}'"
-    )
-    print(f"✅ [{cfg['name']}] status long after request: '{result['status']}'")
+    print(f"   [{cfg['name']}] Waiting for model to finish loading...")
+
+    start = time.time()
+    while time.time() - start < cfg["timeout"]:
+        response = get_model_status(cfg["name"])
+        assert response.status_code == 200, (
+            f"[{cfg['name']}] Status check failed with "
+            f"{response.status_code}: {response.text}"
+        )
+
+        result = response.json()
+        assert (
+            "status" in result
+        ), f"[{cfg['name']}] Response missing 'status' field: {result}"
+
+        if result["status"] == "active":
+            print(f"✅ [{cfg['name']}] status became 'active'")
+            break
+
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"[{cfg['name']}] Model did not become active within "
+            f"{cfg['timeout']} seconds. Last status: {result.get('status')}"
+        )
 
 
 # ========= Model Inference Tests =========
@@ -182,7 +188,6 @@ def test_chat_completions(model_env):
     Validates the full response envelope, choice structure, and usage stats.
     """
     cfg, _ = model_env
-    time.sleep(1)
 
     payload = {
         "model": cfg["name"],

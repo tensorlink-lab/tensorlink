@@ -450,15 +450,6 @@ class UserThread(Torchnode):
         job_bytes = b"JOB-UPDATE" + json.dumps(job).encode()
         self.send_to_node(node, job_bytes)
 
-    def get_self_info(self):
-        data = super().get_self_info()
-
-        if len(self.jobs) > 0:
-            job = self.jobs[-1]
-            data["job"] = {"capacity": job["id"]}
-
-        return data
-
     def request_worker_info(self):
         for validator in self.validators:
             node = self.nodes[validator]

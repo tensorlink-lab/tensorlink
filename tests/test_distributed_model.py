@@ -11,6 +11,7 @@ that can be loaded on a single worker, and a slightly larger model that will req
 
 from tensorlink.ml import DistributedModel
 import torch.optim as optim
+import pytest
 import torch
 
 
@@ -21,30 +22,11 @@ BATCH_SIZE = 16
 PIPELINES = 1
 DP_FACTOR = 1
 
-
 MODEL_NAME = "sshleifer/tiny-gpt2"
 
 
-def test_model_inference(connected_uwv_nodes):
-    """
-    Test distributed inference with a simple model, ensures distributed forward and
-    generate functions work from torch requests.
-    Using UWV nodes (User-Worker-Validator) for distributed model tests.
-    """
-    user, worker, validator, _ = connected_uwv_nodes
-
-    distributed_model = DistributedModel(model=MODEL_NAME, training=False, node=user)
-
-    with torch.no_grad():
-        _ = distributed_model(torch.randint(0, 100, (1, 1)))
-
-
-def test_model_training(connected_uwv_nodes):
-    """
-    Test distributed training setup with a tiny encoder model. Ensures backward pass
-    and distributed optimizer functions work.
-    Using UWV nodes (User-Worker-Validator) for distributed model tests.
-    """
+@pytest.fixture(scope="module")
+def model_env(connected_uwv_nodes):
     user, worker, validator, _ = connected_uwv_nodes
 
     distributed_model = DistributedModel(
@@ -53,6 +35,28 @@ def test_model_training(connected_uwv_nodes):
         optimizer=optim.Adam,
         node=user,
     )
+
+    return distributed_model
+
+
+def test_model_inference(model_env):
+    """
+    Test distributed inference with a simple model, ensures distributed forward and
+    generate functions work from torch requests.
+    Using UWV nodes (User-Worker-Validator) for distributed model tests.
+    """
+    distributed_model = model_env
+    with torch.no_grad():
+        _ = distributed_model(torch.randint(0, 100, (1, 1)))
+
+
+def test_model_training(model_env):
+    """
+    Test distributed training setup with a tiny encoder model. Ensures backward pass
+    and distributed optimizer functions work.
+    Using UWV nodes (User-Worker-Validator) for distributed model tests.
+    """
+    distributed_model = model_env
 
     assert distributed_model is not None
 
@@ -78,12 +82,5 @@ def test_model_training(connected_uwv_nodes):
     loss.backward()
 
 
-def test_multiple_models(connected_uwv_nodes):
-    """
-    Test a few tiny models that will require different distributed configs (i.e., single offloaded model and
-    multiple offloaded modules)
-    Using UWV nodes (User-Worker-Validator) for distributed model tests.
-    """
-    user, worker, validator, _ = connected_uwv_nodes
-    # TODO: Implement multiple model testing
-    pass
+# def test_multiple_models
+# def test_user_request_double_jobs

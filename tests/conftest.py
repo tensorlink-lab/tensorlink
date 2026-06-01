@@ -131,7 +131,7 @@ def connected_uwv_nodes(uwv_nodes):
     """
     user, worker, validator = uwv_nodes
 
-    time.sleep(5)
+    time.sleep(1)
 
     val_key, val_host, val_port = validator.send_request("info", None)
 
@@ -139,7 +139,7 @@ def connected_uwv_nodes(uwv_nodes):
     time.sleep(1)
     user.connect_node(val_host, val_port, node_id=val_key, timeout=10)
 
-    time.sleep(5)
+    time.sleep(1)
 
     return user, worker, validator, (val_key, val_host, val_port)
 
