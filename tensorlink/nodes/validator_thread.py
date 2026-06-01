@@ -1,6 +1,6 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
-from tensorlink.nodes.contract_manager import ContractManager
+from tensorlink.eth.contract_manager import ContractManager
 from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
