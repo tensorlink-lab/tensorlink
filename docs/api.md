@@ -18,10 +18,6 @@ Tensorlink exposes a lightweight HTTP API for running Hugging Face models across
 | `GET`  | `/v1/models/status` | Check the loading status of a specific model |
 | `GET`  | `/v1/models/available` | List all currently active (fully loaded) models |
 | `GET`  | `/v1/models/demand` | API demand statistics by model |
-| `GET`  | `/stats` | Network and node status |
-| `GET`  | `/network-history` | Historical network metrics |
-| `GET`  | `/node-info` | Information about a specific node |
-| `GET`  | `/claim-info` | Worker reward claim data |
 
 ---
 
@@ -35,7 +31,7 @@ import requests
 response = requests.post(
     "http://localhost:64747/v1/chat/completions",
     json={
-        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "model": "Qwen/Qwen3-14B",
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "What are the benefits of distributed computing?"}
@@ -55,7 +51,7 @@ print(response.json()["choices"][0]["message"]["content"])
 response = requests.post(
     "http://localhost:64747/v1/chat/completions",
     json={
-        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "model": "Qwen/Qwen3-14B",
         "messages": [{"role": "user", "content": "Write a haiku about distributed computing."}],
         "max_tokens": 100,
         "stream": True,
@@ -106,7 +102,7 @@ response = requests.post(
     "http://localhost:64747/v1/responses",
     json={
         "type": "text",
-        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "model": "Qwen/Qwen3-14B",
         "messages": [
             {"role": "user", "content": "Summarize the theory of relativity."}
         ],
@@ -158,7 +154,7 @@ import requests
 response = requests.post(
     "http://localhost:64747/v1/models/request",
     json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
+        "hf_name": "Qwen/Qwen3-14B",
         "model_type": "chat",   # optional
         "time": 1800,           # lease duration in seconds (optional)
         "payment": 0            # reserved for future paid jobs (optional)
@@ -172,9 +168,9 @@ print(response.json())
 
 ```json
 {
-    "model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "model_name": "Qwen/Qwen3-14B",
     "status": "inactive",
-    "message": "Model Qwen/Qwen2.5-7B-Instruct not found. Loading has been initiated."
+    "message": "Model Qwen/Qwen3-14B not found. Loading has been initiated."
 }
 ```
 
@@ -195,7 +191,7 @@ Possible `status` values:
 Check whether a specific model is active, loading, or not present. Pass the model name as a query parameter to avoid path-routing issues with names that contain slashes.
 
 ```
-GET /v1/models/status?model_name=Qwen/Qwen2.5-7B-Instruct
+GET /v1/models/status?model_name=Qwen/Qwen3-14B
 ```
 
 ```python
@@ -203,11 +199,11 @@ import requests
 
 response = requests.get(
     "http://localhost:64747/v1/models/status",
-    params={"model_name": "Qwen/Qwen2.5-7B-Instruct"}
+    params={"model_name": "Qwen/Qwen3-14B"}
 )
 
 print(response.json())
-# {"model_name": "Qwen/Qwen2.5-7B-Instruct", "status": "active", "message": "..."}
+# {"model_name": "Qwen/Qwen3-14B", "status": "active", "message": "..."}
 ```
 
 ---
@@ -221,7 +217,7 @@ import requests
 
 response = requests.get("http://localhost:64747/v1/models/available")
 print(response.json())
-# {"active_models": ["Qwen/Qwen2.5-7B-Instruct", ...]}
+# {"active_models": ["Qwen/Qwen3-14B", ...]}
 ```
 
 ---
@@ -238,51 +234,3 @@ GET /v1/models/demand?days=30&limit=10
 |-----------|------|---------|-------|-------------|
 | `days` | int | 30 | 1–90 | Lookback window in days |
 | `limit` | int | 10 | 1–50 | Maximum number of models to return |
-
----
-
-## Network & Node Info
-
-### Network Stats - `GET /stats`
-
-Returns current network and node status.
-
-```python
-response = requests.get("http://localhost:64747/stats")
-```
-
----
-
-### Network History - `GET /network-history`
-
-Returns historical network metrics.
-
-```
-GET /network-history?days=30&include_weekly=false&include_summary=true
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `days` | int | 30 | Lookback window (1–90) |
-| `include_weekly` | boolean | false | Include weekly breakdowns |
-| `include_summary` | boolean | true | Include summary statistics |
-
----
-
-### Node Info - `GET /node-info`
-
-Returns information about a specific node: type, last seen, and role-specific data.
-
-```
-GET /node-info?node_id=<pubKeyHash>
-```
-
----
-
-### Claim Info - `GET /claim-info`
-
-Returns worker reward claim data for a given node address.
-
-```
-GET /claim-info?node_address=<address>
-```
