@@ -672,10 +672,6 @@ class ContractManager:
                     tag="ContractManager",
                 )
 
-    # -----------------------------------------------------------------------
-    # Validator / job helpers
-    # -----------------------------------------------------------------------
-
     def add_validator_to_clear(self, validator_id: str) -> None:
         """Add a validator to the list of validators to be cleared."""
         if validator_id not in self.validators_to_clear:
@@ -750,10 +746,6 @@ class ContractManager:
             squished[worker] += cap
 
         return all_job_ids, list(squished.values()), list(squished.keys())
-
-    # -----------------------------------------------------------------------
-    # Proposal monitoring / execution
-    # -----------------------------------------------------------------------
 
     def _monitor_and_execute_proposal(self, proposal_hash: str) -> None:
         """Monitor proposal status and execute when ready."""
@@ -915,10 +907,6 @@ class ContractManager:
             self._handle_execution_error(e)
             return False
 
-    # -----------------------------------------------------------------------
-    # Transaction helpers
-    # -----------------------------------------------------------------------
-
     def _submit_transaction(self, tx: Dict[str, Any]) -> bytes:
         """Sign and broadcast a transaction; return the tx hash."""
         signed_tx = self.chain.eth.account.sign_transaction(
@@ -956,10 +944,6 @@ class ContractManager:
             except Exception:
                 pass
             time.sleep(5)
-
-    # -----------------------------------------------------------------------
-    # Job / validator helpers
-    # -----------------------------------------------------------------------
 
     def _is_validator_online(self, node_info: Dict[str, Any]) -> bool:
         """Check if a validator is online and connected to the network."""
@@ -1023,10 +1007,6 @@ class ContractManager:
                     )
 
         return job_hash, capacities, workers
-
-    # -----------------------------------------------------------------------
-    # Worker claim data
-    # -----------------------------------------------------------------------
 
     def get_worker_claim_data(self, worker_address: str) -> List[Dict[str, Any]]:
         """
@@ -1113,10 +1093,6 @@ class ContractManager:
 
         return claims
 
-    # -----------------------------------------------------------------------
-    # Contract query helpers
-    # -----------------------------------------------------------------------
-
     def _get_time_config(self) -> Tuple[int, int]:
         """Get proposal timing configuration from contract."""
         return self.coordinator_contract.functions.timeConfig().call()
@@ -1183,10 +1159,6 @@ class ContractManager:
                 tag="ContractManager",
             )
             return 0
-
-    # -----------------------------------------------------------------------
-    # Misc helpers
-    # -----------------------------------------------------------------------
 
     def _handle_execution_error(self, error: Exception) -> None:
         """Log errors during proposal execution."""
