@@ -1,24 +1,6 @@
 # Examples
 
-Comprehensive examples for using Tensorlink across different interfaces and deployment scenarios.
-
-## Table of Contents
-
-- [Python Examples](#python-examples)
-  - [Public Network Chatbot](#public-network-chatbot)
-  - [Private Cluster - Python API](#private-cluster--python-api)
-  - [Private Cluster - HTTP API](#private-cluster--http-api)
-- [Node Configuration Examples](#node-configuration-examples)
-  - [Public Compute Provider](#public-compute-provider)
-  - [Private LAN Cluster](#private-lan-cluster)
-  - [Local Development](#local-development)
-- [Security Considerations](#security-considerations)
-
----
-
-## Python Examples
-
-### Public Network Chatbot
+## Public Network Chatbot
 
 **[`examples/public_model.py`](examples/public_model.py)**
 
@@ -227,11 +209,3 @@ Good for offline development, testing custom models, and debugging before deploy
 - Never set `trusted: true` on public nodes
 - Don't send sensitive data through public validators
 - Validate model outputs, deterministic output verification is coming soon
-
----
-
-## Need Help?
-
-- 💬 **[Join our Discord](https://discord.gg/aCW2kTNzJ2)** for community support
-- 📚 **[Read the docs](https://smartnodes.ca/tensorlink/docs)** for API reference
-- 🐛 **[Report issues](https://github.com/mattjhawken/tensorlink/issues)** on GitHub

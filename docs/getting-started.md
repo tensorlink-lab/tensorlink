@@ -1,8 +1,8 @@
 # Getting Started
 Install Tensorlink and set up your environment for distributed AI workloads.
 
-Tensorlink lets you run large Hugging Face models across distributed GPU infrastructure without needing local hardware. 
-If you're looking to access compute, the quickest path is through the [API](api.md) (no GPU required). If you're 
+Tensorlink lets you run large Hugging Face models across distributed GPU infrastructure. 
+If you're simply looking for API access to compute, jump to the [API](api.md) section. If you're 
 just looking to contribute compute to the public network, see the [Worker Setup Guide](worker-guide.md).
 
 ---
