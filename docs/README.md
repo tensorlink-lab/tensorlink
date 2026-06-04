@@ -80,11 +80,10 @@ supporting the network.
 > API keys. Hybrid workflows can also be built by combining personal hardware with the public network for distributed 
 > execution. See below:
 
- 
-````mermaid
+```mermaid
 flowchart LR
 
-A[Tensorlink API & Model Wrappers\n(Routing Layer)]
+A[Tensorlink API & Model Wrappers]
 
 B[Public Devices / Nodes]
 C[Private Nodes]
@@ -104,7 +103,7 @@ D --> F
 
 %% Hybrid output routing
 F --> B
-````
+```
 
 ## Current Limitations
 >**⚠️ Early Release Notice**
