@@ -26,7 +26,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.10"
-cryptography = "^45"
+cryptography = ">=45,<47"
 fastapi = "^0.115"
 uvicorn = "^0.34"
 web3 = "^7.3"
