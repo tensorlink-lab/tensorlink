@@ -20,8 +20,9 @@ from web3 import Web3
 
 class Participant(TypedDict):
     """A single worker entry used as a Merkle leaf."""
-    addr: str       # EIP-55 checksummed address
-    capacity: int   # byte-hours contributed
+
+    addr: str  # EIP-55 checksummed address
+    capacity: int  # byte-hours contributed
 
 
 def build_participants(
@@ -148,9 +149,7 @@ def generate_merkle_proof(
     )
 
     if target_index is None:
-        raise ValueError(
-            f"Participant {target_address} not found in participant list"
-        )
+        raise ValueError(f"Participant {target_address} not found in participant list")
 
     leaves = [_leaf_hash(p, w3) for p in participants]
 

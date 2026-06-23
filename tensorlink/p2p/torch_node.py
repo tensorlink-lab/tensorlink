@@ -15,6 +15,7 @@ import psutil
 
 MSG_TOKEN = b"TOKEN"
 MSG_STREAM_END = b"END__"
+EXPECTED_MODULE_STATUSES = ("inactive", "loaded", "error")
 
 
 def _bar(current, total, width=20):
@@ -156,7 +157,7 @@ class Torchnode(Smartnode):
             if not handled:
                 # Define a dictionary mapping prefixes to handler methods
                 handlers = {
-                    b"LOADED": self._handle_module_loaded,
+                    b"STATUS": self._handle_module_status,
                     b"FORWARD": self._handle_forward,
                     b"BACKWARD": self._handle_backward,
                     b"GENERATE": self._handle_generate,
@@ -176,7 +177,7 @@ class Torchnode(Smartnode):
                             handler(data, node)
                             if prefix
                             in (
-                                b"LOADED",
+                                b"STATUS",
                                 b"FORWARD",
                                 b"GENERATE",
                                 b"BACKWARD",
@@ -447,16 +448,40 @@ class Torchnode(Smartnode):
 
         return False
 
-    def _handle_module_loaded(self, data: bytes, node: Connection):
-        """Remove load module request to signal to distributed process"""
-        self.debug_print(
-            f"Successfully offloaded submodule to: {node.node_id}",
-            level=logging.INFO,
-            colour="bright_cyan",
-            tag="Torchnode",
-        )
+    def _handle_module_status(self, data: bytes, node: Connection):
+        """
+        Update module parameters given the worker's response to a module
+        loading request. Can be 'loaded' (success) or 'error' (failure).
+
+        If failed, try and recruit another worker.
+        """
         module_id = data[6:70].decode()
+        status = data[70:80].decode().lower()
+
+        # First remove request from worker info, regardless of status
         self._remove_request(node.node_id, "MODULE" + module_id)
+
+        if module_id in self.modules:
+            if status in EXPECTED_MODULE_STATUSES:
+                self.modules[module_id]["status"] = status
+
+        if status == "loaded":
+            self.debug_print(
+                f"Successfully offloaded submodule to: {node.node_id}",
+                level=logging.INFO,
+                colour="bright_cyan",
+                tag="Torchnode",
+            )
+
+        elif status == "error":
+            self.debug_print(
+                f"Error offloading submodule to: {node.node_id}. Attempting to recruit "
+                f"another worker...",
+                level=logging.WARNING,
+                colour="bright_cyan",
+                tag="Torchnode",
+            )
+
         return True
 
     def handle_requests(self, request=None):
@@ -479,8 +504,8 @@ class Torchnode(Smartnode):
                 "check_backward": self._handle_check_backward,
                 "check_forward": self._handle_check_forward,
                 "check_generate": self._handle_check_generate,
-                "check_loaded": self._handle_check_module_loaded,
                 "check_module": self._handle_check_module,
+                "check_module_status": self._handle_check_module_status,
                 "check_module_request": self._handle_check_module_request,
                 "check_parameters": self._handle_check_parameters,
                 "check_parameters_request": self._handle_check_parameters_request,
@@ -491,17 +516,19 @@ class Torchnode(Smartnode):
                 "connect_node": self._handle_connect_node,
                 "debug_print": self._handle_debug_print,
                 "generate": self._handle_send_generate,
+                "get_workers": self._handle_get_workers_request,
                 "get_connection": self._handle_get_connection,
                 "info": self._handle_get_info,
-                "module_loaded": self._handle_module_loaded_request,
                 "optimizer_response": self._handle_optimizer_response_request,
                 "release_memory": self._handle_release_memory,
+                "reset_module_status": self._handle_reset_module_status,
                 "request_parameters": self._handle_request_parameters,
                 "send_backward": self._handle_send_backward,
                 "send_forward": self._handle_send_forward,
                 "send_model": self._handle_send_model,
                 "send_optimizer_request": self._handle_send_optimizer_request,
                 "send_parameters": self._handle_send_parameters,
+                "send_module_status": self._handle_update_module_status_request,
                 "send_stream_end": self._handle_send_stream_end,
                 "send_token": self._handle_send_token,
                 "stop": self._handle_stop,
@@ -533,26 +560,61 @@ class Torchnode(Smartnode):
         self.send_module(name, module_id, module_info, node)
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
-    def _handle_check_module_loaded(self, request):
-        # Check if sent module has been received and loaded on the other nodes
-        worker_id, module_id = request["args"]
-        return_val = False
+    def _handle_get_workers_request(self, request):
+        """
+        Get available worker from active connections
+        """
+        workers = {
+            node_id: node.stats
+            for node_id, node in self.nodes.items()
+            if getattr(node, "role", "").startswith("W")
+        }
+        self.response_queue.put({"status": "SUCCESS", "return": workers})
 
-        if "MODULE" + module_id not in self.requests[worker_id]:
-            return_val = True
+    def _handle_reset_module_status(self, request):
+        """
+        Reset module status and assigned worker when re-sending to a replacement.
+        """
+        module_id, new_worker_id = request["args"]
+        if module_id in self.modules:
+            self.modules[module_id]["status"] = "loading"
+            # Update the host/worker reference if tracked
+            if "assigned_workers" in self.modules[module_id]:
+                self.modules[module_id]["assigned_workers"][-1] = new_worker_id
+        self.response_queue.put({"status": "SUCCESS", "return": None})
 
-        self.response_queue.put({"status": "SUCCESS", "return": return_val})
+    def _handle_check_module_status(self, request):
+        """
+        Returns the current loading status of a module.
+        Returns 'inactive', 'loading', 'loaded', or 'error' (or None if unknown module).
+        """
+        module_id = request["args"]
+        status = None
+        if module_id in self.modules:
+            status = self.modules[module_id].get("status")
 
-    def _handle_module_loaded_request(self, request):
+        if status is None:
+            status = "inactive"
+        else:
+            pass
+
+        self.response_queue.put({"status": "SUCCESS", "return": status})
+
+    def _handle_update_module_status_request(self, request):
         """
         Send module loaded message from worker back to a validator
         """
-        module_id = request["args"]
+        module_id, status = request["args"]
         module = self.modules[module_id]
         node_id = module["host"]
-        module["status"] = "loaded"
-        node = self.nodes[node_id]
-        self.send_to_node(node, b"LOADED" + module_id.encode())
+        module["status"] = status
+
+        if status in EXPECTED_MODULE_STATUSES:
+            # Send status to validator
+            bytes_status = status.upper().encode()
+            node = self.nodes[node_id]
+            self.send_to_node(node, b"STATUS" + module_id.encode() + bytes_status)
+
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_optimizer_response_request(self, request):

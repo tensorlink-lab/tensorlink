@@ -23,14 +23,6 @@ SERVER_URL = "http://127.0.0.1:64747"
 
 # Models to test with
 MODELS = [
-    # pytest.param(
-    #     {
-    #         "name": "Qwen/Qwen3-0.6B-MLX-8bit",
-    #         "timeout": 600,
-    #         "parsed": False,
-    #     },
-    #     id="Qwen3-0.6B",
-    # ),
     pytest.param(
         {
             "name": "sshleifer/tiny-gpt2",
@@ -86,6 +78,36 @@ def model_env(request, connected_wwv_nodes):
     assert response.status_code == 200
 
     yield cfg, (worker, worker2, validator)
+
+
+@pytest.fixture(scope="module")
+def active_model_env(model_env):
+    """
+    Wait until the model is active before yielding.
+    """
+    cfg, nodes = model_env
+
+    start = time.time()
+    last_status = None
+
+    while time.time() - start < cfg["timeout"]:
+        response = get_model_status(cfg["name"])
+        assert response.status_code == 200
+
+        result = response.json()
+        last_status = result.get("status")
+
+        if last_status == "active":
+            break
+
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"[{cfg['name']}] Model did not become active within "
+            f"{cfg['timeout']} seconds. Last status: {last_status}"
+        )
+
+    yield cfg, nodes
 
 
 # ========== Model Status Tests ==========
@@ -182,12 +204,12 @@ def test_status_active(model_env):
 # ========= Model Inference Tests =========
 
 
-def test_chat_completions(model_env):
+def test_chat_completions(active_model_env):
     """
     Non-streaming OpenAI-compatible chat completions.
     Validates the full response envelope, choice structure, and usage stats.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
 
     payload = {
         "model": cfg["name"],
@@ -240,12 +262,12 @@ def test_chat_completions(model_env):
     print(f"   Tokens : {usage['total_tokens']}")
 
 
-def test_chat_completions_stream(model_env):
+def test_chat_completions_stream(active_model_env):
     """
     Streaming chat completions via SSE.
     Validates chunk structure, delta content accumulation, and the [DONE] sentinel.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
     time.sleep(1)
 
     payload = {
@@ -253,7 +275,7 @@ def test_chat_completions_stream(model_env):
         "messages": [
             {"role": "user", "content": "Count to three."},
         ],
-        "max_tokens": 15,
+        "max_tokens": 50,
         "temperature": 0.1,
         "stream": True,
     }
@@ -293,6 +315,8 @@ def test_chat_completions_stream(model_env):
         delta = chunk["choices"][0].get("delta", {})
         full_text += delta.get("content") or ""
 
+        print(full_text)
+
     assert done_received, "Stream ended without [DONE] sentinel"
     assert received_chunks > 0, "No chunks received"
 
@@ -308,12 +332,12 @@ def test_chat_completions_stream(model_env):
     print(f"   Tokens : {tokens}")
 
 
-def test_responses_text(model_env):
+def test_responses_text(active_model_env):
     """
     /v1/responses with type='text' should behave identically to
     /v1/chat/completions for non-streaming requests.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
     time.sleep(1)
 
     payload = {

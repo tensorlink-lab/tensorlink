@@ -62,6 +62,8 @@ def uwv_nodes():
         )
     )
 
+    time.sleep(1)
+
     yield user, worker, validator
 
     # Hard cleanup
@@ -115,6 +117,8 @@ def wwv_nodes():
         )
     )
 
+    time.sleep(1)
+
     yield worker, worker2, validator
 
     # Hard cleanup
@@ -131,7 +135,7 @@ def connected_uwv_nodes(uwv_nodes):
     """
     user, worker, validator = uwv_nodes
 
-    time.sleep(1)
+    time.sleep(3)
 
     val_key, val_host, val_port = validator.send_request("info", None)
 
@@ -151,9 +155,10 @@ def connected_wwv_nodes(wwv_nodes):
     """
     worker, worker2, validator = wwv_nodes
 
+    time.sleep(3)
+
     val_key, val_host, val_port = validator.send_request("info", None)
 
-    time.sleep(1)
     worker.connect_node(val_host, val_port, node_id=val_key, timeout=10)
     time.sleep(1)
     worker2.connect_node(val_host, val_port, node_id=val_key, timeout=10)

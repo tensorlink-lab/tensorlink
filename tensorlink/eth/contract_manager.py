@@ -22,9 +22,6 @@ class ProposalData(TypedDict):
     """
     Typed structure for a proposal dict built by _build_proposal and consumed
     by _hash_proposal_data / _execute_proposal / get_worker_claim_data.
-
-    All hash fields are stored as hex strings (the output of bytes.hex()) so
-    they can be serialised into the DHT and later reconstructed via HexBytes().
     """
 
     validators: List[str]  # checksummed addresses
@@ -1113,10 +1110,6 @@ class ContractManager:
 
         return claims
 
-    # -----------------------------------------------------------------------
-    # Contract query helpers
-    # -----------------------------------------------------------------------
-
     def _get_time_config(self) -> Tuple[int, int]:
         """Get proposal timing configuration from contract."""
         return self.coordinator_contract.functions.timeConfig().call()
@@ -1183,10 +1176,6 @@ class ContractManager:
                 tag="ContractManager",
             )
             return 0
-
-    # -----------------------------------------------------------------------
-    # Misc helpers
-    # -----------------------------------------------------------------------
 
     def _handle_execution_error(self, error: Exception) -> None:
         """Log errors during proposal execution."""

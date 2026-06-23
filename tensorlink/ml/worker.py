@@ -396,48 +396,53 @@ class DistributedWorker:
         module_name = module_info.get("module_name")
         training = module_info.get("training", False)
         our_id = module_info.get("assigned_workers")[0]
-        file_name = module_id + our_id
 
-        if module_id is None:
-            raise ValueError("For standard loading, module_id must be provided")
+        try:
+            file_name = module_id + our_id
 
-        # Clear memory before loading
-        self.cleanup_memory()
+            if module_id is None:
+                raise ValueError("For standard loading, module_id must be provided")
 
-        # Try to load the module based on trusted status
-        if self.trusted:
-            with open(file_name, "rb") as f:
-                module = pickle.load(f)
-                module = module.to(self.device)
-
-        # Else try Hugging Face for model info
-        else:
-            skeleton_module = load_model_skeleton(model_name)
-            module = self._initialize_module_from_config(
-                skeleton_module, model_name, module_name, module_info
-            )
-
-            # Ensure skeleton cleanup
-            del skeleton_module
+            # Clear memory before loading
             self.cleanup_memory()
 
-        # Cleanup file
-        try:
-            os.remove(file_name)
-        except:
-            pass
+            # Try to load the module based on trusted status
+            if self.trusted:
+                with open(file_name, "rb") as f:
+                    module = pickle.load(f)
+                    module = module.to(self.device)
 
-        # Initialize storage structures
-        module.intermediates = {}
-        module.host = module_info.get('host')
-        module.n_batch = 0
+            # Else try Hugging Face for model info
+            else:
+                skeleton_module = load_model_skeleton(model_name)
+                module = self._initialize_module_from_config(
+                    skeleton_module, model_name, module_name, module_info
+                )
 
-        self.modules[module_id] = module
-        if training:
-            optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
-            self.optimizers[module_id] = optimizer_cls
+                # Ensure skeleton cleanup
+                del skeleton_module
+                self.cleanup_memory()
 
-        self.send_request("module_loaded", module_id)
+            # Cleanup file
+            try:
+                os.remove(file_name)
+            except:
+                pass
+
+            # Initialize storage structures
+            module.intermediates = {}
+            module.host = module_info.get('host')
+            module.n_batch = 0
+
+            self.modules[module_id] = module
+            if training:
+                optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
+                self.optimizers[module_id] = optimizer_cls
+
+            self.send_request("send_module_status", (module_id, "loaded"))
+
+        except Exception as e:
+            self.send_request("send_module_status", (module_id, "error"))
 
     def _initialize_module_from_config(
         self,

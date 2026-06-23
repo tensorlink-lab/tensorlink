@@ -552,12 +552,12 @@ class ValidatorThread(Torchnode):
             node.role != "U" or not node_info or node_info["reputation"] < 50
         ):  # TODO reputation
             node.ghosts += 1
-        # Trigger HF model loading path
+        # HF model loading path
         elif job_req.get("model_name"):
             threading.Thread(
                 target=self.create_hf_job, args=(job_req, node.host)
             ).start()
-        # Trigger generic torch model loading path
+        # Custom torch model loading path
         else:
             threading.Thread(target=self.create_base_job, args=(job_req,)).start()
 
@@ -742,6 +742,7 @@ class ValidatorThread(Torchnode):
             self.decline_job(requesting_node, reason)
 
     def _assign_workers_to_modules(self, modules, author, job_id, job_data):
+        """Recruit workers and load their assigned modules"""
         worker_connection_info = {}
         groups = {}
         job_data["worker_modules"] = {}
@@ -754,9 +755,9 @@ class ValidatorThread(Torchnode):
                 self.recruit_worker(worker_id, author, job_id, module_info, module_id)
                 job_data["worker_modules"][worker_id] = module_id
                 worker_connection_info[module_id] = worker_id
-            else:
-                # Hosted modules on our device
-                groups[module_id] = module_info
+
+            # For both offloaded and hosted modules, store module info
+            groups[module_id] = module_info
 
         job_data["distribution"] = groups
 
@@ -801,6 +802,7 @@ class ValidatorThread(Torchnode):
                     "assigned_workers": [worker_id],
                     "distribution": module_info,
                     "public": job_data.get("public", True),
+                    "status": "inactive",
                 }
                 self.state_updates[module_id] = []
 
@@ -857,19 +859,20 @@ class ValidatorThread(Torchnode):
         )
 
         # Send a job request to the worker
-        self._store_request(node.node_id, job_id + module_id)
+        worker_recruitment_id = job_id + module_id
+        self._store_request(node.node_id, worker_recruitment_id)
         self.send_to_node(node, data)
 
         # Await 3 seconds for the job request
         timeout = 3
         start_time = time.time()
-        while module_id in self.requests[node.node_id]:
+        while worker_recruitment_id in self.requests[node.node_id]:
             if time.time() - start_time > timeout:
                 self.debug_print(
                     f"Worker: '{worker_id}' timed out during recruitment request.",
                     tag="Validator",
                 )
-                self.requests[node.node_id].remove(module_id)
+                self.requests[node.node_id].remove(worker_recruitment_id)
                 return False
 
         # Worker accepted the job, update stats
