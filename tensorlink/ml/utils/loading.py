@@ -119,6 +119,8 @@ class TiedLinear(nn.Module):
         self.weight = nn.Parameter(weight, requires_grad=weight.requires_grad)
 
     def forward(self, x):
+        if x.dtype != self.weight.dtype:
+            x = x.to(self.weight.dtype)
         return torch.nn.functional.linear(x, self.weight)
 
 

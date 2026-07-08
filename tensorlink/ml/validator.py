@@ -140,6 +140,10 @@ class DistributedValidator(DistributedWorker):
         max_vram_gb: float = 0,
         max_module_bytes: int = 0,
     ):
+        """
+        Args:
+
+        """
         super().__init__(node, trusted)
         self.endpoint = endpoint
         self._hosting_enabled = enable_hosting

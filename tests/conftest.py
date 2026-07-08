@@ -46,9 +46,9 @@ def uwv_nodes():
             endpoint_url="127.0.0.1",
             load_previous_state=False,
         ),
-        enable_hosting=True,
-        max_memory_gb=MAX_MEMORY_GB,
-        max_module_bytes=int(1e8),
+        enable_hosting=False,
+        max_memory_gb=0,
+        max_module_bytes=0,
     )
 
     worker = Worker(
@@ -89,9 +89,9 @@ def wwv_nodes():
             endpoint_url="127.0.0.1",
             load_previous_state=False,
         ),
-        enable_hosting=True,
+        enable_hosting=False,
         max_memory_gb=0,
-        max_module_bytes=int(1e6),
+        max_module_bytes=0,
     )
 
     worker = Worker(

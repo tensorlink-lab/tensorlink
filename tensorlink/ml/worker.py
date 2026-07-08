@@ -32,7 +32,7 @@ import time
 from threading import Thread
 import torch
 import torch.amp as amp
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from transformers.generation.streamers import BaseStreamer
 
 
@@ -97,6 +97,7 @@ class DistributedWorker:
         )
 
         self.modules = {}
+        self.module_paths = {}
         self.optimizers = {}
         self.terminate = False
         self.trusted = trusted
@@ -236,64 +237,68 @@ class DistributedWorker:
 
     def _handle_forward(self, module_id, key, size, name):
         """Handle forward pass with proper KV cache structure preservation"""
-        module = self.modules[module_id]
+        try:
+            module = self.modules[module_id]
 
-        # Get data from shared memory
-        data = get_from_shared_memory(size, name, encoded=True)
-        args_len = int.from_bytes(data[:8], "big")
-        args_bytes = data[8 : 8 + args_len]
-        kwargs_bytes = data[8 + args_len :]
+            # Get data from shared memory
+            data = get_from_shared_memory(size, name, encoded=True)
+            args_len = int.from_bytes(data[:8], "big")
+            args_bytes = data[8 : 8 + args_len]
+            kwargs_bytes = data[8 + args_len :]
 
-        args = bytes_to_tensor(args_bytes)
-        kwargs = bytes_to_tensor(kwargs_bytes)
+            args = bytes_to_tensor(args_bytes)
+            kwargs = bytes_to_tensor(kwargs_bytes)
 
-        inp = attach_tensor(args, self.device)
-        kwargs = attach_tensor(kwargs, self.device)
+            inp = attach_tensor(args, self.device)
+            kwargs = attach_tensor(kwargs, self.device)
 
-        if module.training:
-            inp = enable_grad(inp)
-            kwargs = enable_grad(kwargs)
+            if module.training:
+                inp = enable_grad(inp)
+                kwargs = enable_grad(kwargs)
 
-        if not isinstance(inp, (list, tuple)):
-            inp = (inp,)
+            if not isinstance(inp, (list, tuple)):
+                inp = (inp,)
 
-        # Forward pass
-        if self.use_amp and module.training:
-            with amp.autocast():
-                out = module(*inp, **kwargs)
-        else:
-            with torch.set_grad_enabled(module.training):
-                # we only use kwargs if this is a layer group module
-                if hasattr(module, "num_layers"):
-                    out = module(**kwargs)
-                else:
+            # Forward pass
+            if self.use_amp and module.training:
+                with amp.autocast():
                     out = module(*inp, **kwargs)
+            else:
+                with torch.set_grad_enabled(module.training):
+                    # we only use kwargs if this is a layer group module
+                    if hasattr(module, "num_layers"):
+                        out = module(**kwargs)
+                    else:
+                        out = module(*inp, **kwargs)
 
-        # Store intermediate results if training
-        if module.training:
-            module.intermediates[key] = {
-                "inputs": inp,
-                "output": handle_output(out),
-            }
+            # Store intermediate results if training
+            if module.training:
+                module.intermediates[key] = {
+                    "inputs": inp,
+                    "output": handle_output(out),
+                }
 
-        # Detach and store output
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            # Detach and store output
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        detached_out = detach_tensor(out)
+            detached_out = detach_tensor(out)
 
-        output_bytes = tensor_to_bytes(detached_out)
-        size, name = store_in_shared_memory(output_bytes)
+            output_bytes = tensor_to_bytes(detached_out)
+            size, name = store_in_shared_memory(output_bytes)
 
-        self.send_request("send_forward", (module.host, module_id, size, name, key))
+            self.send_request("send_forward", (module.host, module_id, size, name, key))
 
-        # Incremental training counter
-        if module.training:
-            module.n_batch += 1
+            # Incremental training counter
+            if module.training:
+                module.n_batch += 1
 
-        # Strategic memory management
-        if self.device.type == "cuda" and module.n_batch % 20 == 0:
-            torch.cuda.empty_cache()
+            # Strategic memory management
+            if self.device.type == "cuda" and module.n_batch % 20 == 0:
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(str(e))
 
     def _handle_generate(self, module_id, size, name, stream):
         """
@@ -435,6 +440,8 @@ class DistributedWorker:
             module.n_batch = 0
 
             self.modules[module_id] = module
+            self.module_paths[module_id] = module_info.get("module_path", "")
+
             if training:
                 optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
                 self.optimizers[module_id] = optimizer_cls
@@ -674,31 +681,53 @@ class DistributedWorker:
                 ),
             )
 
-    def _load_single_module(
-        self, model_name: str, base_model: torch.nn.Module, module_info: Dict[str, Any]
-    ) -> torch.nn.Module:
-        """
-        Load a single module (e.g., just the RMSNorm layer).
-        Uses empty weights initialization and only loads required module weights.
-        """
+    def _load_single_module(self, model_name, base_model, module_info):
         module_path = module_info.get("module_path", "")
         module_class_name = module_info.get("module", "")
+        tied_to = module_info.get("tied_to", "")
 
         if not module_path or module_path == "model":
             del base_model
             self.cleanup_memory()
             return self._load_full_model(model_name, module_info)
 
-        # Otherwise proceed with submodule extraction
-        tied_to = module_info.get("tied_to", "")
+        if tied_to:
+            source_module = self._find_loaded_module_by_path(tied_to)
+            if source_module is not None and hasattr(source_module, "weight"):
+                del base_model
+                self.cleanup_memory()
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Tying {module_path} -> {tied_to} (shared Parameter, no reload)",
+                        "cyan",
+                        logging.DEBUG,
+                    ),
+                )
+                if module_class_name == "Linear":
+                    return TiedLinear(source_module.weight)
+                return source_module  # e.g. tied embedding-to-embedding case
+
+            # Source not resident on this worker yet - this should not normally
+            # happen given graphing.py's co-location guarantee, but don't
+            # silently rebuild a divorced tensor. Surface it loudly instead.
+            self.send_request(
+                "debug_print",
+                (
+                    f"WARNING: tied source '{tied_to}' not loaded on this worker yet; "
+                    f"falling back to independent reload for '{module_path}' - "
+                    f"this breaks true weight tying and doubles memory use",
+                    "red",
+                    logging.WARNING,
+                ),
+            )
+
+        # ... existing reload path stays as the fallback only ...
         effective_path = tied_to or module_path
         target_module = get_nested_module(base_model, effective_path)
-
         del base_model
         self.cleanup_memory()
-
         model_path = self.cache_manager.load_model_path(model_name)
-
         load_module_weights(
             model_path=model_path,
             module_path=effective_path,
@@ -706,26 +735,14 @@ class DistributedWorker:
             module_info=module_info,
             device=self.device,
             log_fn=lambda x: self.send_request(
-                "debug_print",
-                (
-                    x,
-                    "cyan",
-                    logging.DEBUG,
-                ),
+                "debug_print", (x, "cyan", logging.DEBUG)
             ),
             warn_fn=lambda x: self.send_request(
-                "debug_print",
-                (
-                    x,
-                    "red",
-                    logging.WARNING,
-                ),
+                "debug_print", (x, "red", logging.WARNING)
             ),
         )
-
         if tied_to and module_class_name == "Linear":
             return TiedLinear(target_module.weight)
-
         return target_module
 
     def _load_full_model(self, model_name: str, module_info: dict) -> torch.nn.Module:
@@ -835,6 +852,7 @@ class DistributedWorker:
                 if self.modules[args].training:
                     del self.optimizers[args]
                 del self.modules[args]
+                self.module_paths.pop(args, None)
 
                 gc.collect()
                 if self.device.type == "cuda":
@@ -921,3 +939,19 @@ class DistributedWorker:
         # Final cleanup
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def _find_loaded_module_by_path(
+        self, module_path: str
+    ) -> Optional[torch.nn.Module]:
+        """
+        Return the already-loaded module resident on this worker whose
+        module_path matches, or None if it isn't loaded here yet.
+
+        Paths are written by the same graphing.py logic on both sides
+        (tied_embed_path/tied_lm_head_path are built as f"model.{name}"),
+        so exact string equality is sufficient, no prefix fuzzing needed here.
+        """
+        for module_id, path in self.module_paths.items():
+            if path == module_path:
+                return self.modules.get(module_id)
+        return None
