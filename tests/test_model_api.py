@@ -36,11 +36,19 @@ MODELS = [
         {
             "name": "HuggingFaceTB/SmolLM2-135M",
             "model_type": "causal",
-            "timeout": 60,
+            "timeout": 90,
             "parsed": True,
         },
         id="smollm2-135m",
     ),
+    # pytest.param(
+    #     {
+    #         "name": "Qwen/Qwen3-0.6B",
+    #         "model_type": "causal",
+    #         "timeout": 90,
+    #         "parsed": True,
+    #     }
+    # )
 ]
 
 

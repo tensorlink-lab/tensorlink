@@ -144,3 +144,25 @@ class ModelStatusResponse(BaseModel):
     model: str
     status: str
     message: str
+
+
+class ModelDistributionEntry(BaseModel):
+    """Describes a single module's distribution state."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    worker_id: Optional[str] = None  # null for validator-hosted modules
+    loaded: bool = False
+    type: str = ""
+    memory: int = 0
+
+
+class ModelStatusDistributionResponse(BaseModel):
+    """Extended model status response including per-module distribution."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_name: str
+    status: str  # "active" | "initializing" | "inactive"
+    message: str
+    distribution: Optional[Dict[str, ModelDistributionEntry]] = None
