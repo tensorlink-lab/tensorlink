@@ -123,6 +123,14 @@ log_handler.setFormatter(logging.Formatter("[%(asctime)s] - %(message)s"))
 log_handler.suffix = "%Y%m%d"
 logging.getLogger().addHandler(log_handler)
 logging.getLogger().setLevel(logging.DEBUG)
+
+# These libraries log at DEBUG/INFO on every single RPC request/response and
+# inherit the root logger's DEBUG level + file handler set above. Left alone,
+# they flood logs/runtime.log with "Making request..."/"POST ... HTTP/1.1 200"
+# lines and bury our own debug_print output. We only care about their errors.
+for _noisy_logger in ("web3", "urllib3", "requests"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 BASE_PORT = 38751
 
 
@@ -293,6 +301,24 @@ class Smartnode(threading.Thread):
             # Smart nodes parameters for additional security and contract connectivity
             self.url = CHAIN_URL
             self.chain = Web3(Web3.HTTPProvider(CHAIN_URL))
+
+            # Drop the default "validation" middleware: it silently issues an
+            # extra eth_chainId RPC call before every eth_call/sendTransaction/
+            # estimateGas/createAccessList to check a "chainId" key we never
+            # set on our transaction dicts. That means every contract read or
+            # write we make was costing 2 RPC calls instead of 1. We never rely
+            # on this middleware (no "chainId" key anywhere, no eth_getBlock*
+            # extraData validation either), so removing it is functionally a
+            # no-op and roughly halves our RPC volume.
+            try:
+                self.chain.middleware_onion.remove("validation")
+            except (KeyError, ValueError) as e:
+                self._log_debug(
+                    f"Could not remove web3 'validation' middleware "
+                    f"(may already be absent): {e}",
+                    tag="Smartnode",
+                )
+
             self.contract_address = Web3.to_checksum_address(CONTRACT)
 
             # Grab the Smartnode contract

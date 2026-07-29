@@ -88,6 +88,15 @@ class ContractManager:
         # successful submission.
         self._submitted_this_round: bool = False
 
+        # proposal_validator() and proposal_creator() run as independent
+        # threads on independent timers but both poll getCurrentRoundValidators
+        # on-chain, even though the validator set only changes once per round.
+        # A short TTL cache lets the second thread reuse the first thread's
+        # result instead of making a redundant RPC call for the same data.
+        self._round_validators_cache: Optional[Tuple[float, List[str]]] = None
+        self._round_validators_cache_lock = threading.Lock()
+        self._ROUND_VALIDATORS_CACHE_TTL = 5.0  # seconds
+
     def proposal_validator(self) -> None:
         """Listen for new proposals created on SmartnodesCoordinator and validate them."""
         while not self.terminate_flag.is_set():
@@ -1115,8 +1124,30 @@ class ContractManager:
         return self.coordinator_contract.functions.timeConfig().call()
 
     def _get_current_round_validators(self) -> List[str]:
-        """Get the list of current round validators."""
-        return self.coordinator_contract.functions.getCurrentRoundValidators().call()
+        """
+        Get the list of current round validators.
+
+        Cached for a short TTL because proposal_validator() and
+        proposal_creator() each poll this independently, and the on-chain
+        validator set for a round doesn't change between polls. On a cache
+        miss (or first call) this behaves exactly as a direct contract call,
+        including propagating any exception unchanged and without touching
+        the cache.
+        """
+        with self._round_validators_cache_lock:
+            if self._round_validators_cache is not None:
+                cached_at, validators = self._round_validators_cache
+                if time.time() - cached_at < self._ROUND_VALIDATORS_CACHE_TTL:
+                    return validators
+
+        validators = (
+            self.coordinator_contract.functions.getCurrentRoundValidators().call()
+        )
+
+        with self._round_validators_cache_lock:
+            self._round_validators_cache = (time.time(), validators)
+
+        return validators
 
     def _calculate_next_round_time(self) -> int:
         """Calculate when the next proposal round will start."""
