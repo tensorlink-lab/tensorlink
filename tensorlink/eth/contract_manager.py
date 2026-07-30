@@ -90,9 +90,8 @@ class ContractManager:
 
         # proposal_validator() and proposal_creator() run as independent
         # threads on independent timers but both poll getCurrentRoundValidators
-        # on-chain, even though the validator set only changes once per round.
-        # A short TTL cache lets the second thread reuse the first thread's
-        # result instead of making a redundant RPC call for the same data.
+        # on-chain. A short TTL cache lets the second thread reuse the first
+        # thread's result instead of making a redundant RPC call for the same data.
         self._round_validators_cache: Optional[Tuple[float, List[str]]] = None
         self._round_validators_cache_lock = threading.Lock()
         self._ROUND_VALIDATORS_CACHE_TTL = 5.0  # seconds

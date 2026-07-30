@@ -1221,6 +1221,7 @@ class OffloadedModule(nn.Module):
         self.parent_model.send_request(
             "send_model", (name, self.worker_id, self.module_id, module_info)
         )
+        time.sleep(1)
 
     def handle_timeout(self):
         # Timeout occurred, switch to another worker TODO

@@ -10,10 +10,12 @@ from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download, model_info
 from safetensors import safe_open
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from filelock import FileLock
 import torch.nn as nn
 import torch
 import logging
 import shutil
+import threading
 import glob
 import os
 import gc
@@ -32,22 +34,54 @@ def get_hf_cache_dir() -> str:
 
 
 class ModelCacheManager:
+    # Per-model in-process locks, so threads within the same worker also
+    # serialize on the filesystem lock without extra syscalls once one of
+    # them already holds it. Guarded by _thread_locks_guard so creating a
+    # new per-model Lock can't itself race across threads.
+    _thread_locks: Dict[str, threading.Lock] = {}
+    _thread_locks_guard = threading.Lock()
+
     def __init__(self, primary_dir, max_cache_size_gb=50):
         self.primary_dir = primary_dir
         self.hf_cache_dir = get_hf_cache_dir()
         self.max_cache_size = max_cache_size_gb * 1024**3
 
+        # Directory that holds one lock file per model, shared by every
+        # worker process/thread on this machine that points at the same
+        # HF_HOME cache dir.
+        self._locks_dir = os.path.join(self.hf_cache_dir, ".locks", "model_download")
+        os.makedirs(self._locks_dir, exist_ok=True)
+
+    def _lock_path(self, model_name: str) -> str:
+        safe_name = model_name.replace("/", "--")
+        return os.path.join(self._locks_dir, f"{safe_name}.lock")
+
     def get_local_snapshot(self, model_name):
         path = os.path.join(self.primary_dir, model_name.replace("/", "_"))
         return path if os.path.exists(path) else None
 
+    @staticmethod
+    def _weights_present(path: Optional[str]) -> bool:
+        """A snapshot dir only counts as "cached" if it actually has weight
+        files. huggingface_hub's local_files_only lookup can resolve a
+        snapshot directory that exists but is still mid-download by another
+        worker, so we verify before trusting it."""
+        if not path:
+            return False
+        return bool(
+            glob.glob(os.path.join(path, "*.safetensors"))
+            or glob.glob(os.path.join(path, "pytorch_model*.bin"))
+        )
+
     def get_hf_cached(self, model_name):
         try:
-            return snapshot_download(
+            path = snapshot_download(
                 repo_id=model_name,
                 cache_dir=self.hf_cache_dir,
+                allow_patterns=["*.safetensors", "*.bin", "*.json"],
                 local_files_only=True,
             )
+            return path if self._weights_present(path) else None
         except Exception:
             return None
 
@@ -56,21 +90,39 @@ class ModelCacheManager:
         if local:
             return local
 
+        # Fast, unlocked path: if the model is already fully cached (the
+        # common case after the first load), skip locking entirely.
         cached = self.get_hf_cached(model_name)
         if cached:
             return cached
 
-        size = self._estimate_model_size(model_name)
-        if not has_space(size, self.hf_cache_dir):
-            self.cleanup_hf_cache(size)
+        # Slow path: not cached yet. Serialize on a per-model file lock so
+        # that when several modules/workers request the same model at once,
+        # only one of them actually triggers the download and the rest
+        # block here, then simply re-read the now-complete cache.
+        with self._thread_locks_guard:
+            thread_lock = self._thread_locks.setdefault(model_name, threading.Lock())
 
-        return snapshot_download(
-            repo_id=model_name,
-            cache_dir=self.hf_cache_dir,
-            allow_patterns=["*.safetensors", "*.bin", "*.json"],
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-            local_files_only=False,
-        )
+        with thread_lock:
+            with FileLock(self._lock_path(model_name)):
+                # Re-check now that we hold the lock another
+                # worker/thread may have finished the download while we
+                # were waiting for it.
+                cached = self.get_hf_cached(model_name)
+                if cached:
+                    return cached
+
+                size = self._estimate_model_size(model_name)
+                if not has_space(size, self.hf_cache_dir):
+                    self.cleanup_hf_cache(size)
+
+                return snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=self.hf_cache_dir,
+                    allow_patterns=["*.safetensors", "*.bin", "*.json"],
+                    ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
+                    local_files_only=False,
+                )
 
     @staticmethod
     def _estimate_model_size(model_name: str) -> int:
@@ -104,11 +156,6 @@ class ModelCacheManager:
             freed += size
             if freed >= required_bytes:
                 break
-
-
-# ---------------------------------------------------------------------------
-# Universal prefix resolution
-# ---------------------------------------------------------------------------
 
 
 class TiedLinear(nn.Module):
@@ -192,11 +239,6 @@ def _strip_to_local_key(key: str, matched_prefix: str) -> str:
           -> "mlp.gate_proj.weight"
     """
     return key[len(matched_prefix) + 1 :]  # +1 for the "."
-
-
-# ---------------------------------------------------------------------------
-# Core shared loading primitives
-# ---------------------------------------------------------------------------
 
 
 def apply_required_buffers(
@@ -334,11 +376,6 @@ def _load_tensors_from_shards(
     return state_dict
 
 
-# ---------------------------------------------------------------------------
-# Universal single-module weight loader
-# ---------------------------------------------------------------------------
-
-
 def load_module_weights(
     model_path: str,
     module_path: str,
@@ -403,11 +440,6 @@ def load_module_weights(
 
     target_module.to(device)
     return missing_keys, unexpected_keys
-
-
-# ---------------------------------------------------------------------------
-# Universal grouped-layer weight loader
-# ---------------------------------------------------------------------------
 
 
 def load_grouped_module_weights(
@@ -549,11 +581,6 @@ def _fallback_full_scan(
 
     log_fn(f"Fallback scan found {len(state_dict)} tensors (prefix='{matched_prefix}')")
     return state_dict
-
-
-# ---------------------------------------------------------------------------
-# Full-model loaders (unchanged)
-# ---------------------------------------------------------------------------
 
 
 def load_full_model(
