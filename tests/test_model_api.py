@@ -212,6 +212,7 @@ def test_status_active(model_env):
 # ========= Model Inference Tests =========
 
 
+@pytest.mark.order(4)
 def test_chat_completions(active_model_env):
     """
     Non-streaming OpenAI-compatible chat completions.
@@ -270,6 +271,7 @@ def test_chat_completions(active_model_env):
     print(f"   Tokens : {usage['total_tokens']}")
 
 
+@pytest.mark.order(5)
 def test_chat_completions_stream(active_model_env):
     """
     Streaming chat completions via SSE.
@@ -340,6 +342,7 @@ def test_chat_completions_stream(active_model_env):
     print(f"   Tokens : {tokens}")
 
 
+@pytest.mark.order(6)
 def test_responses_text(active_model_env):
     """
     /v1/responses with type='text' should behave identically to
@@ -375,6 +378,7 @@ def test_responses_text(active_model_env):
     print(f"   Output : {result['choices'][0]['message']['content'][:60]}...")
 
 
+@pytest.mark.order(7)
 def test_responses_invalid_type():
     """
     Submitting an unknown type to /v1/responses should return 422.
