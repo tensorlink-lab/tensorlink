@@ -53,7 +53,7 @@ class ModelCacheManager:
         os.makedirs(self._locks_dir, exist_ok=True)
 
     def _lock_path(self, model_name: str) -> str:
-        safe_name = model_name.replace("/", "--\\\\\\\\\\\\")
+        safe_name = model_name.replace("/", "--")
         return os.path.join(self._locks_dir, f"{safe_name}.lock")
 
     def get_local_snapshot(self, model_name):
@@ -588,15 +588,9 @@ def load_full_model(
     model_type: str,
     device: torch.device,
     log_fn: Callable[[str], None] = logging.debug,
-    torch_dtype: Optional[torch.dtype] = None,
+    torch_dtype: torch.dtype = torch.float16,
 ) -> nn.Module:
     num_gpus = torch.cuda.device_count()
-
-    if torch_dtype is None:
-        if device.type == "cuda":
-            torch_dtype = "auto"  # respect the checkpoint's native precision
-        else:
-            torch_dtype = torch.float32  # CPU: never trust fp16
 
     load_kwargs: Dict[str, Any] = {
         "low_cpu_mem_usage": True,
