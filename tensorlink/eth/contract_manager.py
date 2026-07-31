@@ -86,12 +86,62 @@ class ContractManager:
         # Track whether we have already submitted a proposal this round so that
         # proposal_creator does not re-enter create_and_submit_proposal after a
         # successful submission.
+        #
+        # On a fresh process start this needs to reflect on-chain reality, not
+        # just default to False, otherwise a restart between "submitted" and
+        # "executed" (e.g. after a crash) causes proposal_creator() to create
+        # and submit a *second* proposal for a round we already participated
+        # in, which is what produced the duplicate-proposal + prolonged 429
+        # storm seen in production logs.
         self._submitted_this_round: bool = False
+        try:
+            already_submitted = (
+                self.coordinator_contract.functions.hasSubmittedProposal(
+                    self.public_key
+                ).call()
+            )
+            if already_submitted:
+                self._submitted_this_round = True
+
+                # _execute_proposal is only ever reached via
+                # _monitor_and_execute_proposal, which is normally kicked off
+                # by create_and_submit_proposal(). Since we're skipping that
+                # call (we already submitted, before the restart), resume
+                # monitoring in the background so this proposal still gets
+                # executed once it's ready, instead of being orphaned.
+                proposal_data = self.coordinator_contract.functions.getProposal(
+                    already_submitted
+                ).call()
+                proposal_hash = proposal_data[-1].hex()
+
+                node.debug_print(
+                    f"Found an existing submitted proposal for this round "
+                    f"({proposal_hash}) on startup; resuming monitoring "
+                    f"instead of creating a new one.",
+                    colour="yellow",
+                    level=logging.INFO,
+                    tag="ContractManager",
+                )
+                threading.Thread(
+                    target=self._monitor_and_execute_proposal,
+                    args=(proposal_hash,),
+                    name="resume_proposal_monitor",
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            node.debug_print(
+                f"Could not check for an existing submitted proposal on "
+                f"startup, assuming none: {e}",
+                colour="yellow",
+                level=logging.WARNING,
+                tag="ContractManager",
+            )
 
         # proposal_validator() and proposal_creator() run as independent
         # threads on independent timers but both poll getCurrentRoundValidators
-        # on-chain. A short TTL cache lets the second thread reuse the first
-        # thread's result instead of making a redundant RPC call for the same data.
+        # on-chain, even though the validator set only changes once per round.
+        # A short TTL cache lets the second thread reuse the first thread's
+        # result instead of making a redundant RPC call for the same data.
         self._round_validators_cache: Optional[Tuple[float, List[str]]] = None
         self._round_validators_cache_lock = threading.Lock()
         self._ROUND_VALIDATORS_CACHE_TTL = 5.0  # seconds
@@ -196,10 +246,6 @@ class ContractManager:
                     )
 
             time.sleep(10)
-
-    # -----------------------------------------------------------------------
-    # Proposal creation / submission
-    # -----------------------------------------------------------------------
 
     def create_and_submit_proposal(self) -> None:
         """Build, store, and submit a single proposal for the current round."""
@@ -508,10 +554,6 @@ class ContractManager:
 
         return 1
 
-    # -----------------------------------------------------------------------
-    # Proposal validation
-    # -----------------------------------------------------------------------
-
     def _try_validate_proposal(self, proposal_num: int) -> None:
         """Fetch and start a validation thread for a single proposal number."""
         try:
@@ -677,10 +719,6 @@ class ContractManager:
                     tag="ContractManager",
                 )
 
-    # -----------------------------------------------------------------------
-    # Validator / job helpers
-    # -----------------------------------------------------------------------
-
     def add_validator_to_clear(self, validator_id: str) -> None:
         """Add a validator to the list of validators to be cleared."""
         if validator_id not in self.validators_to_clear:
@@ -756,10 +794,6 @@ class ContractManager:
 
         return all_job_ids, list(squished.values()), list(squished.keys())
 
-    # -----------------------------------------------------------------------
-    # Proposal monitoring / execution
-    # -----------------------------------------------------------------------
-
     def _monitor_and_execute_proposal(self, proposal_hash: str) -> None:
         """Monitor proposal status and execute when ready."""
         try:
@@ -830,12 +864,22 @@ class ContractManager:
             time.sleep(1)
             return self.current_proposal == proposal_id
         except Exception as e:
-            self.node.debug_print(
-                f"Could not verify proposal validity: {e}",
-                colour="yellow",
-                level=logging.WARNING,
-                tag="ContractManager",
-            )
+            if RPCBackoff.is_rate_limit(e):
+                delay = self._rpc_backoff.failure()
+                self.node.debug_print(
+                    f"Rate limited while verifying proposal validity, "
+                    f"backing off {delay:.0f}s",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
+            else:
+                self.node.debug_print(
+                    f"Could not verify proposal validity: {e}",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
             return True  # optimistic, keep monitoring
 
     def _is_proposal_ready(self) -> Tuple[int, bool]:
@@ -920,10 +964,6 @@ class ContractManager:
             self._handle_execution_error(e)
             return False
 
-    # -----------------------------------------------------------------------
-    # Transaction helpers
-    # -----------------------------------------------------------------------
-
     def _submit_transaction(self, tx: Dict[str, Any]) -> bytes:
         """Sign and broadcast a transaction; return the tx hash."""
         signed_tx = self.chain.eth.account.sign_transaction(
@@ -961,10 +1001,6 @@ class ContractManager:
             except Exception:
                 pass
             time.sleep(5)
-
-    # -----------------------------------------------------------------------
-    # Job / validator helpers
-    # -----------------------------------------------------------------------
 
     def _is_validator_online(self, node_info: Dict[str, Any]) -> bool:
         """Check if a validator is online and connected to the network."""
@@ -1028,10 +1064,6 @@ class ContractManager:
                     )
 
         return job_hash, capacities, workers
-
-    # -----------------------------------------------------------------------
-    # Worker claim data
-    # -----------------------------------------------------------------------
 
     def get_worker_claim_data(self, worker_address: str) -> List[Dict[str, Any]]:
         """
@@ -1186,12 +1218,22 @@ class ContractManager:
             current_validators = self._get_current_round_validators()
             return self.public_key in current_validators or not current_validators
         except Exception as e:
-            self.node.debug_print(
-                f"Could not fetch current round validators: {e}",
-                colour="yellow",
-                level=logging.WARNING,
-                tag="ContractManager",
-            )
+            if RPCBackoff.is_rate_limit(e):
+                delay = self._rpc_backoff.failure()
+                self.node.debug_print(
+                    f"Rate limited fetching current round validators, "
+                    f"backing off {delay:.0f}s",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
+            else:
+                self.node.debug_print(
+                    f"Could not fetch current round validators: {e}",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
             return False
 
     def _get_expected_proposal_count(self) -> int:
@@ -1199,12 +1241,22 @@ class ContractManager:
         try:
             return len(self._get_current_round_validators())
         except Exception as e:
-            self.node.debug_print(
-                f"Could not get expected proposal count: {e}",
-                colour="yellow",
-                level=logging.WARNING,
-                tag="ContractManager",
-            )
+            if RPCBackoff.is_rate_limit(e):
+                delay = self._rpc_backoff.failure()
+                self.node.debug_print(
+                    f"Rate limited getting expected proposal count, "
+                    f"backing off {delay:.0f}s",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
+            else:
+                self.node.debug_print(
+                    f"Could not get expected proposal count: {e}",
+                    colour="yellow",
+                    level=logging.WARNING,
+                    tag="ContractManager",
+                )
             return 0
 
     def _handle_execution_error(self, error: Exception) -> None:

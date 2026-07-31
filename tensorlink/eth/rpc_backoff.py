@@ -24,7 +24,6 @@ class RPCBackoff:
                     raise
     """
 
-    # seconds: [0, 5, 10, 20, 40, 80, 160, 300]
     _DELAYS = [0, 5, 10, 20, 40, 80, 160, 300]
 
     def __init__(self):
