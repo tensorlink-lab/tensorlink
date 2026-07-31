@@ -87,6 +87,9 @@ def model_env(request, connected_wwv_nodes):
 
     yield cfg, (worker, worker2, validator)
 
+    print(f"Waiting before switching away from {cfg['name']}...")
+    time.sleep(5)
+
 
 @pytest.fixture(scope="module")
 def active_model_env(model_env):

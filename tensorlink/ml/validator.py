@@ -1021,6 +1021,8 @@ class DistributedValidator(DistributedWorker):
             # Update available GPU memory
             self._release_host_memory(job_id)
 
+            self.send_request("update_job_status", (job_id, "active"))
+
             # Load tokenizer
             if model_name not in self.tokenizers:
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -1041,8 +1043,6 @@ class DistributedValidator(DistributedWorker):
                     logging.INFO,
                 ),
             )
-
-            self.send_request("update_job_status", (job_id, "active"))
 
             return True
 

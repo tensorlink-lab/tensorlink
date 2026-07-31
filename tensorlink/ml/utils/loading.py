@@ -186,7 +186,7 @@ def _iter_safetensor_keys(model_path: str):
             yield from shard.keys()
 
 
-def resolve_weight_prefix(model_path: str, module_path: str) -> str:
+def resolve_weight_prefix(model_path: str, module_path: str) -> Optional[str]:
     """
     Discover the actual key prefix used in the weight files for *module_path*.
 
@@ -200,19 +200,30 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
       module_path="model.lm_head"            -> "lm_head"
       module_path="model"                    -> "model"
 
-    Returns the matched prefix string, or "" if nothing matched (caller
-    should treat "" as a root/full load).
+    Returns:
+      - "" only when *module_path* itself denotes the whole model (i.e. an
+        explicit root-load request: module_path in ("", "model")).
+      - the matched prefix string on a normal match.
+      - None when nothing matched at all, or the shard scan failed. This is
+        NOT the same as "", it means "this module has no entries of its
+        own in the weight files" (e.g. RotaryEmbedding, whose buffers are
+        computed at init time rather than loaded), and callers must treat
+        it as "skip loading weights for this module", never as "load
+        everything".
     """
+    if module_path in ("", "model"):
+        return ""
+
     sampled: List[str] = []
     try:
         for key in _iter_safetensor_keys(model_path):
             sampled.append(key)
 
     except Exception:
-        return ""
+        return None
 
     if not sampled:
-        return ""
+        return None
 
     # Build candidates by dropping 0, 1, 2, … leading components.
     # e.g. "model.model.embed_tokens" ->
@@ -223,8 +234,8 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
         if any(key.startswith(candidate + ".") for key in sampled):
             return candidate
 
-    # Nothing matched, signal a root/full load
-    return ""
+    # Nothing matched, this module has no weight-file entries of its own.
+    return None
 
 
 def _strip_to_local_key(key: str, matched_prefix: str) -> str:

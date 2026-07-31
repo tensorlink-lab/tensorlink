@@ -149,6 +149,7 @@ class ContractManager:
     def proposal_validator(self) -> None:
         """Listen for new proposals created on SmartnodesCoordinator and validate them."""
         while not self.terminate_flag.is_set():
+            time.sleep(30)  # Long sleep between looking for new proposals
             try:
                 self._rpc_backoff.wait()
 
@@ -189,8 +190,6 @@ class ContractManager:
                         tag="ContractManager",
                     )
 
-            time.sleep(5)
-
     def proposal_creator(self) -> None:
         """Create proposals when this node is selected as a round validator."""
         while not self.terminate_flag.is_set():
@@ -205,10 +204,8 @@ class ContractManager:
                     self.coordinator_contract.functions.getState().call()
                 )
                 self._rpc_backoff.success()
-                time.sleep(1)
 
                 is_expired = self.coordinator_contract.functions.isRoundExpired().call()
-                time.sleep(1)
 
                 # Reset submission flag when a new round starts
                 if next_proposal_id != self.current_proposal:
@@ -244,8 +241,6 @@ class ContractManager:
                         level=logging.ERROR,
                         tag="ContractManager",
                     )
-
-            time.sleep(10)
 
     def create_and_submit_proposal(self) -> None:
         """Build, store, and submit a single proposal for the current round."""
@@ -514,7 +509,6 @@ class ContractManager:
                         level=logging.WARNING,
                         tag="ContractManager",
                     )
-                    time.sleep(2)
                     continue
 
                 # Rate limit, back off and retry
@@ -548,7 +542,7 @@ class ContractManager:
                     tag="ContractManager",
                 )
                 if retry < max_retries:
-                    time.sleep(10)
+                    time.sleep(5)
                 else:
                     return 1
 

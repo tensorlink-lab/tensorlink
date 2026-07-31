@@ -380,10 +380,6 @@ class TensorlinkAPI:
             """Get claim information for a specific worker node"""
             return self.smart_node.contract_manager.get_worker_claim_data(node_address)
 
-    # ---------------------------------------------------------------------- #
-    # Model status helpers (v1)                                               #
-    # ---------------------------------------------------------------------- #
-
     def _find_job_for_model(self, model_name: str):
         """
         Search for an active, API-hosted job matching model_name.
@@ -491,10 +487,6 @@ class TensorlinkAPI:
         """Convenience wrapper: build distribution then derive status."""
         distribution = self._build_distribution_info(job_data)
         return self._derive_status_from_distribution(distribution)
-
-    # ---------------------------------------------------------------------- #
-    # Legacy status helper                                                     #
-    # ---------------------------------------------------------------------- #
 
     def _check_model_status(self, model_name: str) -> dict:
         """
