@@ -47,7 +47,7 @@ pydantic = "^2.9"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
-black = "^24.1.1"
+black = ">=24.1.1,<27.0.0"
 pylint = "^3.0.3"
 mypy = "^1.8.0"
 coverage = "^7.4.0"
