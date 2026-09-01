@@ -1,4 +1,4 @@
-from tensorlink.ml.utils import bytes_to_tensor
+from tensorlink.ml.utils import bytes_to_tensor, resolve_dtype
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -255,6 +255,7 @@ def _strip_to_local_key(key: str, matched_prefix: str) -> str:
 def apply_required_buffers(
     module: nn.Module,
     module_info: Dict[str, Any],
+    device: torch.device,
     log_fn: Callable[[str], None] = logging.debug,
     warn_fn: Callable[[str], None] = logging.warning,
     error_fn: Callable[[str], None] = logging.error,
@@ -274,6 +275,8 @@ def apply_required_buffers(
       3. Nested buffer path (navigate to the correct submodule first)
     """
     required_buffers = module_info.get("required_buffers", {})
+    module_dtype = resolve_dtype(module, device)
+
     if not required_buffers or required_buffers == b"{}":
         return
 
@@ -327,11 +330,11 @@ def apply_required_buffers(
             if hasattr(target, buf_name) and buf_name in existing_buffers:
                 existing = getattr(target, buf_name)
                 if existing.shape == tensor.shape:
-                    existing.copy_(tensor)
+                    existing.copy_(tensor.to(existing.dtype))
                 else:
                     target.register_buffer(buf_name, tensor)
             else:
-                target.register_buffer(buf_name, tensor)
+                target.register_buffer(buf_name, tensor.to(module_dtype))
 
             log_fn(f"Applied buffer '{rel_key}'")
 
@@ -447,9 +450,16 @@ def load_module_weights(
         warn_fn(f"All keys correct for '{module_path}': {dict_keys}")
 
     if module_info:
-        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+        apply_required_buffers(target_module, module_info, device, log_fn, warn_fn)
 
     target_module.to(device)
+
+    dtypes = {p.dtype for p in target_module.parameters()} | {
+        b.dtype for b in target_module.buffers()
+    }
+    if len(dtypes) > 1:
+        warn_fn(f"Mixed dtypes in loaded module '{module_info}': {dtypes}")
+
     return missing_keys, unexpected_keys
 
 
@@ -528,7 +538,7 @@ def load_grouped_module_weights(
     )
 
     if module_info:
-        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+        apply_required_buffers(target_module, module_info, device, log_fn, warn_fn)
 
     target_module.to(device)
 
@@ -599,8 +609,11 @@ def load_full_model(
     model_type: str,
     device: torch.device,
     log_fn: Callable[[str], None] = logging.debug,
-    torch_dtype: torch.dtype = torch.float16,
+    torch_dtype: Optional[torch.dtype] = None,
 ) -> nn.Module:
+    if torch_dtype is None:
+        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+
     num_gpus = torch.cuda.device_count()
 
     load_kwargs: Dict[str, Any] = {
@@ -630,18 +643,27 @@ def load_full_model(
     return model
 
 
-def load_model_skeleton(model_name: str, model_type: str = "chat"):
+def load_model_skeleton(
+    model_name: str, model_type: str = "chat", torch_dtype: Optional[torch.dtype] = None
+):
     model_config = AutoConfig.from_pretrained(model_name)
-
     with init_empty_weights():
         if model_type in ("causal", "chat"):
-            skeleton_model = AutoModelForCausalLM.from_config(model_config)
+            skeleton_model = AutoModelForCausalLM.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         elif model_type == "seq2seq":
-            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
+            skeleton_model = AutoModelForSeq2SeqLM.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         elif model_type == "audio2text":
-            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
+            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         else:
-            skeleton_model = AutoModel.from_config(model_config)
+            skeleton_model = AutoModel.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
 
     skeleton_model.eval()
 

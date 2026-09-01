@@ -467,7 +467,7 @@ class Torchnode(Smartnode):
 
         if status == "loaded":
             self.debug_print(
-                f"Successfully offloaded submodule to: {node.node_id}",
+                f"Successfully offloaded submodule: {module_id} to: {node.node_id}",
                 level=logging.INFO,
                 colour="bright_cyan",
                 tag="Torchnode",
@@ -475,7 +475,7 @@ class Torchnode(Smartnode):
 
         elif status == "error":
             self.debug_print(
-                f"Error offloading submodule to: {node.node_id}. Attempting to recruit "
+                f"Error offloading submodule: {module_id} to: {node.node_id}. Attempting to recruit "
                 f"another worker...",
                 level=logging.WARNING,
                 colour="bright_cyan",

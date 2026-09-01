@@ -6,6 +6,7 @@ from tensorlink.ml.utils import (
     handle_output,
     enable_grad,
     get_optimizer_from_spec,
+    resolve_dtype,
 )
 from tensorlink.ml.utils.loading import (
     TiedLinear,
@@ -23,7 +24,6 @@ from tensorlink.nodes.shared_memory import (
 )
 
 import gc
-import inspect
 import json
 import logging
 import os
@@ -473,14 +473,14 @@ class DistributedWorker:
                     model_name, skeleton_module, module_id, module_info
                 )
             else:
-                # Load single module
+                # Load single module / entire model
                 return self._load_single_module(
                     model_name, skeleton_module, module_info
                 )
 
         except Exception as e:
             # Make sure skeleton is cleaned up on error
-            err = f"Failed to load model from HuggingFace: {str(e)}"
+            err = f"Failed to load model from HuggingFace: {e}"
             self.send_request(
                 "debug_print",
                 (
@@ -715,14 +715,14 @@ class DistributedWorker:
                 "debug_print",
                 (
                     f"WARNING: tied source '{tied_to}' not loaded on this worker yet; "
-                    f"falling back to independent reload for '{module_path}' - "
+                    f"falling back to independent reload for '{module_path}', "
                     f"this breaks true weight tying and doubles memory use",
                     "red",
                     logging.WARNING,
                 ),
             )
 
-        # ... existing reload path stays as the fallback only ...
+        # Loading case for a single, un-tied module
         effective_path = tied_to or module_path
         target_module = get_nested_module(base_model, effective_path)
         del base_model
@@ -752,7 +752,8 @@ class DistributedWorker:
         """
         model_type = module_info.get('model_type', 'chat')
         self.cleanup_memory()
-        return load_full_model(model_name, model_type, self.device)
+        dtype = resolve_dtype(model_name, self.device)
+        return load_full_model(model_name, model_type, self.device, torch_dtype=dtype)
 
     def process_state_update(self, module_id, state_update):
         """Process optimizer state updates"""

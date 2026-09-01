@@ -1038,7 +1038,7 @@ class DistributedValidator(DistributedWorker):
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedValidator -> Finalized hosted job for {model_name} with job_id {job_id}",
+                    f"Finalized hosted job for {model_name} with job_id {job_id}",
                     "green",
                     logging.INFO,
                 ),

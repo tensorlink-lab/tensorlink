@@ -2,7 +2,7 @@ import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Dict
+from typing import Dict, Optional, Union
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
@@ -12,6 +12,7 @@ import torch.nn as nn
 from dataclasses import is_dataclass, asdict
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
+from transformers import AutoConfig
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -964,80 +965,268 @@ def _get_cache_kv(cache):
         raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
 
 
-def debug_structure(obj, name="root", indent=0, max_depth=6, visited=None):
+def debug_structure(
+    obj,
+    name="root",
+    indent=0,
+    max_depth=6,
+    max_items=3,
+    show_stats=True,
+    visited=None,
+    _lines=None,
+):
     """
-    Recursively prints structure/types/shapes of nested objects.
-    Useful for debugging transformer/model outputs.
+    Recursively builds a compact structure/types/shapes report of nested
+    objects. Returns a single string (joined with newlines) instead of
+    printing directly, so callers can route it through their own logging/
+    debug_print pipeline. Useful for debugging transformer/model outputs
+    and KV caches without flooding logs.
     """
 
+    top_level = _lines is None
+    if top_level:
+        _lines = []
     if visited is None:
         visited = set()
 
     prefix = "  " * indent
 
-    # Prevent recursive loops
     obj_id = id(obj)
     if obj_id in visited:
-        print(f"{prefix}{name}: <recursive reference>")
-        return
-
+        _lines.append(f"{prefix}{name}: <recursive reference>")
+        return "\n".join(_lines) if top_level else None
     visited.add(obj_id)
 
-    # Depth limit
     if indent > max_depth:
-        print(f"{prefix}{name}: <max depth reached>")
-        return
+        _lines.append(f"{prefix}{name}: <max depth reached>")
+        return "\n".join(_lines) if top_level else None
 
-    # Tensors
+    # --- Tensors ---
     if isinstance(obj, torch.Tensor):
-        print(
-            f"{prefix}{name}: "
-            f"Tensor(shape={tuple(obj.shape)}, "
-            f"dtype={obj.dtype}, "
-            f"device={obj.device}, "
-            f"requires_grad={obj.requires_grad})"
-        )
+        stats = ""
+        if show_stats and obj.numel() > 0:
+            try:
+                with torch.no_grad():
+                    flat = obj.detach()
+                    if flat.is_floating_point():
+                        n_nan = torch.isnan(flat).sum().item()
+                        n_inf = torch.isinf(flat).sum().item()
+                        stats = (
+                            f", min={flat.min().item():.4g}"
+                            f", max={flat.max().item():.4g}"
+                            f", mean={flat.float().mean().item():.4g}"
+                        )
+                        if n_nan:
+                            stats += f", NAN={n_nan}"
+                        if n_inf:
+                            stats += f", INF={n_inf}"
+                    else:
+                        stats = f", min={flat.min().item()}, max={flat.max().item()}"
+            except Exception as e:
+                stats = f", <stats failed: {e}>"
 
-    # Dict-like
-    elif isinstance(obj, Mapping):
-        print(f"{prefix}{name}: dict[{len(obj)}]")
-        for k, v in obj.items():
+        _lines.append(
+            f"{prefix}{name}: Tensor(shape={tuple(obj.shape)}, "
+            f"dtype={obj.dtype}, device={obj.device}, "
+            f"requires_grad={obj.requires_grad}{stats})"
+        )
+        return "\n".join(_lines) if top_level else None
+
+    # --- Skip class/type objects ---
+    if isinstance(obj, type):
+        _lines.append(f"{prefix}{name}: <class {obj.__name__}>")
+        return "\n".join(_lines) if top_level else None
+
+    # --- Dict-like ---
+    if isinstance(obj, Mapping):
+        _lines.append(f"{prefix}{name}: dict[{len(obj)}]")
+        items = list(obj.items())
+        shown, remaining = items[:max_items], items[max_items:]
+        for k, v in shown:
             debug_structure(
                 v,
                 name=f"[{repr(k)}]",
                 indent=indent + 1,
                 max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
                 visited=visited,
+                _lines=_lines,
             )
+        if remaining:
+            _lines.append(f"{prefix}  ... {len(remaining)} more keys")
+        return "\n".join(_lines) if top_level else None
 
-    # List/Tuple
-    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
-        print(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
+    # --- List/Tuple ---
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+        _lines.append(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
 
-        for i, v in enumerate(obj):
+        if len(obj) > max_items and _all_same_signature(obj):
+            debug_structure(
+                obj[0],
+                name="[0..%d] (all identical shape/type)" % (len(obj) - 1),
+                indent=indent + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
+                visited=visited,
+                _lines=_lines,
+            )
+            _lines.append(
+                f"{prefix}  ... {len(obj)} items total, showing signature of [0]"
+            )
+            return "\n".join(_lines) if top_level else None
+
+        shown, remaining = obj[:max_items], obj[max_items:]
+        for i, v in enumerate(shown):
             debug_structure(
                 v,
                 name=f"[{i}]",
                 indent=indent + 1,
                 max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
                 visited=visited,
+                _lines=_lines,
             )
+        if remaining:
+            _lines.append(f"{prefix}  ... {len(remaining)} more items")
+        return "\n".join(_lines) if top_level else None
 
-    # HF model outputs / dataclasses / custom objects
-    elif hasattr(obj, "__dict__"):
-        print(f"{prefix}{name}: {type(obj).__name__}")
-
-        for k, v in vars(obj).items():
+    # --- HF model outputs / dataclasses / custom objects ---
+    if hasattr(obj, "__dict__"):
+        _lines.append(f"{prefix}{name}: {type(obj).__name__}")
+        attrs = [
+            (k, v)
+            for k, v in vars(obj).items()
+            if not (k.startswith("__") and k.endswith("__"))
+        ]
+        shown, remaining = attrs[: max_items * 3], attrs[max_items * 3 :]
+        for k, v in shown:
             debug_structure(
-                v, name=f".{k}", indent=indent + 1, max_depth=max_depth, visited=visited
+                v,
+                name=f".{k}",
+                indent=indent + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
+                visited=visited,
+                _lines=_lines,
             )
+        if remaining:
+            _lines.append(f"{prefix}  ... {len(remaining)} more attrs")
+        return "\n".join(_lines) if top_level else None
 
-    # Primitive
+    # --- Primitive ---
+    value = repr(obj)
+    if len(value) > 120:
+        value = value[:120] + "..."
+    _lines.append(f"{prefix}{name}: {type(obj).__name__} = {value}")
+    return "\n".join(_lines) if top_level else None
+
+
+def _all_same_signature(seq, sample_size=5):
+    """
+    Cheap heuristic: check if the first `sample_size` items in a sequence
+    share the same type and (if tensor-bearing) roughly the same structure.
+    Used to decide whether to collapse a long list (e.g. 30 KV-cache layers)
+    into a single representative summary instead of printing every item.
+    """
+    sample = seq[:sample_size]
+    if not sample:
+        return False
+    first_type = type(sample[0])
+    if any(type(x) is not first_type for x in sample):
+        return False
+
+    def _sig(x):
+        if isinstance(x, torch.Tensor):
+            return (x.shape, x.dtype)
+        if hasattr(x, "__dict__"):
+            sig = {}
+            for k, v in vars(x).items():
+                if isinstance(v, torch.Tensor):
+                    sig[k] = (v.shape, v.dtype)
+            return sig
+        return None
+
+    sigs = [_sig(x) for x in sample]
+    return all(s == sigs[0] for s in sigs) and sigs[0] is not None
+
+
+def resolve_dtype(
+    model: Union[str, nn.Module],
+    device: torch.device,
+    explicit_dtype: Optional[torch.dtype] = None,
+) -> torch.dtype:
+    """
+    Resolve the dtype to use for a model, given:
+      1. An explicit user override (always wins, no inference needed).
+      2. The model's own native/checkpoint dtype (HF config for a model name,
+         actual parameter dtype for an already-built nn.Module).
+      3. A safety clamp for dtype/device combinations known to be unreliable.
+
+    Args:
+        model: HF model name/path (str) or an already-instantiated nn.Module.
+        device: The device this model will actually run on.
+        explicit_dtype: If provided, short-circuits inference entirely —
+            but is still passed through the device safety clamp, since an
+            explicit request for fp16-on-CPU is still fp16-on-CPU.
+
+    Returns:
+        The dtype to load/build the model in.
+    """
+    # 1. Determine the "native" dtype: explicit override, or inferred.
+    if explicit_dtype is not None:
+        native_dtype = explicit_dtype
+    elif isinstance(model, nn.Module):
+        native_dtype = _infer_module_dtype(model)
     else:
-        value = repr(obj)
+        native_dtype = _infer_hf_dtype(model)
 
-        # Truncate huge reprs
-        if len(value) > 120:
-            value = value[:120] + "..."
+    if native_dtype is None:
+        native_dtype = torch.float32  # unknown provenance -> safest fallback
 
-        print(f"{prefix}{name}: {type(obj).__name__} = {value}")
+    # 2. Clamp for known-unsafe dtype/device combinations.
+    if device.type == "cpu":
+        # CPU fp16 kernels are unreliable (weak/incomplete on x86; this is
+        # the root cause of the original inf/nan bug). bf16 and fp32 are
+        # both fine on CPU, so only fp16 gets remapped.
+        return torch.bfloat16 if native_dtype == torch.float16 else native_dtype
+
+    if device.type == "cuda":
+        # bf16 needs Ampere or newer (compute capability >= 8.0);
+        # older GPUs (V100, T4, etc.) will silently misbehave or error.
+        if native_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            return torch.float16
+        return native_dtype
+
+    if device.type == "mps":
+        # bf16 support on Apple's MPS backend has historically been
+        # incomplete depending on torch version; fp16 is the safer bet.
+        return torch.float16 if native_dtype == torch.bfloat16 else native_dtype
+
+    return native_dtype
+
+
+def _infer_hf_dtype(model_name: str) -> Optional[torch.dtype]:
+    """Read the checkpoint's published dtype from its HF config, without
+    downloading any weights."""
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        dtype = getattr(config, "torch_dtype", None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if isinstance(dtype, str) and dtype != "auto":
+            return getattr(torch, dtype, None)
+    except Exception:
+        pass
+    return None
+
+
+def _infer_module_dtype(model: nn.Module) -> Optional[torch.dtype]:
+    """Read the dtype an already-instantiated module is actually holding."""
+    try:
+        return next(model.parameters()).dtype
+    except StopIteration:
+        return None

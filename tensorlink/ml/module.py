@@ -8,14 +8,11 @@ import torch.optim as optim
 import torch.nn as nn
 import threading
 import logging
-import pickle
 import torch
 import types
 import queue
 import time
-import json
 import gc
-import io
 import os
 
 from tensorlink.ml.utils.injector import (
@@ -46,6 +43,8 @@ from tensorlink.ml.utils import (
     handle_output,
     attach_tensor,
     resolve_module_from_path,
+    resolve_dtype,
+    debug_structure,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -199,7 +198,7 @@ class DistributedModel(nn.Module):
         optimizer: Optional[Type[optim.Optimizer]] = None,
         scheduler_type: Optional[Type[optim.lr_scheduler._LRScheduler]] = None,
         device: Optional[str] = None,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = None,
         trusted: bool = False,
         node: Optional[Any] = None,
         training: bool = True,
@@ -225,15 +224,25 @@ class DistributedModel(nn.Module):
 
         super().__init__()
 
+        # Set device
+        self.device = (
+            device
+            if device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        # Set model info
         if isinstance(model, nn.Module):
             self.name = str(model).split("(")[0]
-            self.model: nn.Module = model.to(dtype=dtype)
+            resolved_dtype = resolve_dtype(model, self.device, explicit_dtype=dtype)
+            self.model: nn.Module = model.to(dtype=resolved_dtype)
         else:
             self.model_name = model
             self.model = None
+            resolved_dtype = resolve_dtype(model, self.device, explicit_dtype=dtype)
 
+        self.dtype = resolved_dtype
         self.tokenizer = tokenizer
-        self.dtype = dtype
 
         # Store model and training resources
         self.user_memory = get_gpu_memory()
@@ -250,13 +259,6 @@ class DistributedModel(nn.Module):
         self.distributed_graph: Dict[str, Any] = {}
         self.parameters_storage: Dict[str, torch.Tensor] = {}
         self.my_modules = set()
-
-        # Set device
-        self.device = (
-            device
-            if device
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
 
         # Optimizer and scheduler placeholders
         self.optimizer = optimizer
@@ -963,7 +965,7 @@ class DistributedModel(nn.Module):
             )
 
         # Move source weight to correct device first if needed
-        source_weight = source_module.weight.to(self.device)
+        source_weight = source_module.weight.to(device=self.device, dtype=self.dtype)
         source_module.weight = nn.Parameter(
             source_weight, requires_grad=source_module.weight.requires_grad
         )
@@ -1289,6 +1291,20 @@ class OffloadedModule(nn.Module):
                 [handle_output(args), self.module_id]
             )
 
+        send_report = debug_structure(
+            {"args": args, "kwargs": kwargs},
+            name=(
+                f"[SEND] module_id={self.module_id} "
+                f"path={getattr(self, 'module_path', self.module_name)} "
+                f"micro={n_micro} batch={n_batch}"
+            ),
+        )
+
+        self.parent_model.send_request(
+            "debug_print",
+            (f"OffloadedModule -> {send_report}", "bright_magenta", logging.DEBUG),
+        )
+
         detached_args = detach_tensor(args, clone=True)
         args_bytes = tensor_to_bytes(detached_args)
         kwargs_bytes = tensor_to_bytes(kwargs)
@@ -1318,6 +1334,19 @@ class OffloadedModule(nn.Module):
 
         output = bytes_to_tensor(output_bytes)
         output = attach_tensor(output, self.parent_model.device)
+
+        recv_report = debug_structure(
+            output,
+            name=(
+                f"[RECV] module_id={self.module_id} "
+                f"path={getattr(self, 'module_path', self.module_name)} "
+                f"elapsed={time.time() - start_time:.3f}s"
+            ),
+        )
+        self.parent_model.send_request(
+            "debug_print",
+            (f"OffloadedModule -> {recv_report}", "bright_cyan", logging.DEBUG),
+        )
 
         if self.training:
             output = enable_grad(output)
