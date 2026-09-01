@@ -21,8 +21,23 @@ UPNP = False
 MAX_MEMORY_GB = 0.4
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--print-level",
+        action="store",
+        default=5,
+        type=int,
+        help="Tensorlink node print level",
+    )
+
+
+@pytest.fixture(scope="session")
+def print_level(pytestconfig):
+    return pytestconfig.getoption("--print-level")
+
+
 @pytest.fixture(scope="module")
-def uwv_nodes():
+def uwv_nodes(print_level):
     """
     Create User-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -32,7 +47,7 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
         )
     )
 
@@ -41,7 +56,7 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             endpoint=False,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
@@ -56,7 +71,7 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
         )
@@ -74,7 +89,7 @@ def uwv_nodes():
 
 
 @pytest.fixture(scope="module")
-def wwv_nodes():
+def wwv_nodes(print_level):
     """
     Create Worker-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -84,7 +99,7 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             endpoint=True,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
@@ -99,7 +114,7 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
         )
@@ -110,7 +125,7 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             duplicate="1",
             max_memory_gb=MAX_MEMORY_GB,

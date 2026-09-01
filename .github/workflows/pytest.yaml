@@ -41,6 +41,40 @@ jobs:
 
       - name: Run Tests Sequentially
         run: |
-          poetry run pytest tests/test_node.py -s --disable-warnings
-          poetry run pytest tests/test_distributed_model.py -s --disable-warnings
-          poetry run pytest tests/test_model_api.py -s --disable-warnings --maxfail=2
+          set +e
+
+          failed=0
+
+          poetry run pytest tests/test_node.py --print-level=30
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "❌ test_node.py failed with exit code $status"
+            failed=1
+          fi
+
+          poetry run pytest tests/test_distributed_model.py --print-level=30
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "❌ test_distributed_model.py failed with exit code $status"
+            failed=1
+          fi
+
+          poetry run pytest tests/test_model_api.py --print-level=30
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "❌ test_model_api.py failed with exit code $status"
+            failed=1
+          fi
+
+          if [ $failed -ne 0 ]; then
+            echo "❌ One or more test suites failed."
+            exit 1
+          fi
+
+          echo "✅ All test suites passed."
+
+      - name: Dump debug log on failure
+        if: failure()
+        run: |
+          echo "===== TENSORLINK DEBUG LOG ====="
+          cat logs/runtime.log
