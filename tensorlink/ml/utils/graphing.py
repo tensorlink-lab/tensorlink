@@ -252,11 +252,12 @@ class ModelParser:
         optimizer_spec: Optional[dict] = None,
         host_max_memory_bytes: int = 0,
         host_max_module_bytes: int = 0,
-        host_max_depth: int = 2,
+        host_max_depth: int = 1,
         max_offload_depth: int = 3,
         max_seq_len: int = 4096,
         batch_size: int = 1,
         model_type: str = "chat",
+        force_tied_to_host: bool = True,
     ):
         """
         Build a distributed execution configuration for a model by assigning its
@@ -338,6 +339,13 @@ class ModelParser:
                 Logical model type (e.g. "chat", "vision", "embedding"). Stored in the
                 config and used by downstream execution logic.
 
+            force_tied_to_host : bool, optional (default=False)
+                If True, tied modules (e.g. input embeddings and lm_head) MUST be
+                loaded on the local host rather than merely co-located with each
+                other on the same worker. Raises AssignmentError immediately if
+                host_max_memory_bytes is insufficient, instead of silently falling
+                back to worker placement.
+
         Returns:
             dict: A dictionary with the following keys:
                 - success : bool
@@ -395,6 +403,13 @@ class ModelParser:
         if host_max_module_bytes == 0:
             self._host_max_module_bytes = 1e15  # Set to massive number if not specified
 
+        # Fail fast if force_tied_to_host can't possibly be honored
+        if force_tied_to_host and host_max_memory_bytes == 0:
+            raise ValueError(
+                "force_tied_to_host=True requires host_max_memory_bytes > 0 to keep "
+                "tied modules on the host."
+            )
+
         model_memory, breakdown = estimate_memory(
             model,
             training=training,
@@ -444,6 +459,7 @@ class ModelParser:
                 model_type=model_type,
                 tied_embed_path=tied_embed_path,
                 tied_lm_head_path=tied_lm_head_path,
+                force_tied_to_host=force_tied_to_host,
             )
 
             config = _group_sequential_layers(config)
@@ -485,6 +501,7 @@ class ModelParser:
         obfuscation_layer_assigned: bool = False,
         tied_embed_path: Optional[str] = None,
         tied_lm_head_path: Optional[str] = None,
+        force_tied_to_host: bool = False,
     ):
         config = {}
 
@@ -526,7 +543,7 @@ class ModelParser:
             has_no_children = len(list(module.children())) == 0
 
             if has_params and has_no_children:
-                # This is a leaf layer with parameters - good candidate for obfuscation layer
+                # This is a leaf layer with parameters, good candidate for obfuscation layer
                 force_host = True
                 obfuscation_layer_assigned = True
             elif depth <= 1:
@@ -558,20 +575,17 @@ class ModelParser:
         ) or force_host:
             # Double-check we can actually fit this on host if forced
             if force_host and memory > host_max_memory_bytes - self.assigned_memory:
-                # If this is the second half of a tied pair and the first half
-                # already landed on host, we cannot silently fall back to worker
-                # assignment - that would split the tied tensor. Fail loudly.
-                if is_tied_module and self._tied_on_host:
+                if is_tied_module and (force_tied_to_host or self._tied_on_host):
                     if self.verbose:
                         print(
                             f"{indent}  FAILED: tied module {module_path} cannot "
-                            f"be co-located on host with its counterpart "
+                            f"be placed on host "
                             f"(requires {memory / 1e6:.2f}MB, "
                             f"{(host_max_memory_bytes - self.assigned_memory) / 1e6:.2f}MB available)"
                         )
                     raise AssignmentError(
-                        f"Unable to co-locate tied module {module_path} with its "
-                        f"counterpart on host: exceeds remaining host budget "
+                        f"Unable to place tied module {module_path} on host: exceeds "
+                        f"remaining host budget "
                         f"({memory / 1e6:.2f}MB required, "
                         f"{(host_max_memory_bytes - self.assigned_memory) / 1e6:.2f}MB available)."
                     )
@@ -580,7 +594,8 @@ class ModelParser:
                     print(
                         f"{indent}  WARNING: Obfuscation layer too large for host ({memory / 1e6:.2f}MB > {(host_max_memory_bytes - self.assigned_memory) / 1e6:.2f}MB available)"
                     )
-                # Don't force it if it truly won't fit
+
+                # Don't force if it won't fit
                 force_host = False
             else:
                 # Check if this is a tied module
@@ -629,6 +644,23 @@ class ModelParser:
                     self.assigned_memory = prev_assigned
                     raise
 
+        # If force_tied_to_host is set and we reach here, the tied module
+        # missed the host branch entirely. Catch that case explicitly
+        # instead of silently letting it fall through to worker assignment below.
+        if is_tied_module and force_tied_to_host:
+            if self.verbose:
+                print(
+                    f"{indent}  FAILED: tied module {module_path} did not "
+                    f"qualify for host placement (host_max_depth={host_max_depth}, "
+                    f"host_max_module_bytes={self._host_max_module_bytes / 1e6:.2f}MB) "
+                    f"but force_tied_to_host=True"
+                )
+            raise AssignmentError(
+                f"force_tied_to_host=True but tied module {module_path} does not "
+                f"qualify for host placement under the current host_max_depth "
+                f"/ host_max_module_bytes settings."
+            )
+
         # Check if module is loop-iterable before trying to assign
         is_loop_iterable = _is_loop_iterable_module(module, module_path)
 
@@ -640,7 +672,7 @@ class ModelParser:
 
             if self._tied_reserved:
                 # Room for this exact module was already carved out when the
-                # first tied half was placed - consume it, don't re-decrement
+                # first tied half was placed, consume it, don't re-decrement
                 # (that would double-charge the same bytes).
                 tied_forced_worker = self._tied_worker
                 self._tied_reserved = False
@@ -658,7 +690,7 @@ class ModelParser:
                         f"(co-located with tied counterpart)"
                     )
             else:
-                # No reservation and no room - falling through would let this
+                # No reservation and no room; falling through would let this
                 # land elsewhere (or recurse/split) and silently break the
                 # tied-weight guarantee. Fail loudly instead.
                 if self.verbose:
@@ -713,7 +745,7 @@ class ModelParser:
             if (
                 is_tied_module
                 and self._tied_worker is None
-                and tied_forced_worker is None  # this really is the first half
+                and tied_forced_worker is None
             ):
                 self._tied_worker = assigned_worker
                 self._tied_on_host = False
@@ -785,7 +817,7 @@ class ModelParser:
                     f"Unable to assign {module_path}: exceeded max depth {max_offload_depth}"
                 )
 
-        # Module is either too large OR is loop-iterable - recurse into children
+        # Module is either too large OR is loop-iterable, recurse into children
         if self.verbose:
             reason = "is loop-iterable" if is_loop_iterable else "too large"
             print(
@@ -836,6 +868,7 @@ class ModelParser:
                         obfuscation_layer_assigned=obfuscation_layer_assigned,
                         tied_embed_path=tied_embed_path,
                         tied_lm_head_path=tied_lm_head_path,
+                        force_tied_to_host=force_tied_to_host,
                     )
                 )
 

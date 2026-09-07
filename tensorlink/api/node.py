@@ -466,7 +466,7 @@ class TensorlinkAPI:
         ]
 
         if not offloaded:
-            # No offloaded modules — validator hosts everything; treat as active
+            # No offloaded modules validator hosts everything; treat as active
             return {
                 "status": "active",
                 "message": "Model is active and ready to use.",

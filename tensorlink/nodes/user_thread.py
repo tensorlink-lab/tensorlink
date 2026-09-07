@@ -23,6 +23,7 @@ class UserThread(Torchnode):
         local_test=False,
         priority_nodes: list = None,
         seed_validators: list = None,
+        max_memory_gb: float = None,
     ):
         super(UserThread, self).__init__(
             request_queue,
@@ -34,6 +35,7 @@ class UserThread(Torchnode):
             local_test=local_test,
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
         )
         self.print_level = print_level
         self.distributed_graph = {}
@@ -243,42 +245,9 @@ class UserThread(Torchnode):
     def request_job(self, n_pipelines, dp_factor, distribution, training):
         """Request job through smart contract and set up the relevant connections for a distributed model.
         Returns a distributed nn.Module with built-in RPC calls to workers."""
-        # Commented out code as user contract interactions will come later
-        # Publish job request to smart contract (args: n_seed_validators, requested_capacity), returns validator IDs
-        # TODO check if user already has job and switch to that if so, (re initialize a job if failed to start or
-        #  disconnected, request data from validators/workers if disconnected and have to reset info.
-        # job_id = self.contract.functions.jobIdByUser(user_id).call()
-        # if job_id >= 1:
-        #     self.debug_print(
-        #         f"request_job: User has active job, loading active job. Delete job request if this was unintentional!"
-        #     )
-        # else:
-        #     tx_hash = self.contract.functions.requestJob(1, capacity).transact(
-        #         {"from": self.account.address}
-        #     )
-        #     tx_receipt = self.chain.eth.wait_for_transaction_receipt(tx_hash)
-        #
-        #     if tx_receipt.status != 1:
-        #         try:
-        #             tx = self.chain.eth.get_transaction(tx_hash)
-        #             tx_input = tx.input
-        #             revert_reason = self.chain.eth.call(
-        #                 {"to": tx.to, "data": tx_input}, tx.blockNumber
-        #             )
-        #
-        #         except ContractLogicError as e:
-        #             revert_reason = f"ContractLogicError: {e}"
-        #
-        #         except Exception as e:
-        #             revert_reason = f"Could not fetch revert reason: {e}"
-        #
-        #         self.debug_print(f"request_job: Job request reverted; {revert_reason}")
-        #
-        # self.debug_print("request_job: Job requested on Smart Contract!")
-        # validator_ids = self.contract.functions.getJobValidators(job_id).call()
         validator_ids = [random.choice(self.validators)]
+        # The case where we do not have a Hugging Face model (i.e. custom model)
         if not distribution.get("model_name"):
-            # The case where we have a custom model with distributed config
             distribution = {
                 k: v for k, v in distribution.items() if v["type"] == "offloaded"
             }
@@ -307,7 +276,7 @@ class UserThread(Torchnode):
                 "seed_validators": validator_ids,
             }
         else:
-            # The case where we have a huggingface model name for inference
+            # The case where we have a Hugging Face model name for inference
             job_request = {
                 "author": self.rsa_key_hash,
                 "loading": True,
@@ -324,6 +293,7 @@ class UserThread(Torchnode):
                 "model_name": distribution.get("model_name"),
                 "optimizer": distribution.get("optimizer"),
                 "seed_validators": validator_ids,
+                "available_memory": self.get_gpu_memory(),
             }
 
         # Get validator connections
@@ -365,28 +335,29 @@ class UserThread(Torchnode):
         dist_model_config = {}
         for mod_id, module in distribution.items():
             # Wait for loading confirmation from worker roles
-            module_info = self.modules[mod_id]
-            if len(module_info["assigned_workers"]) < 1:
-                self.debug_print(
-                    "Network could not find workers for job.",
-                    level=logging.INFO,
-                    colour="red",
-                    tag="User",
-                )
-                return
+            if module["type"] == "offloaded":
+                module_info = self.modules[mod_id]
+                if len(module_info["assigned_workers"]) < 1:
+                    self.debug_print(
+                        "Network could not find workers for job.",
+                        level=logging.INFO,
+                        colour="red",
+                        tag="User",
+                    )
+                    return
 
-            # worker_id = worker_info["workers"][0]
-            # module, name = access_module(model, config[mod_id]["mod_id"])
+                # worker_id = worker_info["workers"][0]
+                # module, name = access_module(model, config[mod_id]["mod_id"])
 
-            # Update job with selected worker
-            # TODO Takes the last (most recent model for now, should accommodate all pipelines in the future)
-            # job_request["workers"][0][
-            #     worker_id
-            # ] = mod_id  # TODO 0 hardcoded and must be replaced with n_pipelines
-            dist_model_config[mod_id] = module.copy()
+                # Update job with selected worker
+                # TODO Takes the last (most recent model for now, should accommodate all pipelines in the future)
+                # job_request["workers"][0][
+                #     worker_id
+                # ] = mod_id  # TODO 0 hardcoded and must be replaced with n_pipelines
+                dist_model_config[mod_id] = module.copy()
 
-            self.modules[mod_id]["forward_queue"] = {}
-            self.modules[mod_id]["backward_queue"] = {}
+                self.modules[mod_id]["forward_queue"] = {}
+                self.modules[mod_id]["backward_queue"] = {}
 
         # TODO Send activation message to validators
         # for validator in validators:

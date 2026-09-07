@@ -81,6 +81,10 @@ SM_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesCore.json")
 MS_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesCoordinator.json")
 TOKEN_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesERC20.json")
 
+# Dirs for node storage and logs
+os.makedirs("logs", exist_ok=True)
+os.makedirs("tmp", exist_ok=True)
+
 API = get_key(".tensorlink.env", "API")
 
 with open(os.path.join(CONFIG_PATH, "config.json"), "r") as f:
@@ -111,25 +115,6 @@ SNO_EVENT_SIGNATURES = {
     "ProposalExecuted": "ProposalExecuted(uint256)",
 }
 
-
-# Configure logging with TimedRotatingFileHandler
-os.makedirs("logs", exist_ok=True)
-os.makedirs("tmp", exist_ok=True)
-
-log_handler = TimedRotatingFileHandler(
-    "logs/runtime.log", when="midnight", interval=1, backupCount=7
-)
-log_handler.setFormatter(logging.Formatter("[%(asctime)s] - %(message)s"))
-log_handler.suffix = "%Y%m%d"
-logging.getLogger().addHandler(log_handler)
-logging.getLogger().setLevel(logging.DEBUG)
-
-# These libraries log at DEBUG/INFO on every single RPC request/response and
-# inherit the root logger's DEBUG level + file handler set above. Left alone,
-# they flood logs/runtime.log with "Making request..."/"POST ... HTTP/1.1 200"
-# lines and bury our own debug_print output. We only care about their errors.
-for _noisy_logger in ("web3", "urllib3", "requests"):
-    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 BASE_PORT = 38751
 
@@ -291,6 +276,19 @@ class Smartnode(threading.Thread):
 
         if self.upnp:
             self._init_upnp()
+
+        # Configure logging with TimedRotatingFileHandler
+        log_handler = TimedRotatingFileHandler(
+            f"logs/runtime_{role}.log", when="midnight", interval=1, backupCount=7
+        )
+        log_handler.setFormatter(logging.Formatter("[%(asctime)s] - %(message)s"))
+        log_handler.suffix = "%Y%m%d"
+        logging.getLogger().addHandler(log_handler)
+        logging.getLogger().setLevel(logging.DEBUG)
+
+        # These libraries log at DEBUG/INFO on every single RPC request/response
+        for _noisy_logger in ("web3", "urllib3", "requests"):
+            logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
         self.VERBOSE = VERBOSE
 
@@ -524,11 +522,22 @@ class Smartnode(threading.Thread):
 
     def debug_print(self, message, level=logging.DEBUG, colour=None, tag=None) -> None:
         """Print to console if debug is enabled"""
-        logging.log(level, message)
 
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        tag_width = 15  # Adjust as needed
+        if tag:
+            centered_tag = tag.center(tag_width)
+            plain_tag = f" {centered_tag}"
+        else:
+            plain_tag = " " * (tag_width + 1)
+
+        # Plain, uncoloured version goes to the logger
+        formatted_message = f"[{timestamp}] {plain_tag} -> {message}"
+        logging.log(level, formatted_message)
+
+        # Create coloured version to go to the console
         if level >= self.print_level:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
             role_colour = "\033[37m"
             if self.role == "U":
                 role_colour = COLOURS["magenta"]
@@ -539,21 +548,20 @@ class Smartnode(threading.Thread):
 
             if colour is None:
                 colour = LEVEL_COLOURS.get(level, "white")
-
             colour_code = COLOURS.get(colour, "\033[37m")
             reset_colour = "\033[0m"
 
-            tag_width = 15  # Adjust as needed
             if tag:
-                centered_tag = tag.center(tag_width)
                 background_colour = BACKGROUND_COLOURS.get(tag.strip(), "\033[40m")
-                tag = f" {background_colour}{centered_tag}{reset_colour}"
+                coloured_tag = f" {background_colour}{centered_tag}{reset_colour}"
             else:
-                tag = " " * (tag_width + 1)
+                coloured_tag = " " * (tag_width + 1)
 
-            print(
-                f"[{role_colour}{timestamp}{reset_colour}]{tag} -> {colour_code}{message}{reset_colour}"
+            console_message = (
+                f"[{role_colour}{timestamp}{reset_colour}] {coloured_tag} -> "
+                f"{colour_code}{message}{reset_colour}"
             )
+            print(console_message)
 
     """Methods for DHT Query and Storage"""
 

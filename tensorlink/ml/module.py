@@ -1,5 +1,4 @@
 from transformers import (
-    PreTrainedModel,
     AutoModelForCausalLM,
 )
 from typing import Generator, List, Optional, Type, Dict, Any, Union
@@ -44,7 +43,6 @@ from tensorlink.ml.utils import (
     attach_tensor,
     resolve_module_from_path,
     resolve_dtype,
-    debug_structure,
 )
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
@@ -440,12 +438,12 @@ class DistributedModel(nn.Module):
 
                         if self.trusted:
                             size, shm_name = store_in_shared_memory(
-                                (detach_tensor(loss), None)
+                                (detach_tensor(loss), None), encoding=None
                             )
                         else:
                             loss_bytes = tensor_to_bytes(loss)
                             size, shm_name = store_in_shared_memory(
-                                loss_bytes, encoded=True
+                                loss_bytes, encoding=None
                             )
 
                         self.send_request(
@@ -463,11 +461,13 @@ class DistributedModel(nn.Module):
                                 size, name = args
 
                                 if self.trusted:
-                                    loss = get_from_shared_memory(size, name)
+                                    loss = get_from_shared_memory(
+                                        size, name, encoding=None
+                                    )
 
                                 else:
                                     loss_bytes = get_from_shared_memory(
-                                        size, name, encoded=True
+                                        size, name, encoding=None
                                     )
                                     loss = bytes_to_tensor(loss_bytes)
 
@@ -1250,7 +1250,7 @@ class OffloadedModule(nn.Module):
         kwargs_bytes = tensor_to_bytes(detached_kwargs)
 
         request_bytes = self.module_id.encode() + args_bytes + b"::" + kwargs_bytes
-        size, shm_name = store_in_shared_memory(request_bytes, encoded=True)
+        size, shm_name = store_in_shared_memory(request_bytes, encoding=None)
         self.parent_model.send_request(
             "generate", (self.worker_id, size, shm_name, stream)
         )
@@ -1270,7 +1270,7 @@ class OffloadedModule(nn.Module):
             if args is not None:
                 waiting = False
                 size, name = args
-                output_bytes = get_from_shared_memory(size, name)
+                output_bytes = get_from_shared_memory(size, name, encoding=None)
 
             if time.time() - start_time >= MAX_WAIT_TIME:
                 # Logic here to request another worker take his place
@@ -1281,88 +1281,118 @@ class OffloadedModule(nn.Module):
 
     def forward(self, *args, **kwargs):
         start_time = time.time()
-        n_batch = self.parent_model.model.n_batch
-        n_micro = getattr(self.parent_model._thread_local, "micro", None)
-        tag = [n_batch, n_micro, self.module_id]
+        try:
+            n_batch = self.parent_model.model.n_batch
+            n_micro = getattr(self.parent_model._thread_local, "micro", None)
+            tag = [n_batch, n_micro, self.module_id]
 
-        # Store the intermediate tensor for backwards pass
-        if not self.entire_model:
-            self.parent_model.model.intermediates[n_micro].append(
-                [handle_output(args), self.module_id]
+            # Store the intermediate tensor for backwards pass
+            if not self.entire_model:
+                self.parent_model.model.intermediates[n_micro].append(
+                    [handle_output(args), self.module_id]
+                )
+
+            # send_report = debug_structure(
+            #     {"args": args, "kwargs": kwargs},
+            #     name=(
+            #         f"[SEND] module_id={self.module_id} "
+            #         f"path={getattr(self, 'module_path', self.module_name)} "
+            #         f"micro={n_micro} batch={n_batch}"
+            #     ),
+            # )
+            # self.parent_model.send_request(
+            #     "debug_print",
+            #     (f"OffloadedModule -> {send_report}", "bright_magenta", logging.DEBUG),
+            # )
+
+            detached_args = detach_tensor(args, clone=True)
+            args_bytes = tensor_to_bytes(detached_args)
+            kwargs_bytes = tensor_to_bytes(kwargs)
+            forward_bytes = (
+                len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
             )
 
-        send_report = debug_structure(
-            {"args": args, "kwargs": kwargs},
-            name=(
-                f"[SEND] module_id={self.module_id} "
-                f"path={getattr(self, 'module_path', self.module_name)} "
-                f"micro={n_micro} batch={n_batch}"
-            ),
-        )
+            size, shm_name = store_in_shared_memory(forward_bytes, encoding=None)
 
-        self.parent_model.send_request(
-            "debug_print",
-            (f"OffloadedModule -> {send_report}", "bright_magenta", logging.DEBUG),
-        )
+            # Relay forward pass to next roles
+            self.parent_model.send_request(
+                "send_forward",
+                (self.worker_id, self.module_id, size, shm_name, tag),
+            )
 
-        detached_args = detach_tensor(args, clone=True)
-        args_bytes = tensor_to_bytes(detached_args)
-        kwargs_bytes = tensor_to_bytes(kwargs)
-        forward_bytes = len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
-        size, shm_name = store_in_shared_memory(forward_bytes, encoded=True)
-
-        # Relay forward pass to next roles
-        self.parent_model.send_request(
-            "send_forward", (self.worker_id, self.module_id, size, shm_name, tag)
-        )
-
-        # Wait for response, change to appending waiting thread to list in master
-        waiting = True
-        while waiting:
-            time.sleep(0.01)
+            # Wait for response
             key = (n_batch, n_micro, self.module_id)
-            args = self.parent_model.send_request("check_forward", key)
+            output_bytes = None
 
-            if args is not None:
-                waiting = False
-                size, name = args
-                output_bytes = get_from_shared_memory(size, name)
+            while output_bytes is None:
+                time.sleep(0.01)
+                response = self.parent_model.send_request(
+                    "check_forward",
+                    key,
+                )
 
-            if time.time() - start_time >= MAX_WAIT_TIME:
-                # Logic here to request another worker take his place
-                waiting = False
+                if response is not None:
+                    size, name = response
+                    output_bytes = get_from_shared_memory(size, name, encoding=None)
+                    break
 
-        output = bytes_to_tensor(output_bytes)
-        output = attach_tensor(output, self.parent_model.device)
+                if time.time() - start_time >= MAX_WAIT_TIME:
+                    raise TimeoutError(
+                        f"Timed out waiting for forward response: "
+                        f"module_id={self.module_id}, "
+                        f"batch={n_batch}, micro={n_micro}, "
+                        f"elapsed={time.time() - start_time:.3f}s"
+                    )
 
-        recv_report = debug_structure(
-            output,
-            name=(
-                f"[RECV] module_id={self.module_id} "
-                f"path={getattr(self, 'module_path', self.module_name)} "
-                f"elapsed={time.time() - start_time:.3f}s"
-            ),
-        )
-        self.parent_model.send_request(
-            "debug_print",
-            (f"OffloadedModule -> {recv_report}", "bright_cyan", logging.DEBUG),
-        )
+            output = bytes_to_tensor(output_bytes)
+            output = attach_tensor(output, self.parent_model.device)
 
-        if self.training:
-            output = enable_grad(output)
+            # recv_report = debug_structure(
+            #     output,
+            #     name=(
+            #         f"[RECV] module_id={self.module_id} "
+            #         f"path={getattr(self, 'module_path', self.module_name)} "
+            #         f"elapsed={time.time() - start_time:.3f}s"
+            #     ),
+            # )
+            # self.parent_model.send_request(
+            #     "debug_print",
+            #     (f"OffloadedModule -> {recv_report}", "bright_cyan", logging.DEBUG),
+            # )
 
-        self.parent_model.send_request(
-            "release_memory", ("forward_queue", self.module_id, key)
-        )
+            if self.training:
+                output = enable_grad(output)
 
-        inter_storage = [
-            self.module_id,
-            output,
-        ]  # Store associated output
+            self.parent_model.send_request(
+                "release_memory",
+                ("forward_queue", self.module_id, key),
+            )
+            inter_storage = [
+                self.module_id,
+                output,
+            ]
 
-        # Store intermediates and connection for backwards pass
-        self.parent_model.model.intermediates[n_micro].append(inter_storage)
-        return output
+            # Store intermediates and connection for backwards pass
+            self.parent_model.model.intermediates[n_micro].append(inter_storage)
+            return output
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+
+            self.parent_model.send_request(
+                "debug_print",
+                (
+                    f"OffloadedModule.forward failed: "
+                    f"module_id={getattr(self, 'module_id', None)} "
+                    f"path={getattr(self, 'module_path', self.module_name)} "
+                    f"elapsed={elapsed:.3f}s "
+                    f"error={type(e).__name__}: {e}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+
+            raise
 
     def add_distributed_parameter(self, name, distributed_param):
         """Register a DistributedParameter to the offloaded module."""

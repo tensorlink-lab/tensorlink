@@ -1,4 +1,3 @@
-# tests/conftest.py
 from tensorlink.nodes import (
     User,
     Validator,
@@ -18,7 +17,11 @@ PRINT_LEVEL = 5  # Custom logging print level for VERBOSE
 ON_CHAIN = False
 LOCAL = True
 UPNP = False
-MAX_MEMORY_GB = 0.4
+ENABLE_HOSTED_MODULES = True
+
+# These two values were hand-picked to illict
+MAX_MEMORY_GB = 0.35
+MAX_MODULE_GB = 0.05
 
 
 def pytest_addoption(parser):
@@ -48,6 +51,7 @@ def uwv_nodes(print_level):
             on_chain=ON_CHAIN,
             local_test=LOCAL,
             print_level=print_level,
+            max_memory_gb=MAX_MEMORY_GB,
         )
     )
 
@@ -60,10 +64,10 @@ def uwv_nodes(print_level):
             endpoint=False,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         ),
-        enable_hosting=False,
-        max_memory_gb=0,
-        max_module_bytes=0,
+        enable_hosting=ENABLE_HOSTED_MODULES,
+        max_module_gb=MAX_MODULE_GB,
     )
 
     worker = Worker(
@@ -103,10 +107,10 @@ def wwv_nodes(print_level):
             endpoint=True,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         ),
-        enable_hosting=False,
-        max_memory_gb=0,
-        max_module_bytes=0,
+        enable_hosting=ENABLE_HOSTED_MODULES,
+        max_module_gb=MAX_MODULE_GB,
     )
 
     worker = Worker(

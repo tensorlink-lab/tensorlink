@@ -8,9 +8,14 @@ from dataclasses import dataclass
 from typing import Optional, List
 
 from tensorlink.ml.worker import DistributedWorker
+from tensorlink.ml.utils.utils import get_gpu_memory
 from tensorlink.nodes.user_thread import UserThread
 from tensorlink.nodes.validator_thread import ValidatorThread
 from tensorlink.nodes.worker_thread import WorkerThread
+
+
+MIN_PUBLIC_VALIDATOR_MEMORY_GB = 12
+MAX_PUBLIC_VALIDATOR_MODULE_SIZE = 5e8
 
 
 @dataclass
@@ -41,6 +46,7 @@ class BaseNodeConfig:
     on_chain: bool = True
     local_test: bool = False
     print_level: int = logging.WARNING
+    max_memory_gb: float = 0
     priority_nodes: Optional[List[List[str]]] = None
     seed_validators: Optional[List[List[str]]] = None
 
@@ -53,7 +59,6 @@ class WorkerConfig(BaseNodeConfig):
 
     duplicate: str = ""
     load_previous_state: bool = False
-    max_memory_gb: float = 0
 
 
 @dataclass
@@ -313,29 +318,31 @@ class Validator(BaseNode):
         self,
         config: ValidatorConfig,
         enable_hosting: bool = False,
-        max_memory_gb: float = 0,
-        max_module_bytes: int = 0,
+        max_module_gb: float = 0,
         **kwargs,
     ):
         """
         Initialize a Validator node.
-
-        Parameters
-        ----------
-        enable_hosting : bool
-            Whether this validator may host modules locally.
-        max_memory_gb : float
-            Maximum VRAM budget for hosted execution.
-        max_module_bytes : int
-            Maximum module size allowed for hosting.
         """
-        self._enable_hosting = enable_hosting
-        self._max_vram_gb = max_memory_gb
-        self._max_module_bytes = max_module_bytes
+        self.enable_hosting = enable_hosting
+        self.max_memory_gb = config.max_memory_gb
+        self.max_module_gb = max_module_gb
 
         super().__init__(config, **kwargs)
 
         self.config = config
+
+        # Ensure validator constraints if operating publicly (for safety)
+        if self.config.on_chain:
+            max_memory = 0 if self.max_memory_gb is None else self.max_memory_gb
+            estimated_available_memory = get_gpu_memory(max_memory)
+
+            # If we do not have the required memory for running public validator, turn off...
+            if estimated_available_memory < MIN_PUBLIC_VALIDATOR_MEMORY_GB:
+                raise (
+                    "Not enough GPU memory available to run a public validator node,"
+                    f" {MIN_PUBLIC_VALIDATOR_MEMORY_GB}GB required!"
+                )
 
     def run_role(self):
         """
@@ -364,9 +371,9 @@ class Validator(BaseNode):
             self,
             trusted=self.trusted,
             endpoint=self.config.endpoint,
-            enable_hosting=self._enable_hosting,
-            max_vram_gb=self._max_vram_gb,
-            max_module_bytes=self._max_module_bytes,
+            enable_hosting=self.enable_hosting,
+            max_memory_gb=self.max_memory_gb,
+            max_module_gb=self.max_module_gb,
         )
 
         if self.utilization:

@@ -45,6 +45,7 @@ class ValidatorThread(Torchnode):
         load_previous_state=False,
         priority_nodes: list = None,
         seed_validators: list = None,
+        max_memory_gb: float = None,
     ):
         """
         Initialize a Validator P2P Node.
@@ -59,6 +60,7 @@ class ValidatorThread(Torchnode):
             local_test=local_test,
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
         )
 
         # Additional attributes specific to the Validator class
@@ -615,6 +617,7 @@ class ValidatorThread(Torchnode):
 
         # Store job info in DHT
         self.dht.store(job_id, job_data)
+        self.jobs.append(job_id)
 
         # Recruit the workers
         worker_connection_info = self._assign_workers_to_modules(
@@ -817,13 +820,12 @@ class ValidatorThread(Torchnode):
                     return
 
     def _finalize_job(self, job_id, job_data):
+        """Begin the job monitoring thread"""
         self.response_queue.put({"status": "SUCCESS", "return": job_data})
 
-        self.jobs.append(job_id)
-
+        # Update dht with latest job rendition to be safe
         job_data["timestamp"] = time.time()
         job_data["last_seen"] = time.time()
-
         self.dht.store(job_id, job_data)
 
         job_monitor = JobMonitor(self)

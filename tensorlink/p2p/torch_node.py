@@ -1,5 +1,8 @@
 from tensorlink.ml.utils.utils import get_gpu_memory
-from tensorlink.nodes.shared_memory import get_from_shared_memory
+from tensorlink.nodes.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.smart_node import Smartnode
 
@@ -118,7 +121,7 @@ class Torchnode(Smartnode):
         local_test=False,
         priority_nodes: list = None,
         seed_validators: list = None,
-        max_memory_gb: float = 0,
+        max_memory_gb: float = None,
     ):
         super(Torchnode, self).__init__(
             role=role,
@@ -132,7 +135,7 @@ class Torchnode(Smartnode):
 
         # Available GPU mpc estimation
         self._max_memory_gb = max_memory_gb
-        self.available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        self.available_gpu_memory = self.get_gpu_memory()
         self.total_gpu_memory = self.available_gpu_memory
         self.available_ram = psutil.virtual_memory().available
 
@@ -298,7 +301,16 @@ class Torchnode(Smartnode):
 
             # Received a forward pass
             eos = data.find(b"::")
-            size = int(data[7:eos])
+            try:
+                size = int(data[7:eos])
+            except (ValueError, IndexError):
+                self.debug_print(
+                    "Invalid forward header",
+                    tag="Torchnode",
+                    level=logging.ERROR,
+                )
+                return False
+
             formatted_size = format_size(size)
             self.debug_print(
                 f"RECEIVED FORWARD: {formatted_size}",
@@ -309,7 +321,16 @@ class Torchnode(Smartnode):
             # TODO we must check that the forward received corresponds to a sent pass/specific module
             # must also do with backwards
             tensor = data[eos + 2 : eos + 2 + size]
-            payload = json.loads(data[eos + 2 + size :])
+
+            try:
+                payload = json.loads(data[eos + 2 + size :])
+            except json.JSONDecodeError:
+                self.debug_print(
+                    "Invalid JSON payload in forward",
+                    tag="Torchnode",
+                    level=logging.ERROR,
+                )
+                return False
 
             if isinstance(payload, dict):
                 module_id = payload.get("module_id")
@@ -334,11 +355,11 @@ class Torchnode(Smartnode):
             buffer = shm.buf[:size]
             buffer[:] = tensor
 
-            self.modules[module_id]["forward_queue"][key] = (size, shm.name)
-            self.memory_manager[key] = shm.name
-
             del buffer
             shm.close()
+
+            self.modules[module_id]["forward_queue"][key] = (size, shm.name)
+            self.memory_manager[key] = shm.name
             return True
 
         except Exception as e:
@@ -642,7 +663,7 @@ class Torchnode(Smartnode):
     def _handle_send_generate(self, request):
         node_id, size, shm_name, stream = request["args"]
         node = self.nodes[node_id]
-        generate_bytes = get_from_shared_memory(size, shm_name, encoded=True)
+        generate_bytes = get_from_shared_memory(size, shm_name, encoding=None)
         stream_flag = b"\x01" if stream else b"\x00"
 
         packet = b"GENERATE" + stream_flag + generate_bytes
@@ -785,7 +806,6 @@ class Torchnode(Smartnode):
 
         else:
             n_iter, n_micro, module_id = request["args"]
-
             if module_id in self.modules:
                 if request["args"] in self.modules[module_id]["forward_queue"]:
                     return_val = self.modules[module_id]["forward_queue"][
@@ -948,15 +968,12 @@ class Torchnode(Smartnode):
 
     def store_parameters_in_shared_memory(self, key, parameters):
         module_id = key[1:]
-        parameters = json.dumps(parameters).encode()
-        size = len(parameters)
 
-        shm = shared_memory.SharedMemory(create=True, size=size)
-        buffer = shm.buf[:size]
-        buffer[:] = parameters
+        size, shm_name = store_in_shared_memory(parameters, encoding=None)
 
-        self.modules[module_id]["parameters"][key] = (size, shm.name)
-        self.memory_manager[key] = shm.name
+        # Track the shared-memory allocation for the module and parameter key
+        self.modules[module_id]["parameters"][key] = (size, shm_name)
+        self.memory_manager[key] = shm_name
 
     def send_parameters_req(self, node: Connection, module_id: str):
         """Request parameters from a specific worker"""
@@ -1137,3 +1154,7 @@ class Torchnode(Smartnode):
 
         print(sep)
         print()
+
+    def get_gpu_memory(self) -> float:
+        self.available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        return self.available_gpu_memory

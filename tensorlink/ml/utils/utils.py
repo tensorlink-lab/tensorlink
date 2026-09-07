@@ -133,10 +133,9 @@ def estimate_memory(
 
 def get_gpu_memory(max_vram_gb: float | None = None) -> int:
     """
-    Returns available memory in bytes.
-    - Uses total free CUDA VRAM if available.
-    - Falls back to available system RAM if CUDA is not available.
-    - If max_vram_gb is provided, caps the returned memory.
+    Returns available memory in bytes. Gets the total free CUDA VRAM if available.
+    Falls back to available system RAM if CUDA is not available. If max_vram_gb
+    is provided, caps the returned memory.
     """
 
     # Determine max memory cap
@@ -460,6 +459,36 @@ def tensor_to_bytes(obj):
 
     structure_len = len(structure_bytes).to_bytes(4, "big")
     return structure_len + structure_bytes + tensor_bytes
+
+
+def _get_cache_kv(cache):
+    """
+    Extract (key_list, value_list) from a DynamicCache regardless of
+    transformers version. New versions use cache.layers[i].keys/.values,
+    old versions expose cache.key_cache / cache.value_cache directly.
+    """
+    if hasattr(cache, 'key_cache'):
+        return cache.key_cache, cache.value_cache
+
+    elif hasattr(cache, 'layers'):
+        if not cache.layers:
+            return [], []
+
+        # Probe attribute names on first layer
+        layer = cache.layers[0]
+        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
+        val_attr = 'values' if hasattr(layer, 'values') else 'value'
+
+        keys, vals = [], []
+        for l in cache.layers:
+            k = getattr(l, key_attr, None)
+            v = getattr(l, val_attr, None)
+            keys.append(k)
+            vals.append(v)
+
+        return keys, vals
+    else:
+        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
 
 
 def bytes_to_tensor(data: bytes):
@@ -911,7 +940,14 @@ def resolve_module_from_path(model: nn.Module, path: str):
             continue
         parent = getattr(parent, p)
     child_name = parts[-1]
-    child = getattr(parent, child_name)
+
+    if hasattr(parent, child_name):
+        child = getattr(parent, child_name)
+    elif child_name == "model":
+        child = parent
+    else:
+        raise f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+
     return parent, child, child_name
 
 
@@ -935,36 +971,6 @@ def optimizer_to_spec(optimizer_cls):
     return optimizer_spec
 
 
-def _get_cache_kv(cache):
-    """
-    Extract (key_list, value_list) from a DynamicCache regardless of
-    transformers version. New versions use cache.layers[i].keys/.values,
-    old versions expose cache.key_cache / cache.value_cache directly.
-    """
-    if hasattr(cache, 'key_cache'):
-        return cache.key_cache, cache.value_cache
-
-    elif hasattr(cache, 'layers'):
-        if not cache.layers:
-            return [], []
-
-        # Probe attribute names on first layer
-        layer = cache.layers[0]
-        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
-        val_attr = 'values' if hasattr(layer, 'values') else 'value'
-
-        keys, vals = [], []
-        for l in cache.layers:
-            k = getattr(l, key_attr, None)
-            v = getattr(l, val_attr, None)
-            keys.append(k)
-            vals.append(v)
-
-        return keys, vals
-    else:
-        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
-
-
 def debug_structure(
     obj,
     name="root",
@@ -974,6 +980,7 @@ def debug_structure(
     show_stats=True,
     visited=None,
     _lines=None,
+    _global_stats=None,
 ):
     """
     Recursively builds a compact structure/types/shapes report of nested
@@ -982,24 +989,49 @@ def debug_structure(
     debug_print pipeline. Useful for debugging transformer/model outputs
     and KV caches without flooding logs.
     """
-
     top_level = _lines is None
     if top_level:
         _lines = []
     if visited is None:
         visited = set()
+    if _global_stats is None:
+        _global_stats = {
+            "min": None,
+            "max": None,
+            "n_tensors": 0,
+            "n_nan": 0,
+            "n_inf": 0,
+            "min_source": None,
+            "max_source": None,
+        }
 
-    prefix = "  " * indent
+    def _finish():
+        if top_level and show_stats and _global_stats["n_tensors"] > 0:
+            gmin = _global_stats["min"]
+            gmax = _global_stats["max"]
+            summary = (
+                f"\n[GLOBAL] tensors={_global_stats['n_tensors']}, "
+                f"min={gmin:.4g} (at {_global_stats['min_source']}), "
+                f"max={gmax:.4g} (at {_global_stats['max_source']})"
+            )
+            if _global_stats["n_nan"]:
+                summary += f", total_NAN={_global_stats['n_nan']}"
+            if _global_stats["n_inf"]:
+                summary += f", total_INF={_global_stats['n_inf']}"
+            _lines.append(summary)
+        return "\n".join(_lines) if top_level else None
 
+    prefix = " " * indent
     obj_id = id(obj)
+
     if obj_id in visited:
         _lines.append(f"{prefix}{name}: <recursive reference>")
-        return "\n".join(_lines) if top_level else None
+        return _finish()
     visited.add(obj_id)
 
     if indent > max_depth:
         _lines.append(f"{prefix}{name}: <max depth reached>")
-        return "\n".join(_lines) if top_level else None
+        return _finish()
 
     # --- Tensors ---
     if isinstance(obj, torch.Tensor):
@@ -1011,31 +1043,62 @@ def debug_structure(
                     if flat.is_floating_point():
                         n_nan = torch.isnan(flat).sum().item()
                         n_inf = torch.isinf(flat).sum().item()
+                        t_min = flat.min().item()
+                        t_max = flat.max().item()
                         stats = (
-                            f", min={flat.min().item():.4g}"
-                            f", max={flat.max().item():.4g}"
+                            f", min={t_min:.4g}"
+                            f", max={t_max:.4g}"
                             f", mean={flat.float().mean().item():.4g}"
                         )
                         if n_nan:
                             stats += f", NAN={n_nan}"
                         if n_inf:
                             stats += f", INF={n_inf}"
+
+                        # Update global stats (skip NaN/Inf so they don't
+                        # poison the running min/max).
+                        finite = flat[torch.isfinite(flat)]
+                        if finite.numel() > 0:
+                            f_min = finite.min().item()
+                            f_max = finite.max().item()
+                            if (
+                                _global_stats["min"] is None
+                                or f_min < _global_stats["min"]
+                            ):
+                                _global_stats["min"] = f_min
+                                _global_stats["min_source"] = f"{name}"
+                            if (
+                                _global_stats["max"] is None
+                                or f_max > _global_stats["max"]
+                            ):
+                                _global_stats["max"] = f_max
+                                _global_stats["max_source"] = f"{name}"
+                        _global_stats["n_nan"] += n_nan
+                        _global_stats["n_inf"] += n_inf
                     else:
-                        stats = f", min={flat.min().item()}, max={flat.max().item()}"
+                        t_min = flat.min().item()
+                        t_max = flat.max().item()
+                        stats = f", min={t_min}, max={t_max}"
+                        if _global_stats["min"] is None or t_min < _global_stats["min"]:
+                            _global_stats["min"] = t_min
+                            _global_stats["min_source"] = f"{name}"
+                        if _global_stats["max"] is None or t_max > _global_stats["max"]:
+                            _global_stats["max"] = t_max
+                            _global_stats["max_source"] = f"{name}"
+                    _global_stats["n_tensors"] += 1
             except Exception as e:
                 stats = f", <stats failed: {e}>"
-
         _lines.append(
             f"{prefix}{name}: Tensor(shape={tuple(obj.shape)}, "
             f"dtype={obj.dtype}, device={obj.device}, "
             f"requires_grad={obj.requires_grad}{stats})"
         )
-        return "\n".join(_lines) if top_level else None
+        return _finish()
 
     # --- Skip class/type objects ---
     if isinstance(obj, type):
         _lines.append(f"{prefix}{name}: <class {obj.__name__}>")
-        return "\n".join(_lines) if top_level else None
+        return _finish()
 
     # --- Dict-like ---
     if isinstance(obj, Mapping):
@@ -1052,15 +1115,15 @@ def debug_structure(
                 show_stats=show_stats,
                 visited=visited,
                 _lines=_lines,
+                _global_stats=_global_stats,
             )
         if remaining:
-            _lines.append(f"{prefix}  ... {len(remaining)} more keys")
-        return "\n".join(_lines) if top_level else None
+            _lines.append(f"{prefix} ... {len(remaining)} more keys")
+        return _finish()
 
     # --- List/Tuple ---
     if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
         _lines.append(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
-
         if len(obj) > max_items and _all_same_signature(obj):
             debug_structure(
                 obj[0],
@@ -1071,12 +1134,12 @@ def debug_structure(
                 show_stats=show_stats,
                 visited=visited,
                 _lines=_lines,
+                _global_stats=_global_stats,
             )
             _lines.append(
-                f"{prefix}  ... {len(obj)} items total, showing signature of [0]"
+                f"{prefix} ... {len(obj)} items total, showing signature of [0]"
             )
-            return "\n".join(_lines) if top_level else None
-
+            return _finish()
         shown, remaining = obj[:max_items], obj[max_items:]
         for i, v in enumerate(shown):
             debug_structure(
@@ -1088,10 +1151,11 @@ def debug_structure(
                 show_stats=show_stats,
                 visited=visited,
                 _lines=_lines,
+                _global_stats=_global_stats,
             )
         if remaining:
-            _lines.append(f"{prefix}  ... {len(remaining)} more items")
-        return "\n".join(_lines) if top_level else None
+            _lines.append(f"{prefix} ... {len(remaining)} more items")
+        return _finish()
 
     # --- HF model outputs / dataclasses / custom objects ---
     if hasattr(obj, "__dict__"):
@@ -1112,17 +1176,18 @@ def debug_structure(
                 show_stats=show_stats,
                 visited=visited,
                 _lines=_lines,
+                _global_stats=_global_stats,
             )
         if remaining:
-            _lines.append(f"{prefix}  ... {len(remaining)} more attrs")
-        return "\n".join(_lines) if top_level else None
+            _lines.append(f"{prefix} ... {len(remaining)} more attrs")
+        return _finish()
 
     # --- Primitive ---
     value = repr(obj)
     if len(value) > 120:
         value = value[:120] + "..."
     _lines.append(f"{prefix}{name}: {type(obj).__name__} = {value}")
-    return "\n".join(_lines) if top_level else None
+    return _finish()
 
 
 def _all_same_signature(seq, sample_size=5):

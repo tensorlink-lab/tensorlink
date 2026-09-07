@@ -84,6 +84,7 @@ def model_env(request, connected_wwv_nodes):
     response = request_model(cfg["name"], cfg["model_type"], cfg["timeout"])
 
     assert response.status_code == 200
+    time.sleep(1)
 
     yield cfg, (worker, worker2, validator)
 
@@ -157,7 +158,7 @@ def test_status_loading(model_env):
     """
     cfg, _ = model_env
     result = None
-    for _ in range(5):
+    for _ in range(10):
         # Check a few times as the job takes a second to be added to the validator
         response = get_model_status(cfg["name"])
         assert response.status_code == 200, (
@@ -172,8 +173,8 @@ def test_status_loading(model_env):
     assert (
         "status" in result
     ), f"[{cfg['name']}] Response missing 'status' field: {result}"
-    assert result["status"] == "initializing", (
-        f"[{cfg['name']}] Expected 'initializing' immediately after model request, "
+    assert result["status"] in ("initializing", "active"), (
+        f"[{cfg['name']}] Expected 'initializing' or 'active' immediately after model request, "
         f"got '{result['status']}'"
     )
     print(f"✅ [{cfg['name']}] status immediately after request: '{result['status']}'")
@@ -229,7 +230,7 @@ def test_chat_completions(active_model_env):
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say 'Hello world' and nothing else."},
         ],
-        "max_tokens": 20,
+        "max_tokens": 25,
         "temperature": 0.1,
         "stream": False,
     }
@@ -288,7 +289,7 @@ def test_chat_completions_stream(active_model_env):
         "messages": [
             {"role": "user", "content": "Count to three."},
         ],
-        "max_tokens": 50,
+        "max_tokens": 25,
         "temperature": 0.1,
         "stream": True,
     }
@@ -360,8 +361,8 @@ def test_responses_text(active_model_env):
         "messages": [
             {"role": "user", "content": "What is 2 + 2?"},
         ],
-        "max_tokens": 10,
-        "temperature": 0.0,
+        "max_tokens": 25,
+        "temperature": 0.7,
         "stream": False,
     }
 

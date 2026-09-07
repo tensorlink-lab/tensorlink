@@ -19,54 +19,6 @@ class WorkerThread(Torchnode):
             tasks, ie distributing a model too large to handle on a single computer / user
     """
 
-    def __init__(
-        self,
-        request_queue,
-        response_queue,
-        print_level=logging.INFO,
-        max_connections: int = 0,
-        upnp=True,
-        on_chain=False,
-        local_test=False,
-        mining_active=None,
-        max_memory_gb=0,
-        duplicate="",
-        load_previous_state=False,
-        priority_nodes: list = None,
-        seed_validators: list = None,
-    ):
-        super(WorkerThread, self).__init__(
-            request_queue,
-            response_queue,
-            "W" + duplicate,
-            max_connections=max_connections,
-            upnp=upnp,
-            on_chain=on_chain,
-            local_test=local_test,
-            priority_nodes=priority_nodes,
-            seed_validators=seed_validators,
-            max_memory_gb=max_memory_gb,
-        )
-
-        self.training = False
-        self.role = "W" + duplicate
-        self.print_level = print_level
-        self.loss = None
-        self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
-        self.keeper = Keeper(self)
-
-        self.debug_print(
-            f"Launching Worker: {self.rsa_key_hash} ({self.host}:{self.port})",
-            level=logging.INFO,
-            tag="Worker",
-        )
-
-        self.mining_active = mining_active
-
-        # Finally, load up previous saved state if any
-        if on_chain or load_previous_state:
-            self.keeper.load_previous_state()
-
     def handle_data(self, data: bytes, node: Connection):
         """
         Handle incoming tensors from connected roles and new job requests
@@ -124,6 +76,54 @@ class WorkerThread(Torchnode):
                 tag="Worker",
             )
             raise e
+
+    def __init__(
+        self,
+        request_queue,
+        response_queue,
+        print_level=logging.INFO,
+        max_connections: int = 0,
+        upnp=True,
+        on_chain=False,
+        local_test=False,
+        mining_active=None,
+        duplicate="",
+        load_previous_state=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
+        max_memory_gb: float = None,
+    ):
+        super(WorkerThread, self).__init__(
+            request_queue,
+            response_queue,
+            "W" + duplicate,
+            max_connections=max_connections,
+            upnp=upnp,
+            on_chain=on_chain,
+            local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
+        )
+
+        self.training = False
+        self.role = "W" + duplicate
+        self.print_level = print_level
+        self.loss = None
+        self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
+        self.keeper = Keeper(self)
+
+        self.debug_print(
+            f"Launching Worker: {self.rsa_key_hash} ({self.host}:{self.port})",
+            level=logging.INFO,
+            tag="Worker",
+        )
+
+        self.mining_active = mining_active
+
+        # Finally, load up previous saved state if any
+        if on_chain or load_previous_state:
+            self.keeper.load_previous_state()
 
     def _handle_job_req(self, data: bytes, node: Connection):
         try:

@@ -158,19 +158,6 @@ class ModelCacheManager:
                 break
 
 
-class TiedLinear(nn.Module):
-    """Linear projection using a weight tensor tied to an Embedding."""
-
-    def __init__(self, weight: torch.Tensor):
-        super().__init__()
-        self.weight = nn.Parameter(weight, requires_grad=weight.requires_grad)
-
-    def forward(self, x):
-        if x.dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
-        return torch.nn.functional.linear(x, self.weight)
-
-
 def _iter_safetensor_keys(model_path: str):
     """Yield all weight keys from safetensors shards (or .bin as fallback)."""
     safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
@@ -676,31 +663,42 @@ def load_model_skeleton(
 def get_nested_module(
     model: torch.nn.Module, path: str, target_class_name: str = None
 ) -> torch.nn.Module:
-    parts = path.split('.')
-    current = model
+    """
+    Get a module given its path in the model using notation from
+    distributed config generator in graphing.py (e.g. model.layers).
+    """
+    try:
+        parts = path.split('.')
+        current = model
 
-    for i in range(len(parts)):
-        part = parts[i]
+        for i in range(len(parts)):
+            part = parts[i]
 
-        if part == "":
-            continue
-
-        if part == "model":
-            # Only skip if there are further parts AND the next part
-            # is accessible without going through .model explicitly
-            has_more = len(parts) > i + 1
-            if has_more and hasattr(current, "model"):
-                next_part = parts[i + 1]
-                if hasattr(current, next_part):
-                    continue
-            elif not has_more:
-                pass
-            else:
+            if part == "":
                 continue
 
-        if part.isdigit():
-            current = current[int(part)]
-        else:
-            current = getattr(current, part)
+            if part == "model":
+                # Only skip if there are further parts AND the next part
+                # is accessible without going through .model explicitly
+                has_more = len(parts) > i + 1
+                if has_more and hasattr(current, "model"):
+                    next_part = parts[i + 1]
+                    if hasattr(current, next_part):
+                        continue
+                elif not has_more:
+                    if not hasattr(current, "model"):
+                        continue
+                    pass
+                else:
+                    continue
 
-    return current
+            if part.isdigit():
+                current = current[int(part)]
+            else:
+                current = getattr(current, part)
+
+        return current
+    except Exception as e:
+        print(
+            f"ERROR FETCHING NESTED MODULE {path} FOR MODEL {model.__class__}. (Error: {e})"
+        )
