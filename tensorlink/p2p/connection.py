@@ -394,6 +394,10 @@ class Connection(threading.Thread):
             finally:
                 del view
                 shm.close()
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass  # already unlinked by a concurrent path, harmless
 
         except Exception as e:
             self.main_node.debug_print(
