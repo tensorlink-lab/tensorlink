@@ -297,18 +297,16 @@ class Keeper:
     def _archive_daily_to_weekly(self):
         """Archive daily statistics older than 90 days into weekly aggregates."""
         current_time = time.time()
-        ninety_days_ago = current_time - THIRTY_DAYS_SECONDS * 3
+        two_years_ago = current_time - THIRTY_DAYS_SECONDS * 24
         today = datetime.fromtimestamp(current_time).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         today_timestamp = today.timestamp()
 
-        # Find daily stats that are older than 90 days and not from today
         daily_to_archive = [
             stat
             for stat in self.network_stats["daily"]
-            if stat["timestamp"] < ninety_days_ago
-            and stat["timestamp"] < today_timestamp
+            if stat["timestamp"] < two_years_ago and stat["timestamp"] < today_timestamp
         ]
 
         if not daily_to_archive:
@@ -320,84 +318,75 @@ class Keeper:
             stat_date = datetime.fromtimestamp(daily_stat["timestamp"])
             iso_year, iso_week, _ = stat_date.isocalendar()
             week_key = f"{iso_year}-W{iso_week:02d}"
+            weekly_groups.setdefault(week_key, []).append(daily_stat)
 
-            if week_key not in weekly_groups:
-                weekly_groups[week_key] = []
-            weekly_groups[week_key].append(daily_stat)
+        # --- everything below is now OUTSIDE the daily_stat loop ---
+        metric_keys = [
+            "workers",
+            "validators",
+            "users",
+            "jobs",
+            "proposals",
+            "available_capacity",
+            "used_capacity",
+            "total_capacity",
+        ]
 
-            # Create weekly aggregates
-            metric_keys = [
-                "workers",
-                "validators",
-                "users",
-                "jobs",
-                "proposals",
-                "available_capacity",
-                "used_capacity",
-                "total_capacity",
+        for week_key, stats in weekly_groups.items():
+            # Skip if already archived
+            if any(w["week"] == week_key for w in self.network_stats["weekly"]):
+                continue
+
+            n = len(stats)
+            tflops_vals = [
+                s.get("avg_tflops") for s in stats if s.get("avg_tflops") is not None
+            ]
+            bandwidth_vals = [
+                s.get("avg_bandwidth_gb_s")
+                for s in stats
+                if s.get("avg_bandwidth_gb_s") is not None
             ]
 
-            for week_key, stats in weekly_groups.items():
-                # Skip if already archived
-                if any(w["week"] == week_key for w in self.network_stats["weekly"]):
-                    continue
+            weekly_stat = {
+                "week": week_key,
+                "week_start": min(s["timestamp"] for s in stats),
+                "week_end": max(s["timestamp"] for s in stats),
+                "days_count": n,
+                **{
+                    f"avg_{key}": sum(s.get(key, 0) for s in stats) / n
+                    for key in metric_keys
+                },
+                "avg_tflops": (
+                    round(sum(tflops_vals) / len(tflops_vals), 2)
+                    if tflops_vals
+                    else None
+                ),
+                "avg_bandwidth_gb_s": (
+                    round(sum(bandwidth_vals) / len(bandwidth_vals), 2)
+                    if bandwidth_vals
+                    else None
+                ),
+                "total_benchmarked": sum(s.get("total_benchmarked", 0) for s in stats),
+            }
+            self.network_stats["weekly"].append(weekly_stat)
 
-                n = len(stats)
-                tflops_vals = [
-                    s.get("avg_tflops")
-                    for s in stats
-                    if s.get("avg_tflops") is not None
-                ]
-                bandwidth_vals = [
-                    s.get("avg_bandwidth_gb_s")
-                    for s in stats
-                    if s.get("avg_bandwidth_gb_s") is not None
-                ]
+        # Remove archived daily stats
+        self.network_stats["daily"] = [
+            s
+            for s in self.network_stats["daily"]
+            if s["timestamp"] >= two_years_ago or s["timestamp"] >= today_timestamp
+        ]
 
-                weekly_stat = {
-                    "week": week_key,
-                    "week_start": min(s["timestamp"] for s in stats),
-                    "week_end": max(s["timestamp"] for s in stats),
-                    "days_count": n,
-                    **{
-                        f"avg_{key}": sum(s.get(key, 0) for s in stats) / n
-                        for key in metric_keys
-                    },
-                    "avg_tflops": (
-                        round(sum(tflops_vals) / len(tflops_vals), 2)
-                        if tflops_vals
-                        else None
-                    ),
-                    "avg_bandwidth_gb_s": (
-                        round(sum(bandwidth_vals) / len(bandwidth_vals), 2)
-                        if bandwidth_vals
-                        else None
-                    ),
-                    "total_benchmarked": sum(
-                        s.get("total_benchmarked", 0) for s in stats
-                    ),
-                }
-                self.network_stats["weekly"].append(weekly_stat)
+        # Keep last 104 weeks
+        self.network_stats["weekly"].sort(key=lambda x: x["week_start"])
+        self.network_stats["weekly"] = self.network_stats["weekly"][-104:]
 
-            # Remove archived daily stats
-            self.network_stats["daily"] = [
-                s
-                for s in self.network_stats["daily"]
-                if s["timestamp"] >= ninety_days_ago
-                or s["timestamp"] >= today_timestamp
-            ]
-
-            # Keep last 104 weeks
-            self.network_stats["weekly"].sort(key=lambda x: x["week_start"])
-            self.network_stats["weekly"] = self.network_stats["weekly"][-104:]
-
-            if daily_to_archive:
-                self.node.debug_print(
-                    f"Archived {len(daily_to_archive)} daily stats into {len(weekly_groups)} weeks",
-                    level=logging.INFO,
-                    colour="blue",
-                    tag="Keeper",
-                )
+        self.node.debug_print(
+            f"Archived {len(daily_to_archive)} daily stats into {len(weekly_groups)} weeks",
+            level=logging.INFO,
+            colour="blue",
+            tag="Keeper",
+        )
 
     def _update_daily_statistics(self):
         current_time = time.time()
@@ -602,7 +591,7 @@ class Keeper:
                     "labels": [s["week"] for s in weekly_stats],
                     "datasets": {
                         f"avg_{cat}": [s.get(f"avg_{cat}", 0) for s in weekly_stats]
-                        for cat in CATEGORIES
+                        for cat in CATEGORIES + ["total_capacity", "used_capacity"]
                     },
                     "week_starts": [s["week_start"] for s in weekly_stats],
                     "week_ends": [s["week_end"] for s in weekly_stats],
