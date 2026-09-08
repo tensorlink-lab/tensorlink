@@ -44,7 +44,7 @@ from tensorlink.ml.utils import (
     resolve_module_from_path,
     resolve_dtype,
 )
-from tensorlink.nodes.shared_memory import (
+from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
 )

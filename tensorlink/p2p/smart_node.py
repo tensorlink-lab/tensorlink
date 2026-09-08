@@ -1,18 +1,19 @@
-from tensorlink.crypto.rsa import (
+from tensorlink.utils.rsa import (
     decrypt,
     encrypt,
     authenticate_public_key,
     get_rsa_pub_key,
 )
+from tensorlink.utils.logging import log_message
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.monitor import ConnectionMonitor
 from tensorlink.p2p.dht import DHT
 
-from logging.handlers import TimedRotatingFileHandler
 from dotenv import get_key, set_key
 from typing import Tuple, Union, Optional, List
 from miniupnpc import UPnP
 from web3 import Web3
+from datetime import datetime
 import hashlib
 import ipaddress
 import json
@@ -114,7 +115,6 @@ SNO_EVENT_SIGNATURES = {
     "ProposalCreated": "ProposalCreated(uint256,bytes)",
     "ProposalExecuted": "ProposalExecuted(uint256)",
 }
-
 
 BASE_PORT = 38751
 
@@ -276,19 +276,6 @@ class Smartnode(threading.Thread):
 
         if self.upnp:
             self._init_upnp()
-
-        # Configure logging with TimedRotatingFileHandler
-        log_handler = TimedRotatingFileHandler(
-            f"logs/runtime_{role}.log", when="midnight", interval=1, backupCount=7
-        )
-        log_handler.setFormatter(logging.Formatter("[%(asctime)s] - %(message)s"))
-        log_handler.suffix = "%Y%m%d"
-        logging.getLogger().addHandler(log_handler)
-        logging.getLogger().setLevel(logging.DEBUG)
-
-        # These libraries log at DEBUG/INFO on every single RPC request/response
-        for _noisy_logger in ("web3", "urllib3", "requests"):
-            logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
         self.VERBOSE = VERBOSE
 
@@ -509,7 +496,7 @@ class Smartnode(threading.Thread):
         Args:
             message (str): Error message to log
         """
-        self.debug_print(f"{message}", level=logging.ERROR, tag=tag)
+        self.debug_print(f"{message}", level=logging.WARNING, tag=tag)
 
     def _log_debug(self, message: str, tag="Smartnode") -> None:
         """
@@ -522,23 +509,27 @@ class Smartnode(threading.Thread):
 
     def debug_print(self, message, level=logging.DEBUG, colour=None, tag=None) -> None:
         """Print to console if debug is enabled"""
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        tag_width = 15
 
-        tag_width = 15  # Adjust as needed
         if tag:
             centered_tag = tag.center(tag_width)
             plain_tag = f" {centered_tag}"
         else:
             plain_tag = " " * (tag_width + 1)
 
-        # Plain, uncoloured version goes to the logger
-        formatted_message = f"[{timestamp}] {plain_tag} -> {message}"
-        logging.log(level, formatted_message)
+        # Include role in file logs
+        file_message = f"[{timestamp}] [{self.role}] {plain_tag} -> {message}"
 
-        # Create coloured version to go to the console
-        if level >= self.print_level:
+        should_print = level >= self.print_level
+
+        console_message = None
+
+        if should_print:
             role_colour = "\033[37m"
+
             if self.role == "U":
                 role_colour = COLOURS["magenta"]
             elif self.role.startswith("W"):
@@ -548,20 +539,26 @@ class Smartnode(threading.Thread):
 
             if colour is None:
                 colour = LEVEL_COLOURS.get(level, "white")
+
             colour_code = COLOURS.get(colour, "\033[37m")
             reset_colour = "\033[0m"
 
             if tag:
-                background_colour = BACKGROUND_COLOURS.get(tag.strip(), "\033[40m")
+                background_colour = BACKGROUND_COLOURS.get(
+                    tag.strip(),
+                    "\033[40m",
+                )
                 coloured_tag = f" {background_colour}{centered_tag}{reset_colour}"
             else:
                 coloured_tag = " " * (tag_width + 1)
 
             console_message = (
-                f"[{role_colour}{timestamp}{reset_colour}] {coloured_tag} -> "
+                f"[{role_colour}{timestamp}{reset_colour}] "
+                f"{coloured_tag} -> "
                 f"{colour_code}{message}{reset_colour}"
             )
-            print(console_message)
+
+        log_message(level, file_message, console_message, should_print)
 
     """Methods for DHT Query and Storage"""
 

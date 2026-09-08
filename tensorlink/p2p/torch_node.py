@@ -4,7 +4,7 @@ from tensorlink.ml.utils.gpu_benchmark import (
     benchmark_memory_bandwidth,
     get_gpu_memory,
 )
-from tensorlink.nodes.shared_memory import (
+from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
 )

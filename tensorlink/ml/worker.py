@@ -17,7 +17,7 @@ from tensorlink.ml.utils.loading import (
     get_nested_module,
 )
 from tensorlink.ml.utils.injector import LayerGroupModule
-from tensorlink.nodes.shared_memory import (
+from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
 )

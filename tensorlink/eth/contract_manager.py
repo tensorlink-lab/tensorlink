@@ -10,7 +10,7 @@ import time
 
 from tensorlink.eth.rpc_backoff import RPCBackoff
 from tensorlink.p2p.torch_node import Torchnode
-from tensorlink.crypto.merkle import (
+from tensorlink.utils.merkle import (
     build_participants,
     merkle_root_from_participants,
     generate_merkle_proof,

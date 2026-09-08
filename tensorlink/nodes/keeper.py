@@ -29,6 +29,23 @@ DAILY_STAT_DEFAULTS = {
     "by_gpu_model": {},
 }
 
+WEEKLY_STAT_DEFAULTS = {
+    "week_start": 0,
+    "week_end": 0,
+    "days_count": 0,
+    "avg_workers": 0,
+    "avg_validators": 0,
+    "avg_users": 0,
+    "avg_jobs": 0,
+    "avg_proposals": 0,
+    "avg_available_capacity": 0,
+    "avg_used_capacity": 0,
+    "avg_total_capacity": 0,
+    "avg_tflops": None,
+    "avg_bandwidth_gb_s": None,
+    "total_benchmarked": 0,
+}
+
 THIRTY_DAYS_SECONDS = 60 * 60 * 24 * 30
 SEVEN_DAYS_SECONDS = 60 * 60 * 24 * 7
 ONE_DAY_SECONDS = 60 * 60 * 24
@@ -40,6 +57,13 @@ def _normalize_daily_stat(stat: Dict) -> Dict:
     """Backfill fields on stats written before device/benchmark tracking
     existed, so nothing downstream has to special-case missing keys."""
     return {**DAILY_STAT_DEFAULTS, **stat}
+
+
+def _normalize_weekly_stat(stat: Dict) -> Dict:
+    """Backfill fields on weekly rollups written before this schema
+    existed (or partially written), so downstream code never has to
+    special-case missing keys."""
+    return {**WEEKLY_STAT_DEFAULTS, **stat}
 
 
 def _load_historical_stats() -> Dict:
@@ -502,7 +526,9 @@ class Keeper:
         """Get weekly statistics for last N weeks."""
         if weeks <= 0:
             return []
-        return self.network_stats["weekly"][-weeks:]
+        return [
+            _normalize_weekly_stat(s) for s in self.network_stats["weekly"][-weeks:]
+        ]
 
     def get_network_summary(self) -> Dict:
         """Get summary of current network statistics."""

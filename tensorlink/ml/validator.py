@@ -150,6 +150,7 @@ class DistributedValidator(DistributedWorker):
 
         self._max_memory_bytes = int(max_memory_gb * 1e9)  # Convert to bytes
         self._max_module_bytes = int(max_module_gb * 1e9)
+
         if not self._hosting_enabled:
             self._max_module_bytes = 0
             self._max_memory_bytes = 0

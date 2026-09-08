@@ -43,3 +43,9 @@ jobs:
           poetry run pytest tests/test_node.py -s
           poetry run pytest tests/test_model_api.py -s
           poetry run pytest tests/test_distributed_model.py -s
+
+      - name: Dump runtime.log on failure
+        if: failure()
+        run: |
+          echo "=== runtime.log (chronological) ==="
+          sort -k1,2 logs/runtime.log || echo "logs/runtime.log not found"
