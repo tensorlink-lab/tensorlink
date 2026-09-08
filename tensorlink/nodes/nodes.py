@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Optional, List
 
 from tensorlink.ml.worker import DistributedWorker
-from tensorlink.ml.utils.utils import get_gpu_memory
+from tensorlink.ml.utils.gpu_benchmark import run_device_benchmark, get_gpu_memory
 from tensorlink.nodes.user_thread import UserThread
 from tensorlink.nodes.validator_thread import ValidatorThread
 from tensorlink.nodes.worker_thread import WorkerThread
@@ -120,6 +120,7 @@ class BaseNode:
         config: BaseNodeConfig,
         trusted: bool = False,
         utilization: bool = True,
+        benchmark: bool = True,
     ):
         """
         Initialize a BaseNode instance.
@@ -136,10 +137,17 @@ class BaseNode:
         utilization : bool, optional
             If True, runs distributed ML logic in a background thread to allow
             concurrent network operation. If False, runs synchronously.
+
+        benchmark : bool, optional
+            If True, runs a computing benchmark and device info check.
         """
         self.config = config
         self.trusted = trusted
         self.utilization = utilization
+
+        self.device_info, self.device_benchmark = (
+            run_device_benchmark() if benchmark else None
+        ), None
 
         # IPC primitives for communicating with the role process
         self.node_requests = mp.Queue()
@@ -282,6 +290,8 @@ class Worker(BaseNode):
             self.node_responses,
             **vars(self.config),
             mining_active=self.mining_active,
+            _device_info=self.device_info,
+            _device_benchmark=self.device_benchmark,
         )
 
         node.run()
@@ -352,6 +362,8 @@ class Validator(BaseNode):
             self.node_requests,
             self.node_responses,
             **vars(self.config),
+            _device_info=self.device_info,
+            _device_benchmark=self.device_benchmark,
         )
 
         node.run()
@@ -403,6 +415,8 @@ class User(BaseNode):
             self.node_requests,
             self.node_responses,
             **vars(self.config),
+            _device_info=self.device_info,
+            _device_benchmark=self.device_benchmark,
         )
 
         node.run()

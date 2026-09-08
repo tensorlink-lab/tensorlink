@@ -329,11 +329,13 @@ class TensorlinkAPI:
             days: int = Query(30, ge=1, le=90),
             include_weekly: bool = False,
             include_summary: bool = True,
+            include_device: bool = False,
         ):
             return self.smart_node.get_network_status(
                 days=days,
                 include_weekly=include_weekly,
                 include_summary=include_summary,
+                include_device=include_device,
             )
 
         @self.app.get("/proposal-history")

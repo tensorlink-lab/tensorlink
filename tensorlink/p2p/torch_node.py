@@ -1,4 +1,9 @@
-from tensorlink.ml.utils.utils import get_gpu_memory
+from tensorlink.ml.utils.gpu_benchmark import (
+    get_gpu_info,
+    benchmark_matmul,
+    benchmark_memory_bandwidth,
+    get_gpu_memory,
+)
 from tensorlink.nodes.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
@@ -122,6 +127,8 @@ class Torchnode(Smartnode):
         priority_nodes: list = None,
         seed_validators: list = None,
         max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         super(Torchnode, self).__init__(
             role=role,
@@ -132,6 +139,9 @@ class Torchnode(Smartnode):
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
         )
+        # Pointers to model parameters in DistributedModels
+        self.modules = {}
+        self.state_updates = {}
 
         # Available GPU mpc estimation
         self._max_memory_gb = max_memory_gb
@@ -139,17 +149,25 @@ class Torchnode(Smartnode):
         self.total_gpu_memory = self.available_gpu_memory
         self.available_ram = psutil.virtual_memory().available
 
+        # Device info
+        self._device_info = _device_info
+        self._device_benchmark = _device_benchmark
+        self._device_benchmarked_at = time.time() if _device_info is not None else None
+
+        threading.Thread(
+            target=self._run_device_benchmark,
+            name="_device_benchmark",
+            daemon=True,
+        ).start()
+
         self._mpc_comms = None
         self.memory_manager = {}
         self.request_queue = request_queue
         self.response_queue = response_queue
 
-        # Pointers to model parameters in DistributedModels
-        self.modules = {}
-        self.state_updates = {}
-
         # Master flag for handling different types of storage as master
         self.master = False
+        self.training = False
         self.mpc_terminate_flag = threading.Event()
 
     def handle_data(self, data: bytes, node: Connection):
@@ -171,6 +189,7 @@ class Torchnode(Smartnode):
                     b"MODULE": self._handle_module,
                     b"UPDATE-TRAIN": self._update_train,
                     b"TRAIN-UPDATED": self._train_updated,
+                    b"STATS-REQUEST": self.handle_statistics_request,
                 }
 
                 # Iterate through handlers to find the matching prefix
@@ -188,6 +207,7 @@ class Torchnode(Smartnode):
                                 b"OPTIMIZER",
                                 b"MODULE",
                                 b"UPDATE-TRAIN",
+                                b"STATS-REQUEST",
                             )
                             else handler(data)
                         )
@@ -196,6 +216,27 @@ class Torchnode(Smartnode):
 
         except Exception as e:
             self._log_error(f"Error handling data: {e}", tag="Torchnode")
+
+    def handle_statistics_request(self, data: bytes, node: Connection):
+        """When a validator requests a stats request, return stats"""
+        self.debug_print(f"Received stats request from: {node.node_id}", tag="Worker")
+
+        self.get_gpu_memory()
+
+        stats = {
+            "id": self.rsa_key_hash,
+            "gpu_memory": self.available_gpu_memory,
+            "total_gpu_memory": self.total_gpu_memory,
+            "role": self.role,
+            "training": self.training,
+            "device": self._device_info,
+            "benchmark": self._device_benchmark,
+            "benchmarked_at": self._device_benchmarked_at,
+        }
+
+        stats_bytes = json.dumps(stats).encode()
+        stats_bytes = b"STATS-RESPONSE" + stats_bytes
+        self.send_to_node(node, stats_bytes)
 
     def _train_updated(self, data: bytes):
         mode = False if data[13:14] == b"0" else True
@@ -1069,7 +1110,7 @@ class Torchnode(Smartnode):
 
     def print_ui_status(self):
         total_vram = self.total_gpu_memory
-        used_vram = total_vram - get_gpu_memory()
+        used_vram = total_vram - self.get_gpu_memory()
 
         ram = psutil.virtual_memory()
         used_ram = ram.total - ram.available
@@ -1155,6 +1196,38 @@ class Torchnode(Smartnode):
         print(sep)
         print()
 
-    def get_gpu_memory(self) -> float:
-        self.available_gpu_memory = get_gpu_memory(self._max_memory_gb)
-        return self.available_gpu_memory
+    def get_gpu_memory(self) -> int:
+        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        reserved_loading_memory = 0
+
+        for module_id, module_info in self.modules.items():
+            # Account for modules that are not in CUDA and are still initializing
+            if module_info.get("status", "loading") == "loading":
+                reserved_loading_memory += module_info["memory"]
+
+        available_gpu_memory = max(
+            0, int(available_gpu_memory - reserved_loading_memory)
+        )
+        return available_gpu_memory
+
+    def _run_device_benchmark(self):
+        """Populate _device_info/_device_benchmark once. Safe to call again
+        later (e.g. on a timer) if you want periodic re-benchmarking."""
+        try:
+            self._device_info = get_gpu_info()
+
+            if self._device_info.get("available"):
+                self._device_benchmark = {
+                    "compute": benchmark_matmul(),
+                    "memory": benchmark_memory_bandwidth(),
+                }
+
+            self._device_benchmarked_at = time.time()
+
+        except Exception as e:
+            self.debug_print(
+                f"Device benchmark failed: {e}",
+                colour="yellow",
+                level=logging.WARNING,
+                tag="Torchnode",
+            )

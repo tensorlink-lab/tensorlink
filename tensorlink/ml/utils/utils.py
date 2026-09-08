@@ -6,7 +6,6 @@ from typing import Dict, Optional, Union
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
-import psutil
 import torch
 import torch.nn as nn
 from dataclasses import is_dataclass, asdict
@@ -38,127 +37,6 @@ def format_memory_size(number: int) -> str:
             return f"{number:.2f} {unit}"
         number /= 1024
     return f"{number:.2f} TB"
-
-
-def estimate_memory(
-    module: nn.Module,
-    training: bool = True,
-    batch_size: int = 256,
-    seq_length: int = 2048,
-    dtype: torch.dtype = torch.float16,
-    optimizer_type: str = "adam",
-    include_kv_cache: bool = True,
-    recursive: bool = True,
-    count_activations: bool = True,
-) -> tuple[float, dict]:
-    """Estimate GPU memory required for a model."""
-
-    dtype_size = torch.tensor([], dtype=dtype).element_size()
-
-    breakdown = {
-        "parameters": 0,
-        "gradients": 0,
-        "optimizer": 0,
-        "activations": 0,
-        "kv_cache": 0,
-    }
-
-    # ---- parameters ----
-    if recursive:
-        param_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
-        param_bytes += sum(b.numel() * b.element_size() for b in module.buffers())
-    else:
-        param_bytes = sum(
-            p.numel() * p.element_size() for p in module.parameters(recurse=False)
-        )
-        param_bytes += sum(
-            b.numel() * b.element_size() for b in module.buffers(recurse=False)
-        )
-
-    breakdown["parameters"] = param_bytes
-
-    # ---- training extras ----
-    if training:
-        breakdown["gradients"] = param_bytes
-        if optimizer_type.lower() in {"adam", "adamw"}:
-            breakdown["optimizer"] = 2 * param_bytes * (4 / dtype_size)
-        else:
-            breakdown["optimizer"] = param_bytes
-
-    # ---- activations ----
-    if count_activations:
-        if hasattr(module, "config"):
-            hidden_size = module.config.hidden_size
-        elif hasattr(module, "hidden_size"):
-            hidden_size = module.hidden_size
-        elif hasattr(module, "embed_dim"):
-            hidden_size = module.embed_dim
-        elif hasattr(module, "d_model"):
-            hidden_size = module.d_model
-        else:
-            total_params = sum(p.numel() for p in module.parameters())
-            hidden_size = max(256, min(int((total_params / 12) ** 0.5), 8192))
-
-        activation_multiplier = 4 if not training else 7
-
-        breakdown["activations"] = (
-            batch_size * seq_length * hidden_size * dtype_size * activation_multiplier
-        )
-
-        if include_kv_cache and hasattr(module, "config") and not training:
-            num_layers = module.config.num_hidden_layers
-            num_heads = getattr(
-                module.config,
-                "num_key_value_heads",
-                module.config.num_attention_heads,
-            )
-            head_dim = hidden_size // module.config.num_attention_heads
-
-            breakdown["kv_cache"] = (
-                batch_size
-                * seq_length
-                * num_layers
-                * num_heads
-                * head_dim
-                * 2
-                * dtype_size
-            )
-
-    # ---- overhead ----
-    OVERHEAD = 1.20
-    total = sum(breakdown.values()) * OVERHEAD
-
-    return total, breakdown
-
-
-def get_gpu_memory(max_vram_gb: float | None = None) -> int:
-    """
-    Returns available memory in bytes. Gets the total free CUDA VRAM if available.
-    Falls back to available system RAM if CUDA is not available. If max_vram_gb
-    is provided, caps the returned memory.
-    """
-
-    # Determine max memory cap
-    max_memory_bytes = None
-    if max_vram_gb is not None and max_vram_gb > 0:
-        max_memory_bytes = int(max_vram_gb * 1e9)
-
-    # Case 1: CUDA available
-    if torch.cuda.is_available():
-        memory = 0
-        for device in range(torch.cuda.device_count()):
-            free, total = torch.cuda.mem_get_info(device)
-            memory += free
-
-    # Case 2: Fallback to system RAM
-    else:
-        memory = psutil.virtual_memory().available
-
-    # Apply cap if specified
-    if max_memory_bytes is not None:
-        memory = min(memory, max_memory_bytes)
-
-    return int(memory)
 
 
 def find_module(module: nn.Module, target_name: str, ids: list = []):

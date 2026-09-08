@@ -26,8 +26,8 @@ from tensorlink.ml.utils.loading import (
     load_module_weights,
     get_nested_module,
 )
+from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.ml.utils import (
-    get_gpu_memory,
     get_batch_size,
     combine_micro_batches,
     split_micro_batches,

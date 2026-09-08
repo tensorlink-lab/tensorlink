@@ -24,6 +24,8 @@ class UserThread(Torchnode):
         priority_nodes: list = None,
         seed_validators: list = None,
         max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         super(UserThread, self).__init__(
             request_queue,
@@ -36,6 +38,8 @@ class UserThread(Torchnode):
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
             max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
         self.print_level = print_level
         self.distributed_graph = {}

@@ -46,6 +46,8 @@ class ValidatorThread(Torchnode):
         priority_nodes: list = None,
         seed_validators: list = None,
         max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         """
         Initialize a Validator P2P Node.
@@ -61,6 +63,8 @@ class ValidatorThread(Torchnode):
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
             max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
 
         # Additional attributes specific to the Validator class
@@ -1035,6 +1039,12 @@ class ValidatorThread(Torchnode):
         }
 
     def get_network_status(
-        self, days: int = 30, include_weekly: bool = False, include_summary: bool = True
+        self,
+        days: int = 30,
+        include_weekly: bool = False,
+        include_summary: bool = True,
+        include_device=True,
     ) -> Dict:
-        return self.keeper.get_network_status(days, include_weekly, include_summary)
+        return self.keeper.get_network_status(
+            days, include_weekly, include_summary, include_device
+        )

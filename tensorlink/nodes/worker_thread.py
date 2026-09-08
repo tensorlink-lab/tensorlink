@@ -1,4 +1,3 @@
-from tensorlink.ml.utils.utils import get_gpu_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
 from tensorlink.nodes.keeper import Keeper
@@ -19,6 +18,57 @@ class WorkerThread(Torchnode):
             tasks, ie distributing a model too large to handle on a single computer / user
     """
 
+    def __init__(
+        self,
+        request_queue,
+        response_queue,
+        print_level=logging.INFO,
+        max_connections: int = 0,
+        upnp=True,
+        on_chain=False,
+        local_test=False,
+        mining_active=None,
+        duplicate="",
+        load_previous_state=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
+    ):
+        super(WorkerThread, self).__init__(
+            request_queue,
+            response_queue,
+            "W" + duplicate,
+            max_connections=max_connections,
+            upnp=upnp,
+            on_chain=on_chain,
+            local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
+        )
+
+        self.role = "W" + duplicate
+        self.print_level = print_level
+        self.loss = None
+        self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
+        self.keeper = Keeper(self)
+
+        self.debug_print(
+            f"Launching Worker: {self.rsa_key_hash} ({self.host}:{self.port})",
+            level=logging.INFO,
+            tag="Worker",
+        )
+
+        self.mining_active = mining_active
+
+        # Finally, load up previous saved state if any
+        if on_chain or load_previous_state:
+            self.keeper.load_previous_state()
+
     def handle_data(self, data: bytes, node: Connection):
         """
         Handle incoming tensors from connected roles and new job requests
@@ -35,13 +85,7 @@ class WorkerThread(Torchnode):
             # Try worker-related tags if not found in parent class
             if not handled:
                 # Try worker-related tags
-                if b"STATS-REQUEST" == data[:13]:
-                    self.debug_print(
-                        f"Received stats request from: {node.node_id}", tag="Worker"
-                    )
-                    self.handle_statistics_request(node)
-
-                elif b"SHUTDOWN-JOB" == data[:12]:
+                if b"SHUTDOWN-JOB" == data[:12]:
                     if node.role == "V":
                         module_id = data[12:76].decode()
                         self.modules[module_id]["termination"] = True
@@ -76,54 +120,6 @@ class WorkerThread(Torchnode):
                 tag="Worker",
             )
             raise e
-
-    def __init__(
-        self,
-        request_queue,
-        response_queue,
-        print_level=logging.INFO,
-        max_connections: int = 0,
-        upnp=True,
-        on_chain=False,
-        local_test=False,
-        mining_active=None,
-        duplicate="",
-        load_previous_state=False,
-        priority_nodes: list = None,
-        seed_validators: list = None,
-        max_memory_gb: float = None,
-    ):
-        super(WorkerThread, self).__init__(
-            request_queue,
-            response_queue,
-            "W" + duplicate,
-            max_connections=max_connections,
-            upnp=upnp,
-            on_chain=on_chain,
-            local_test=local_test,
-            priority_nodes=priority_nodes,
-            seed_validators=seed_validators,
-            max_memory_gb=max_memory_gb,
-        )
-
-        self.training = False
-        self.role = "W" + duplicate
-        self.print_level = print_level
-        self.loss = None
-        self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
-        self.keeper = Keeper(self)
-
-        self.debug_print(
-            f"Launching Worker: {self.rsa_key_hash} ({self.host}:{self.port})",
-            level=logging.INFO,
-            tag="Worker",
-        )
-
-        self.mining_active = mining_active
-
-        # Finally, load up previous saved state if any
-        if on_chain or load_previous_state:
-            self.keeper.load_previous_state()
 
     def _handle_job_req(self, data: bytes, node: Connection):
         try:
@@ -230,42 +226,6 @@ class WorkerThread(Torchnode):
     #
     #     if self.training:
     #         proof["output"] = handle_output(self.model(dummy_input)).sum()
-
-    def get_available_gpu_memory(self):
-        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
-        reserved_loading_memory = 0
-
-        for module_id, module_info in self.modules.items():
-            # Account for modules that are not in CUDA and are still initializing
-            if module_info.get("status", "loading") == "loading":
-                reserved_loading_memory += module_info["memory"]
-
-        return max(0, available_gpu_memory - reserved_loading_memory)
-
-    def handle_statistics_request(self, callee, additional_context: dict = None):
-        """When a validator requests a stats request, return stats"""
-        self.available_gpu_memory = self.get_available_gpu_memory()
-
-        # If mining is active, report total GPU memory since mining will stop on job acceptance
-        if self.mining_active is not None and self.mining_active.value:
-            self.available_gpu_memory = self.total_gpu_memory
-
-        stats = {
-            "id": self.rsa_key_hash,
-            "gpu_memory": self.available_gpu_memory,
-            "total_gpu_memory": self.total_gpu_memory,
-            "role": self.role,
-            "training": self.training,
-        }
-
-        if additional_context is not None:
-            for k, v in additional_context.items():
-                if k not in stats.keys():
-                    stats[k] = v
-
-        stats_bytes = json.dumps(stats).encode()
-        stats_bytes = b"STATS-RESPONSE" + stats_bytes
-        self.send_to_node(callee, stats_bytes)
 
     def activate(self):
         self.training = True

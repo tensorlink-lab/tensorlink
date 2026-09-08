@@ -11,9 +11,9 @@ from tensorlink.ml.utils.formatter import (
 from tensorlink.ml.utils.utils import (
     load_models_cache,
     save_models_cache,
-    get_gpu_memory,
     attach_tensor,
 )
+from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.api.models import GenerationRequest
 from tensorlink.nodes.job_monitor import JobStatus
 
