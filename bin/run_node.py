@@ -27,8 +27,6 @@ def load_config(config_path="config.json"):
     try:
         with open(config_path, "r") as f:
             config = json.load(f)
-            if config.get("config"):
-                return config.get("config")
             return config
 
     except FileNotFoundError:
@@ -43,9 +41,7 @@ def create_env_file(env_path, config):
     """Create a default .tensorlink.env file if it doesn't exist."""
     if not os.path.exists(env_path):
         with open(env_path, "w") as env_file:
-            env_file.write(
-                f"PUBLIC_KEY={config.get('crypto', {}).get('address', '')}\n"
-            )
+            env_file.write(f"PUBLIC_KEY={config.get('chain', {}).get('address', '')}\n")
 
 
 def check_env_file(env_path):
@@ -155,8 +151,8 @@ def stop_mining(mining_process):
 
 def run_worker_loop(worker, config):
     """Main loop for worker nodes with mining management."""
-    mining_enabled = config.get("crypto", {}).get("mining", False)
-    mining_script = config.get("crypto", {}).get("mining_script", "")
+    mining_enabled = config.get("chain", {}).get("mining", False)
+    mining_script = config.get("chain", {}).get("mining_script", "")
     use_sudo = os.geteuid() == 0
     mining_process = None
 
@@ -223,11 +219,11 @@ def main():
 
     if node_type not in ["worker", "validator"]:
         raise ValueError(
-            f"Invalid node type: {node_type}. Must be 'worker', 'validator', or 'both'"
+            f"Invalid node type: {node_type}. Must be 'worker' or 'validator'."
         )
 
-    max_memory_gb = config.get("ml", {}).get("max_memory_gb", 0)
-    max_module_bytes = config.get("ml", {}).get("max_module_bytes", 1e8)
+    max_memory_gb = config.get("ml", {}).get("max_memory_gb")
+    max_module_gb = config.get("ml", {}).get("max_module_gb")
     enable_hosting = True
 
     # Parse common config
@@ -255,7 +251,7 @@ def main():
                 on_chain=on_chain,
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
-                seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                seed_validators=config.get("chain", {}).get("seed_validators", []),
                 max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,
@@ -275,12 +271,12 @@ def main():
                 endpoint_port=config.get("node", {}).get("endpoint_port", 64747),
                 print_level=log_level,
                 priority_nodes=config.get("node", {}).get("priority_nodes", []),
-                seed_validators=config.get("crypto", {}).get("seed_validators", []),
+                seed_validators=config.get("chain", {}).get("seed_validators", []),
+                max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,
-            max_memory_gb=max_memory_gb,
-            max_module_bytes=int(max_module_bytes),
             enable_hosting=enable_hosting,
+            max_module_gb=max_module_gb,
         )
         run_validator_loop(validator)
 
