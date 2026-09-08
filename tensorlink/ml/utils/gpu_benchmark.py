@@ -9,10 +9,8 @@ import os
 from typing import Optional, Tuple, Dict
 
 
-
 DEVICE_PROFILE_PATH = "logs/device_profile.json"
 PROFILE_VERSION = 1
-
 
 
 def _load_cached_profile() -> Optional[Dict]:
@@ -58,8 +56,7 @@ def _profile_matches_current_hardware(cached: Dict, current_info: Dict) -> bool:
     cached_info = cached.get("device_info") or {}
     identity_fields = ("backend", "name")
     return all(
-        cached_info.get(field) == current_info.get(field)
-        for field in identity_fields
+        cached_info.get(field) == current_info.get(field) for field in identity_fields
     )
 
 
