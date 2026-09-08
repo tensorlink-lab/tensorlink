@@ -52,7 +52,8 @@ def uwv_nodes(print_level):
             local_test=LOCAL,
             print_level=print_level,
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
 
     validator = Validator(
@@ -68,6 +69,7 @@ def uwv_nodes(print_level):
         ),
         enable_hosting=ENABLE_HOSTED_MODULES,
         max_module_gb=MAX_MODULE_GB,
+        benchmark=False,
     )
 
     worker = Worker(
@@ -78,7 +80,8 @@ def uwv_nodes(print_level):
             print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
 
     time.sleep(1)
@@ -111,6 +114,7 @@ def wwv_nodes(print_level):
         ),
         enable_hosting=ENABLE_HOSTED_MODULES,
         max_module_gb=MAX_MODULE_GB,
+        benchmark=False,
     )
 
     worker = Worker(
@@ -121,7 +125,8 @@ def wwv_nodes(print_level):
             print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
 
     worker2 = Worker(
@@ -133,7 +138,8 @@ def wwv_nodes(print_level):
             load_previous_state=False,
             duplicate="1",
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
 
     time.sleep(1)

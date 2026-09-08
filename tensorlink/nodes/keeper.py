@@ -33,8 +33,7 @@ THIRTY_DAYS_SECONDS = 60 * 60 * 24 * 30
 SEVEN_DAYS_SECONDS = 60 * 60 * 24 * 7
 ONE_DAY_SECONDS = 60 * 60 * 24
 CLEAN_ARCHIVE_FREQ = 10
-
-MAX_DAILY_STATS = 730
+MAX_DAILY_STATS = 1093
 
 
 def _normalize_daily_stat(stat: Dict) -> Dict:
@@ -572,7 +571,7 @@ class Keeper:
             }
 
             if include_weekly:
-                weekly_stats = self.get_weekly_statistics(12)
+                weekly_stats = self.get_weekly_statistics(days // 7)
                 result["weekly"] = {
                     "labels": [s["week"] for s in weekly_stats],
                     "datasets": {

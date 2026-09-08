@@ -326,7 +326,7 @@ class TensorlinkAPI:
 
         @self.app.get("/network-history")
         async def get_network_history(
-            days: int = Query(30, ge=1, le=90),
+            days: int = Query(30, ge=1, le=1093),
             include_weekly: bool = False,
             include_summary: bool = True,
             include_device: bool = False,
