@@ -6,9 +6,9 @@ from tensorlink.ml.utils import (
     handle_output,
     enable_grad,
     get_optimizer_from_spec,
+    resolve_dtype,
 )
 from tensorlink.ml.utils.loading import (
-    TiedLinear,
     load_full_model,
     load_model_skeleton,
     ModelCacheManager,
@@ -17,13 +17,12 @@ from tensorlink.ml.utils.loading import (
     get_nested_module,
 )
 from tensorlink.ml.utils.injector import LayerGroupModule
-from tensorlink.nodes.shared_memory import (
+from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
 )
 
 import gc
-import inspect
 import json
 import logging
 import os
@@ -32,7 +31,7 @@ import time
 from threading import Thread
 import torch
 import torch.amp as amp
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from transformers.generation.streamers import BaseStreamer
 
 
@@ -97,6 +96,7 @@ class DistributedWorker:
         )
 
         self.modules = {}
+        self.module_paths = {}
         self.optimizers = {}
         self.terminate = False
         self.trusted = trusted
@@ -180,7 +180,7 @@ class DistributedWorker:
         if module.training:
             # Get tensor from shared memory
             tensor_bytes = get_from_shared_memory(
-                loss_relay[0], loss_relay[1], encoded=True
+                loss_relay[0], loss_relay[1], encoding=None
             )
             tensor = bytes_to_tensor(tensor_bytes)
 
@@ -227,7 +227,7 @@ class DistributedWorker:
 
             # Store pass in shared memory and send to next node
             dvalues_bytes = tensor_to_bytes(dvalues)
-            size, name = store_in_shared_memory(dvalues_bytes, encoded=True)
+            size, name = store_in_shared_memory(dvalues_bytes, encoding=None)
             self.send_request("send_backward", (next_node, size, name, tag))
 
             # Strategic memory management - clear only when necessary
@@ -236,64 +236,152 @@ class DistributedWorker:
 
     def _handle_forward(self, module_id, key, size, name):
         """Handle forward pass with proper KV cache structure preservation"""
-        module = self.modules[module_id]
+        module_path = "-"
+        try:
+            module = self.modules[module_id]
+            module_path = self.module_paths[module_id]
 
-        # Get data from shared memory
-        data = get_from_shared_memory(size, name, encoded=True)
-        args_len = int.from_bytes(data[:8], "big")
-        args_bytes = data[8 : 8 + args_len]
-        kwargs_bytes = data[8 + args_len :]
+            # Get data from shared memory
+            data = get_from_shared_memory(size, name, encoding=None)
+            args_len = int.from_bytes(data[:8], "big")
+            args_bytes = data[8 : 8 + args_len]
+            kwargs_bytes = data[8 + args_len :]
+            args = bytes_to_tensor(args_bytes)
+            kwargs = bytes_to_tensor(kwargs_bytes)
+            inp = attach_tensor(args, self.device)
+            kwargs = attach_tensor(kwargs, self.device)
 
-        args = bytes_to_tensor(args_bytes)
-        kwargs = bytes_to_tensor(kwargs_bytes)
+            if module.training:
+                inp = enable_grad(inp)
+                kwargs = enable_grad(kwargs)
 
-        inp = attach_tensor(args, self.device)
-        kwargs = attach_tensor(kwargs, self.device)
+            if not isinstance(inp, (list, tuple)):
+                inp = (inp,)
 
-        if module.training:
-            inp = enable_grad(inp)
-            kwargs = enable_grad(kwargs)
+            # recv_report = debug_structure(
+            #     {"args": inp, "kwargs": kwargs},
+            #     name=f"[RECV] module_id={module_id} path={module_path}",
+            # )
+            # self.send_request(
+            #     "debug_print",
+            #     (f"DistributedWorker -> {recv_report}", "magenta", logging.DEBUG),
+            # )
 
-        if not isinstance(inp, (list, tuple)):
-            inp = (inp,)
-
-        # Forward pass
-        if self.use_amp and module.training:
-            with amp.autocast():
-                out = module(*inp, **kwargs)
-        else:
-            with torch.set_grad_enabled(module.training):
-                # we only use kwargs if this is a layer group module
-                if hasattr(module, "num_layers"):
-                    out = module(**kwargs)
+            # Forward pass
+            try:
+                if self.use_amp and module.training:
+                    with amp.autocast():
+                        out = module(*inp, **kwargs)
                 else:
-                    out = module(*inp, **kwargs)
+                    with torch.set_grad_enabled(module.training):
+                        # we only use kwargs if this is a layer group module
+                        if hasattr(module, "num_layers"):
+                            out = module(**kwargs)
+                        else:
+                            out = module(*inp, **kwargs)
+            except Exception as fwd_err:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"DistributedWorker -> [FORWARD FAILED] module_id={module_id} "
+                        f"path={module_path}: {fwd_err}",
+                        "red",
+                        logging.ERROR,
+                    ),
+                )
+                # self.send_request(
+                #     "report_module_error",
+                #     (module_id, "forward", str(fwd_err)),
+                # )
+                return
 
-        # Store intermediate results if training
-        if module.training:
-            module.intermediates[key] = {
-                "inputs": inp,
-                "output": handle_output(out),
-            }
+            # Store intermediate results if training
+            if module.training:
+                try:
+                    module.intermediates[key] = {
+                        "inputs": inp,
+                        "output": handle_output(out),
+                    }
+                except Exception as store_err:
+                    self.send_request(
+                        "debug_print",
+                        (
+                            f"DistributedWorker -> [INTERMEDIATE STORE FAILED] "
+                            f"module_id={module_id} path={module_path}: {store_err}",
+                            "red",
+                            logging.ERROR,
+                        ),
+                    )
+                    # self.send_request(
+                    #     "report_module_error",
+                    #     (module_id, "store_intermediate", str(store_err)),
+                    # )
+                    return
 
-        # Detach and store output
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            # send_report = debug_structure(
+            #     out,
+            #     name=f"[SEND] module_id={module_id} path={module_path}",
+            # )
+            # self.send_request(
+            #     "debug_print",
+            #     (f"DistributedWorker -> {send_report}", "cyan", logging.DEBUG),
+            # )
 
-        detached_out = detach_tensor(out)
+            # Detach and store output
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        output_bytes = tensor_to_bytes(detached_out)
-        size, name = store_in_shared_memory(output_bytes)
+            detached_out = detach_tensor(out)
+            output_bytes = tensor_to_bytes(detached_out)
+            out_size, out_name = store_in_shared_memory(output_bytes, encoding=None)
 
-        self.send_request("send_forward", (module.host, module_id, size, name, key))
+            self.send_request(
+                "send_forward", (module.host, module_id, out_size, out_name, key)
+            )
 
-        # Incremental training counter
-        if module.training:
-            module.n_batch += 1
+            # Incremental training counter
+            if module.training:
+                module.n_batch += 1
 
-        # Strategic memory management
-        if self.device.type == "cuda" and module.n_batch % 20 == 0:
-            torch.cuda.empty_cache()
+            # Strategic memory management
+            if self.device.type == "cuda" and module.n_batch % 20 == 0:
+                torch.cuda.empty_cache()
+
+        except KeyError:
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [UNKNOWN MODULE] module_id={module_id} "
+                    f"not found in self.modules",
+                    "red",
+                    logging.ERROR,
+                ),
+            )
+            # self.send_request(
+            #     "report_module_error",
+            #     (module_id, "unknown_module", "module_id not found on worker"),
+            # )
+
+        except Exception as e:
+            logging.error(
+                f"Unhandled error in _handle_forward for module_id={module_id} "
+                f"path={module_path}: {e}",
+                exc_info=True,
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [ERROR] module_id={module_id} "
+                    f"path={module_path}: {e}",
+                    "red",
+                    logging.ERROR,
+                ),
+            )
+            # TODO:
+            # self.send_request(
+            #     "report_module_error",
+            #     (module_id, "unhandled", str(e)),
+            # )
 
     def _handle_generate(self, module_id, size, name, stream):
         """
@@ -301,7 +389,7 @@ class DistributedWorker:
         if we have a full model loaded and not a submodule.
         """
         module = self.modules[module_id]
-        payload = get_from_shared_memory(size, name, encoded=True)
+        payload = get_from_shared_memory(size, name, encoding=None)
 
         # Deserialize
         args_bytes, kwargs_bytes = payload.split(b"::")
@@ -340,7 +428,7 @@ class DistributedWorker:
 
                 output_bytes = tensor_to_bytes(detach_tensor(output))
 
-                size, name = store_in_shared_memory(output_bytes)
+                size, name = store_in_shared_memory(output_bytes, encoding=None)
                 self.send_request(
                     "send_forward", (host_id, module_id, size, name, "generate")
                 )
@@ -369,7 +457,7 @@ class DistributedWorker:
             if stream:
                 self._send_stream_end(module_id, host_id)
 
-        size, name = store_in_shared_memory(output_bytes)
+        size, name = store_in_shared_memory(output_bytes, encoding=None)
         self.send_request("send_forward", (host_id, module_id, size, name, "generate"))
 
         if self.device.type == "cuda":
@@ -396,48 +484,64 @@ class DistributedWorker:
         module_name = module_info.get("module_name")
         training = module_info.get("training", False)
         our_id = module_info.get("assigned_workers")[0]
-        file_name = module_id + our_id
 
-        if module_id is None:
-            raise ValueError("For standard loading, module_id must be provided")
+        try:
+            file_name = module_id + our_id
 
-        # Clear memory before loading
-        self.cleanup_memory()
+            if module_id is None:
+                raise ValueError("For standard loading, module_id must be provided")
 
-        # Try to load the module based on trusted status
-        if self.trusted:
-            with open(file_name, "rb") as f:
-                module = pickle.load(f)
-                module = module.to(self.device)
-
-        # Else try Hugging Face for model info
-        else:
-            skeleton_module = load_model_skeleton(model_name)
-            module = self._initialize_module_from_config(
-                skeleton_module, model_name, module_name, module_info
-            )
-
-            # Ensure skeleton cleanup
-            del skeleton_module
+            # Clear memory before loading
             self.cleanup_memory()
 
-        # Cleanup file
-        try:
-            os.remove(file_name)
-        except:
-            pass
+            # Try to load the module based on trusted status
+            if self.trusted:
+                with open(file_name, "rb") as f:
+                    module = pickle.load(f)
+                    module = module.to(self.device)
 
-        # Initialize storage structures
-        module.intermediates = {}
-        module.host = module_info.get('host')
-        module.n_batch = 0
+            # Else try Hugging Face for model info
+            else:
+                skeleton_module = load_model_skeleton(model_name)
+                module = self._initialize_module_from_config(
+                    skeleton_module, model_name, module_name, module_info
+                )
 
-        self.modules[module_id] = module
-        if training:
-            optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
-            self.optimizers[module_id] = optimizer_cls
+                # Ensure skeleton cleanup
+                del skeleton_module
+                self.cleanup_memory()
 
-        self.send_request("module_loaded", module_id)
+            # Cleanup file
+            try:
+                os.remove(file_name)
+            except:
+                pass
+
+            # Initialize storage structures
+            module.intermediates = {}
+            module.host = module_info.get('host')
+            module.n_batch = 0
+
+            self.modules[module_id] = module
+            self.module_paths[module_id] = module_info.get("module_path", "")
+
+            if training:
+                optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
+                self.optimizers[module_id] = optimizer_cls
+
+            self.send_request("send_module_status", (module_id, "loaded"))
+
+        except Exception as e:
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> Module loading error: {e}",
+                    "red",
+                    logging.ERROR,
+                ),
+            )
+
+            self.send_request("send_module_status", (module_id, "error"))
 
     def _initialize_module_from_config(
         self,
@@ -461,14 +565,14 @@ class DistributedWorker:
                     model_name, skeleton_module, module_id, module_info
                 )
             else:
-                # Load single module
+                # Load single module / entire model
                 return self._load_single_module(
                     model_name, skeleton_module, module_info
                 )
 
         except Exception as e:
             # Make sure skeleton is cleaned up on error
-            err = f"Failed to load model from HuggingFace: {str(e)}"
+            err = f"Failed to load model from HuggingFace: {e}"
             self.send_request(
                 "debug_print",
                 (
@@ -669,31 +773,52 @@ class DistributedWorker:
                 ),
             )
 
-    def _load_single_module(
-        self, model_name: str, base_model: torch.nn.Module, module_info: Dict[str, Any]
-    ) -> torch.nn.Module:
-        """
-        Load a single module (e.g., just the RMSNorm layer).
-        Uses empty weights initialization and only loads required module weights.
-        """
+    def _load_single_module(self, model_name, base_model, module_info):
         module_path = module_info.get("module_path", "")
         module_class_name = module_info.get("module", "")
+        tied_to = module_info.get("tied_to", "")
 
         if not module_path or module_path == "model":
             del base_model
             self.cleanup_memory()
             return self._load_full_model(model_name, module_info)
 
-        # Otherwise proceed with submodule extraction
-        tied_to = module_info.get("tied_to", "")
+        if tied_to:
+            tied_id = None
+            for _module_id, _module_path in self.module_paths.items():
+                if tied_to == _module_path:
+                    tied_id = _module_id
+
+            if tied_id is None:
+                raise RuntimeError(
+                    f"Cannot tie {module_path} -> {tied_to}: "
+                    "source module has not been loaded."
+                )
+
+            source_module = self.modules[tied_id]
+            # Get the actual lm_head module from the base model.
+            target_module = get_nested_module(base_model, module_path)
+
+            if not hasattr(source_module, "weight"):
+                raise RuntimeError(
+                    f"Cannot tie {module_path} -> {tied_to}: "
+                    "source module has no weight."
+                )
+
+            # Preserve the actual Linear module, but share the embedding Parameter.
+            target_module.weight = source_module.weight
+
+            del base_model
+            self.cleanup_memory()
+
+            return target_module
+
+        # Loading case for a single, un-tied module
         effective_path = tied_to or module_path
         target_module = get_nested_module(base_model, effective_path)
-
         del base_model
         self.cleanup_memory()
-
         model_path = self.cache_manager.load_model_path(model_name)
-
         load_module_weights(
             model_path=model_path,
             module_path=effective_path,
@@ -701,25 +826,12 @@ class DistributedWorker:
             module_info=module_info,
             device=self.device,
             log_fn=lambda x: self.send_request(
-                "debug_print",
-                (
-                    x,
-                    "cyan",
-                    logging.DEBUG,
-                ),
+                "debug_print", (x, "cyan", logging.DEBUG)
             ),
             warn_fn=lambda x: self.send_request(
-                "debug_print",
-                (
-                    x,
-                    "red",
-                    logging.WARNING,
-                ),
+                "debug_print", (x, "red", logging.WARNING)
             ),
         )
-
-        if tied_to and module_class_name == "Linear":
-            return TiedLinear(target_module.weight)
 
         return target_module
 
@@ -730,7 +842,8 @@ class DistributedWorker:
         """
         model_type = module_info.get('model_type', 'chat')
         self.cleanup_memory()
-        return load_full_model(model_name, model_type, self.device)
+        dtype = resolve_dtype(model_name, self.device)
+        return load_full_model(model_name, model_type, self.device, torch_dtype=dtype)
 
     def process_state_update(self, module_id, state_update):
         """Process optimizer state updates"""
@@ -830,6 +943,7 @@ class DistributedWorker:
                 if self.modules[args].training:
                     del self.optimizers[args]
                 del self.modules[args]
+                self.module_paths.pop(args, None)
 
                 gc.collect()
                 if self.device.type == "cuda":
@@ -916,3 +1030,19 @@ class DistributedWorker:
         # Final cleanup
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def _find_loaded_module_by_path(
+        self, module_path: str
+    ) -> Optional[torch.nn.Module]:
+        """
+        Return the already-loaded module resident on this worker whose
+        module_path matches, or None if it isn't loaded here yet.
+
+        Paths are written by the same graphing.py logic on both sides
+        (tied_embed_path/tied_lm_head_path are built as f"model.{name}"),
+        so exact string equality is sufficient, no prefix fuzzing needed here.
+        """
+        for module_id, path in self.module_paths.items():
+            if path == module_path:
+                return self.modules.get(module_id)
+        return None

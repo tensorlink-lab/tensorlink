@@ -1,4 +1,3 @@
-# tests/conftest.py
 from tensorlink.nodes import (
     User,
     Validator,
@@ -18,11 +17,30 @@ PRINT_LEVEL = 5  # Custom logging print level for VERBOSE
 ON_CHAIN = False
 LOCAL = True
 UPNP = False
-MAX_MEMORY_GB = 0.4
+ENABLE_HOSTED_MODULES = True
+
+# These two values were hand-picked to illict
+MAX_MEMORY_GB = 0.35
+MAX_MODULE_GB = 0.05
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--print-level",
+        action="store",
+        default=5,
+        type=int,
+        help="Tensorlink node print level",
+    )
+
+
+@pytest.fixture(scope="session")
+def print_level(pytestconfig):
+    return pytestconfig.getoption("--print-level")
 
 
 @pytest.fixture(scope="module")
-def uwv_nodes():
+def uwv_nodes(print_level):
     """
     Create User-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -32,8 +50,10 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
-        )
+            print_level=print_level,
+            max_memory_gb=MAX_MEMORY_GB,
+        ),
+        benchmark=False,
     )
 
     validator = Validator(
@@ -41,14 +61,15 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             endpoint=False,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         ),
-        enable_hosting=True,
-        max_memory_gb=MAX_MEMORY_GB,
-        max_module_bytes=int(1e8),
+        enable_hosting=ENABLE_HOSTED_MODULES,
+        max_module_gb=MAX_MODULE_GB,
+        benchmark=False,
     )
 
     worker = Worker(
@@ -56,11 +77,14 @@ def uwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
+
+    time.sleep(1)
 
     yield user, worker, validator
 
@@ -72,7 +96,7 @@ def uwv_nodes():
 
 
 @pytest.fixture(scope="module")
-def wwv_nodes():
+def wwv_nodes(print_level):
     """
     Create Worker-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -82,14 +106,15 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             endpoint=True,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
+            max_memory_gb=MAX_MEMORY_GB,
         ),
-        enable_hosting=True,
-        max_memory_gb=0,
-        max_module_bytes=int(1e6),
+        enable_hosting=ENABLE_HOSTED_MODULES,
+        max_module_gb=MAX_MODULE_GB,
+        benchmark=False,
     )
 
     worker = Worker(
@@ -97,10 +122,11 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
 
     worker2 = Worker(
@@ -108,12 +134,15 @@ def wwv_nodes():
             upnp=UPNP,
             on_chain=ON_CHAIN,
             local_test=LOCAL,
-            print_level=PRINT_LEVEL,
+            print_level=print_level,
             load_previous_state=False,
             duplicate="1",
             max_memory_gb=MAX_MEMORY_GB,
-        )
+        ),
+        benchmark=False,
     )
+
+    time.sleep(1)
 
     yield worker, worker2, validator
 
@@ -131,7 +160,7 @@ def connected_uwv_nodes(uwv_nodes):
     """
     user, worker, validator = uwv_nodes
 
-    time.sleep(1)
+    time.sleep(3)
 
     val_key, val_host, val_port = validator.send_request("info", None)
 
@@ -151,9 +180,10 @@ def connected_wwv_nodes(wwv_nodes):
     """
     worker, worker2, validator = wwv_nodes
 
+    time.sleep(3)
+
     val_key, val_host, val_port = validator.send_request("info", None)
 
-    time.sleep(1)
     worker.connect_node(val_host, val_port, node_id=val_key, timeout=10)
     time.sleep(1)
     worker2.connect_node(val_host, val_port, node_id=val_key, timeout=10)

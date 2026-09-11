@@ -1,4 +1,3 @@
-from tensorlink.ml.utils.utils import get_gpu_memory
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
 from tensorlink.nodes.keeper import Keeper
@@ -29,11 +28,13 @@ class WorkerThread(Torchnode):
         on_chain=False,
         local_test=False,
         mining_active=None,
-        max_memory_gb=0,
         duplicate="",
         load_previous_state=False,
         priority_nodes: list = None,
         seed_validators: list = None,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         super(WorkerThread, self).__init__(
             request_queue,
@@ -46,9 +47,10 @@ class WorkerThread(Torchnode):
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
             max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
 
-        self.training = False
         self.role = "W" + duplicate
         self.print_level = print_level
         self.loss = None
@@ -83,13 +85,7 @@ class WorkerThread(Torchnode):
             # Try worker-related tags if not found in parent class
             if not handled:
                 # Try worker-related tags
-                if b"STATS-REQUEST" == data[:13]:
-                    self.debug_print(
-                        f"Received stats request from: {node.node_id}", tag="Worker"
-                    )
-                    self.handle_statistics_request(node)
-
-                elif b"SHUTDOWN-JOB" == data[:12]:
+                if b"SHUTDOWN-JOB" == data[:12]:
                     if node.role == "V":
                         module_id = data[12:76].decode()
                         self.modules[module_id]["termination"] = True
@@ -230,42 +226,6 @@ class WorkerThread(Torchnode):
     #
     #     if self.training:
     #         proof["output"] = handle_output(self.model(dummy_input)).sum()
-
-    def get_available_gpu_memory(self):
-        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
-        reserved_loading_memory = 0
-
-        for module_id, module_info in self.modules.items():
-            # Account for modules that are not in CUDA and are still initializing
-            if module_info.get("status", "loading") == "loading":
-                reserved_loading_memory += module_info["memory"]
-
-        return max(0, available_gpu_memory - reserved_loading_memory)
-
-    def handle_statistics_request(self, callee, additional_context: dict = None):
-        """When a validator requests a stats request, return stats"""
-        self.available_gpu_memory = self.get_available_gpu_memory()
-
-        # If mining is active, report total GPU memory since mining will stop on job acceptance
-        if self.mining_active is not None and self.mining_active.value:
-            self.available_gpu_memory = self.total_gpu_memory
-
-        stats = {
-            "id": self.rsa_key_hash,
-            "gpu_memory": self.available_gpu_memory,
-            "total_gpu_memory": self.total_gpu_memory,
-            "role": self.role,
-            "training": self.training,
-        }
-
-        if additional_context is not None:
-            for k, v in additional_context.items():
-                if k not in stats.keys():
-                    stats[k] = v
-
-        stats_bytes = json.dumps(stats).encode()
-        stats_bytes = b"STATS-RESPONSE" + stats_bytes
-        self.send_to_node(callee, stats_bytes)
 
     def activate(self):
         self.training = True

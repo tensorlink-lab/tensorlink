@@ -1,6 +1,6 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
-from tensorlink.nodes.contract_manager import ContractManager
+from tensorlink.eth.contract_manager import ContractManager
 from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
@@ -45,6 +45,9 @@ class ValidatorThread(Torchnode):
         load_previous_state=False,
         priority_nodes: list = None,
         seed_validators: list = None,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         """
         Initialize a Validator P2P Node.
@@ -59,6 +62,9 @@ class ValidatorThread(Torchnode):
             local_test=local_test,
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
 
         # Additional attributes specific to the Validator class
@@ -552,12 +558,12 @@ class ValidatorThread(Torchnode):
             node.role != "U" or not node_info or node_info["reputation"] < 50
         ):  # TODO reputation
             node.ghosts += 1
-        # Trigger HF model loading path
+        # HF model loading path
         elif job_req.get("model_name"):
             threading.Thread(
                 target=self.create_hf_job, args=(job_req, node.host)
             ).start()
-        # Trigger generic torch model loading path
+        # Custom torch model loading path
         else:
             threading.Thread(target=self.create_base_job, args=(job_req,)).start()
 
@@ -615,6 +621,7 @@ class ValidatorThread(Torchnode):
 
         # Store job info in DHT
         self.dht.store(job_id, job_data)
+        self.jobs.append(job_id)
 
         # Recruit the workers
         worker_connection_info = self._assign_workers_to_modules(
@@ -742,6 +749,7 @@ class ValidatorThread(Torchnode):
             self.decline_job(requesting_node, reason)
 
     def _assign_workers_to_modules(self, modules, author, job_id, job_data):
+        """Recruit workers and load their assigned modules"""
         worker_connection_info = {}
         groups = {}
         job_data["worker_modules"] = {}
@@ -754,9 +762,9 @@ class ValidatorThread(Torchnode):
                 self.recruit_worker(worker_id, author, job_id, module_info, module_id)
                 job_data["worker_modules"][worker_id] = module_id
                 worker_connection_info[module_id] = worker_id
-            else:
-                # Hosted modules on our device
-                groups[module_id] = module_info
+
+            # For both offloaded and hosted modules, store module info
+            groups[module_id] = module_info
 
         job_data["distribution"] = groups
 
@@ -801,6 +809,7 @@ class ValidatorThread(Torchnode):
                     "assigned_workers": [worker_id],
                     "distribution": module_info,
                     "public": job_data.get("public", True),
+                    "status": "inactive",
                 }
                 self.state_updates[module_id] = []
 
@@ -815,13 +824,12 @@ class ValidatorThread(Torchnode):
                     return
 
     def _finalize_job(self, job_id, job_data):
+        """Begin the job monitoring thread"""
         self.response_queue.put({"status": "SUCCESS", "return": job_data})
 
-        self.jobs.append(job_id)
-
+        # Update dht with latest job rendition to be safe
         job_data["timestamp"] = time.time()
         job_data["last_seen"] = time.time()
-
         self.dht.store(job_id, job_data)
 
         job_monitor = JobMonitor(self)
@@ -857,19 +865,20 @@ class ValidatorThread(Torchnode):
         )
 
         # Send a job request to the worker
-        self._store_request(node.node_id, job_id + module_id)
+        worker_recruitment_id = job_id + module_id
+        self._store_request(node.node_id, worker_recruitment_id)
         self.send_to_node(node, data)
 
         # Await 3 seconds for the job request
         timeout = 3
         start_time = time.time()
-        while module_id in self.requests[node.node_id]:
+        while worker_recruitment_id in self.requests[node.node_id]:
             if time.time() - start_time > timeout:
                 self.debug_print(
                     f"Worker: '{worker_id}' timed out during recruitment request.",
                     tag="Validator",
                 )
-                self.requests[node.node_id].remove(module_id)
+                self.requests[node.node_id].remove(worker_recruitment_id)
                 return False
 
         # Worker accepted the job, update stats
@@ -1030,6 +1039,12 @@ class ValidatorThread(Torchnode):
         }
 
     def get_network_status(
-        self, days: int = 30, include_weekly: bool = False, include_summary: bool = True
+        self,
+        days: int = 30,
+        include_weekly: bool = False,
+        include_summary: bool = True,
+        include_device=True,
     ) -> Dict:
-        return self.keeper.get_network_status(days, include_weekly, include_summary)
+        return self.keeper.get_network_status(
+            days, include_weekly, include_summary, include_device
+        )

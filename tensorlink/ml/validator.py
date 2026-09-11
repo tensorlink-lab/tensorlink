@@ -11,9 +11,9 @@ from tensorlink.ml.utils.formatter import (
 from tensorlink.ml.utils.utils import (
     load_models_cache,
     save_models_cache,
-    get_gpu_memory,
     attach_tensor,
 )
+from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.api.models import GenerationRequest
 from tensorlink.nodes.job_monitor import JobStatus
 
@@ -137,14 +137,24 @@ class DistributedValidator(DistributedWorker):
         trusted: bool = False,
         endpoint: bool = True,
         enable_hosting: bool = False,
-        max_vram_gb: float = 0,
-        max_module_bytes: int = 0,
+        max_memory_gb: float = 0,
+        max_module_gb: float = 0,
     ):
+        """
+        Args:
+
+        """
         super().__init__(node, trusted)
         self.endpoint = endpoint
         self._hosting_enabled = enable_hosting
-        self._max_vram_bytes = max_vram_gb * 1e9  # Convert to bytes
-        self._max_module_bytes = max_module_bytes
+
+        self._max_memory_bytes = int(max_memory_gb * 1e9)  # Convert to bytes
+        self._max_module_bytes = int(max_module_gb * 1e9)
+
+        if not self._hosting_enabled:
+            self._max_module_bytes = 0
+            self._max_memory_bytes = 0
+
         self.model_cache = load_models_cache()
         self.models = {}  # job_id -> model instance
         self.model_state = (
@@ -371,105 +381,102 @@ class DistributedValidator(DistributedWorker):
         self, model_name: str, job_data: dict, hosted: bool = False
     ) -> dict:
         """Inspect a model to determine network requirements and store distribution in JSON cache"""
+        parser = ModelParser()
+        model_name: str = job_data.get("model_name", model_name)
+
+        # Get network worker information to assign modules
+        workers = self.send_request("get_workers", None)
+
+        batch_size = job_data.get("batch_size", None)
+
+        if batch_size is None:
+            if job_data.get("training", False):
+                batch_size = 256
+            else:
+                batch_size = 1
+
+        if job_data.get("optimizer") is None:
+            optimizer_type = "adam"
+            optimizer_spec = {}
+        else:
+            optimizer_type = job_data["optimizer"]["type"]
+            optimizer_spec = job_data.get("optimizer")
+
+        # Get available host memory accounting for concurrent initializations
+        if hosted:
+            available_host_memory = self._get_available_host_memory()
+            host_memory_budget = available_host_memory
+        else:
+            host_memory_budget = 0
+            # host_memory_budget = job_data.get("available_memory", 0)
+
+        # Load HF model, create and save distribution
+        distribution = parser.create_distributed_config(
+            model_name,
+            workers=workers,
+            training=job_data.get("training", False),
+            trusted=False,
+            input_obfuscation=False,
+            optimizer_type=optimizer_type,
+            optimizer_spec=optimizer_spec,
+            host_max_memory_bytes=host_memory_budget,
+            host_max_module_bytes=self._max_module_bytes,
+            host_max_depth=1,
+            max_offload_depth=3,
+            batch_size=job_data.get("batch_size", batch_size),
+            max_seq_len=job_data.get("max_seq_len", 4096),
+            model_type=job_data.get("model_type", "chat"),
+            force_tied_to_host=True if host_memory_budget > 0 else False,
+        )
+
+        job_data["distribution"] = distribution
+
+        offloaded_count = sum(
+            1
+            for v in distribution["config"].values()
+            if "offloaded" in v.get("type", "")
+        )
+
+        if (
+            len(distribution["config"]) == 0
+            or offloaded_count
+            > 6  # TODO This limit on number of distributions is not ideal
+            or not distribution["success"]
+        ):
+            return {}
+
+        if job_data.get("id") is None:
+            job_data["time"] = time.time()
+            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
+            job_data["id"] = job_id
+
+        # Reserve the host memory this model will use
+        host_memory_used = distribution.get("host_memory_used", 0)
+        if host_memory_used > 0:
+            self._reserve_host_memory(job_data["id"], host_memory_used)
+
+        # Store distribution in JSON cache
+        self._ensure_model_entry(model_name)
+        self.model_cache[model_name]["distribution"] = distribution
+        save_models_cache(self.model_cache)
+
+        self.send_request(
+            "debug_print",
+            (
+                f"DistributedValidator -> Retrieved HF model: {job_data}, Reserved: {host_memory_used / 1e9:.2f}GB",
+                "bright_blue",
+                logging.DEBUG,
+            ),
+        )
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Send out job request
         try:
-            parser = ModelParser()
-            model_name: str = job_data.get("model_name", model_name)
-
-            # Get network worker information to assign modules
-            workers = self.send_request("get_workers", None)
-
-            batch_size = job_data.get("batch_size", None)
-
-            if batch_size is None:
-                if job_data.get("training", False):
-                    batch_size = 256
-                else:
-                    batch_size = 1
-
-            if job_data.get("optimizer") is None:
-                optimizer_type = "adam"
-                optimizer_spec = {}
-            else:
-                optimizer_type = job_data["optimizer"]["type"]
-                optimizer_spec = job_data.get("optimizer")
-
-            # Get available host memory accounting for concurrent initializations
-            if hosted:
-                available_host_memory = self._get_available_host_memory()
-                host_memory_budget = available_host_memory
-            else:
-                host_memory_budget = 0
-
-            # Load HF model, create and save distribution
-            distribution = parser.create_distributed_config(
-                model_name,
-                workers=workers,
-                training=job_data.get("training", False),
-                trusted=False,
-                input_obfuscation=False,
-                optimizer_type=optimizer_type,
-                optimizer_spec=optimizer_spec,
-                host_max_memory_bytes=host_memory_budget,
-                host_max_module_bytes=self._max_module_bytes,
-                host_max_depth=1,
-                max_offload_depth=3,
-                batch_size=job_data.get("batch_size", batch_size),
-                max_seq_len=job_data.get("max_seq_len", 4096),
-                model_type=job_data.get("model_type", "chat"),
-            )
-
-            job_data["distribution"] = distribution
-
-            offloaded_count = sum(
-                1
-                for v in distribution["config"].values()
-                if "offloaded" in v.get("type", "")
-            )
-
-            if (
-                len(distribution["config"]) == 0
-                or offloaded_count
-                > 6  # TODO This limit on number of distributions is not ideal
-                or not distribution["success"]
-            ):
-                return {}
-
-            if job_data.get("id") is None:
-                job_data["time"] = time.time()
-                job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
-                job_data["id"] = job_id
-
-            # Reserve the host memory this model will use
-            host_memory_used = distribution.get("host_memory_used", 0)
-            if host_memory_used > 0:
-                self._reserve_host_memory(job_data["id"], host_memory_used)
-
-            # Store distribution in JSON cache
-            self._ensure_model_entry(model_name)
-            self.model_cache[model_name]["distribution"] = distribution
-            save_models_cache(self.model_cache)
-
-            self.send_request(
-                "debug_print",
-                (
-                    f"DistributedValidator -> Retrieved HF model: {job_data}, Reserved: {host_memory_used / 1e9:.2f}GB",
-                    "bright_blue",
-                    logging.DEBUG,
-                ),
-            )
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # Send out job request
-            try:
-                new_job_data = self.send_request("send_job_request", job_data)
-                return new_job_data
-
-            except Exception as e:
-                self._release_host_memory(job_data["id"])
-                raise e
+            new_job_data = self.send_request("send_job_request", job_data)
+            return new_job_data
 
         except Exception as e:
             self._release_host_memory(job_data["id"])
@@ -551,7 +558,7 @@ class DistributedValidator(DistributedWorker):
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedValidator -> Error checking for jobs: {str(e)}",
+                    f"DistributedValidator -> Error checking for jobs: {e}",
                     "bright_red",
                     logging.ERROR,
                 ),
@@ -961,6 +968,7 @@ class DistributedValidator(DistributedWorker):
             if job_data.get("public"):
                 self.public_models[model_name].append(job_id)
 
+            self.send_request("update_job_status", (job_id, "initializing"))
             self.model_state[job_id] = "initializing"
             self.models_initializing.add(job_id)
             return True
@@ -1017,6 +1025,8 @@ class DistributedValidator(DistributedWorker):
             # Update available GPU memory
             self._release_host_memory(job_id)
 
+            self.send_request("update_job_status", (job_id, "active"))
+
             # Load tokenizer
             if model_name not in self.tokenizers:
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -1032,13 +1042,11 @@ class DistributedValidator(DistributedWorker):
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedValidator -> Finalized hosted job for {model_name} with job_id {job_id}",
+                    f"Finalized hosted job for {model_name} with job_id {job_id}",
                     "green",
                     logging.INFO,
                 ),
             )
-
-            self.send_request("update_job_status", (job_id, "active"))
 
             return True
 
@@ -1172,16 +1180,17 @@ class DistributedValidator(DistributedWorker):
     def _get_available_host_memory(self) -> int:
         """Get currently available host memory accounting for reservations"""
         available_memory = 0
-        max_vram_bytes = self._max_vram_bytes
-        if max_vram_bytes <= 0:
-            max_vram_bytes = (
+        max_memory_bytes = self._max_memory_bytes
+        if max_memory_bytes <= 0:
+            max_memory_bytes = (
                 1e15  # Set to massive number (1PB) when max vram was not specified
             )
 
         if self._hosting_enabled:
             with self.memory_lock:
-                total_memory = min(get_gpu_memory(), max_vram_bytes)
+                total_memory = min(get_gpu_memory(), max_memory_bytes)
                 available_memory += total_memory - self.host_memory_reserved
+
         return available_memory
 
     def _audit_memory_reservations(self):

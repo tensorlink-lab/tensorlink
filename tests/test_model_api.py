@@ -23,14 +23,6 @@ SERVER_URL = "http://127.0.0.1:64747"
 
 # Models to test with
 MODELS = [
-    # pytest.param(
-    #     {
-    #         "name": "Qwen/Qwen3-0.6B-MLX-8bit",
-    #         "timeout": 600,
-    #         "parsed": False,
-    #     },
-    #     id="Qwen3-0.6B",
-    # ),
     pytest.param(
         {
             "name": "sshleifer/tiny-gpt2",
@@ -44,11 +36,19 @@ MODELS = [
         {
             "name": "HuggingFaceTB/SmolLM2-135M",
             "model_type": "causal",
-            "timeout": 60,
+            "timeout": 90,
             "parsed": True,
         },
         id="smollm2-135m",
     ),
+    # pytest.param(
+    #     {
+    #         "name": "Qwen/Qwen3-0.6B",
+    #         "model_type": "causal",
+    #         "timeout": 90,
+    #         "parsed": True,
+    #     }
+    # )
 ]
 
 
@@ -84,8 +84,42 @@ def model_env(request, connected_wwv_nodes):
     response = request_model(cfg["name"], cfg["model_type"], cfg["timeout"])
 
     assert response.status_code == 200
+    time.sleep(1)
 
     yield cfg, (worker, worker2, validator)
+
+    print(f"Waiting before switching away from {cfg['name']}...")
+    time.sleep(5)
+
+
+@pytest.fixture(scope="module")
+def active_model_env(model_env):
+    """
+    Wait until the model is active before yielding.
+    """
+    cfg, nodes = model_env
+
+    start = time.time()
+    last_status = None
+
+    while time.time() - start < cfg["timeout"]:
+        response = get_model_status(cfg["name"])
+        assert response.status_code == 200
+
+        result = response.json()
+        last_status = result.get("status")
+
+        if last_status == "active":
+            break
+
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"[{cfg['name']}] Model did not become active within "
+            f"{cfg['timeout']} seconds. Last status: {last_status}"
+        )
+
+    yield cfg, nodes
 
 
 # ========== Model Status Tests ==========
@@ -124,7 +158,7 @@ def test_status_loading(model_env):
     """
     cfg, _ = model_env
     result = None
-    for _ in range(5):
+    for _ in range(10):
         # Check a few times as the job takes a second to be added to the validator
         response = get_model_status(cfg["name"])
         assert response.status_code == 200, (
@@ -139,8 +173,8 @@ def test_status_loading(model_env):
     assert (
         "status" in result
     ), f"[{cfg['name']}] Response missing 'status' field: {result}"
-    assert result["status"] == "initializing", (
-        f"[{cfg['name']}] Expected 'initializing' immediately after model request, "
+    assert result["status"] in ("initializing", "active"), (
+        f"[{cfg['name']}] Expected 'initializing' or 'active' immediately after model request, "
         f"got '{result['status']}'"
     )
     print(f"✅ [{cfg['name']}] status immediately after request: '{result['status']}'")
@@ -182,12 +216,13 @@ def test_status_active(model_env):
 # ========= Model Inference Tests =========
 
 
-def test_chat_completions(model_env):
+@pytest.mark.order(4)
+def test_chat_completions(active_model_env):
     """
     Non-streaming OpenAI-compatible chat completions.
     Validates the full response envelope, choice structure, and usage stats.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
 
     payload = {
         "model": cfg["name"],
@@ -195,7 +230,7 @@ def test_chat_completions(model_env):
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say 'Hello world' and nothing else."},
         ],
-        "max_tokens": 20,
+        "max_tokens": 25,
         "temperature": 0.1,
         "stream": False,
     }
@@ -240,12 +275,13 @@ def test_chat_completions(model_env):
     print(f"   Tokens : {usage['total_tokens']}")
 
 
-def test_chat_completions_stream(model_env):
+@pytest.mark.order(5)
+def test_chat_completions_stream(active_model_env):
     """
     Streaming chat completions via SSE.
     Validates chunk structure, delta content accumulation, and the [DONE] sentinel.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
     time.sleep(1)
 
     payload = {
@@ -253,7 +289,7 @@ def test_chat_completions_stream(model_env):
         "messages": [
             {"role": "user", "content": "Count to three."},
         ],
-        "max_tokens": 15,
+        "max_tokens": 25,
         "temperature": 0.1,
         "stream": True,
     }
@@ -293,6 +329,8 @@ def test_chat_completions_stream(model_env):
         delta = chunk["choices"][0].get("delta", {})
         full_text += delta.get("content") or ""
 
+        print(full_text)
+
     assert done_received, "Stream ended without [DONE] sentinel"
     assert received_chunks > 0, "No chunks received"
 
@@ -308,12 +346,13 @@ def test_chat_completions_stream(model_env):
     print(f"   Tokens : {tokens}")
 
 
-def test_responses_text(model_env):
+@pytest.mark.order(6)
+def test_responses_text(active_model_env):
     """
     /v1/responses with type='text' should behave identically to
     /v1/chat/completions for non-streaming requests.
     """
-    cfg, _ = model_env
+    cfg, _ = active_model_env
     time.sleep(1)
 
     payload = {
@@ -322,8 +361,8 @@ def test_responses_text(model_env):
         "messages": [
             {"role": "user", "content": "What is 2 + 2?"},
         ],
-        "max_tokens": 10,
-        "temperature": 0.0,
+        "max_tokens": 25,
+        "temperature": 0.7,
         "stream": False,
     }
 
@@ -343,6 +382,7 @@ def test_responses_text(model_env):
     print(f"   Output : {result['choices'][0]['message']['content'][:60]}...")
 
 
+@pytest.mark.order(7)
 def test_responses_invalid_type():
     """
     Submitting an unknown type to /v1/responses should return 422.

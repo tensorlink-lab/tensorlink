@@ -1,4 +1,4 @@
-from tensorlink.ml.utils import bytes_to_tensor
+from tensorlink.ml.utils import bytes_to_tensor, resolve_dtype
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -10,10 +10,12 @@ from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download, model_info
 from safetensors import safe_open
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from filelock import FileLock
 import torch.nn as nn
 import torch
 import logging
 import shutil
+import threading
 import glob
 import os
 import gc
@@ -32,22 +34,54 @@ def get_hf_cache_dir() -> str:
 
 
 class ModelCacheManager:
+    # Per-model in-process locks, so threads within the same worker also
+    # serialize on the filesystem lock without extra syscalls once one of
+    # them already holds it. Guarded by _thread_locks_guard so creating a
+    # new per-model Lock can't itself race across threads.
+    _thread_locks: Dict[str, threading.Lock] = {}
+    _thread_locks_guard = threading.Lock()
+
     def __init__(self, primary_dir, max_cache_size_gb=50):
         self.primary_dir = primary_dir
         self.hf_cache_dir = get_hf_cache_dir()
         self.max_cache_size = max_cache_size_gb * 1024**3
 
+        # Directory that holds one lock file per model, shared by every
+        # worker process/thread on this machine that points at the same
+        # HF_HOME cache dir.
+        self._locks_dir = os.path.join(self.hf_cache_dir, ".locks", "model_download")
+        os.makedirs(self._locks_dir, exist_ok=True)
+
+    def _lock_path(self, model_name: str) -> str:
+        safe_name = model_name.replace("/", "--")
+        return os.path.join(self._locks_dir, f"{safe_name}.lock")
+
     def get_local_snapshot(self, model_name):
         path = os.path.join(self.primary_dir, model_name.replace("/", "_"))
         return path if os.path.exists(path) else None
 
+    @staticmethod
+    def _weights_present(path: Optional[str]) -> bool:
+        """A snapshot dir only counts as "cached" if it actually has weight
+        files. huggingface_hub's local_files_only lookup can resolve a
+        snapshot directory that exists but is still mid-download by another
+        worker, so we verify before trusting it."""
+        if not path:
+            return False
+        return bool(
+            glob.glob(os.path.join(path, "*.safetensors"))
+            or glob.glob(os.path.join(path, "pytorch_model*.bin"))
+        )
+
     def get_hf_cached(self, model_name):
         try:
-            return snapshot_download(
+            path = snapshot_download(
                 repo_id=model_name,
                 cache_dir=self.hf_cache_dir,
+                allow_patterns=["*.safetensors", "*.bin", "*.json"],
                 local_files_only=True,
             )
+            return path if self._weights_present(path) else None
         except Exception:
             return None
 
@@ -56,21 +90,39 @@ class ModelCacheManager:
         if local:
             return local
 
+        # Fast, unlocked path: if the model is already fully cached (the
+        # common case after the first load), skip locking entirely.
         cached = self.get_hf_cached(model_name)
         if cached:
             return cached
 
-        size = self._estimate_model_size(model_name)
-        if not has_space(size, self.hf_cache_dir):
-            self.cleanup_hf_cache(size)
+        # Slow path: not cached yet. Serialize on a per-model file lock so
+        # that when several modules/workers request the same model at once,
+        # only one of them actually triggers the download and the rest
+        # block here, then simply re-read the now-complete cache.
+        with self._thread_locks_guard:
+            thread_lock = self._thread_locks.setdefault(model_name, threading.Lock())
 
-        return snapshot_download(
-            repo_id=model_name,
-            cache_dir=self.hf_cache_dir,
-            allow_patterns=["*.safetensors", "*.bin", "*.json"],
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-            local_files_only=False,
-        )
+        with thread_lock:
+            with FileLock(self._lock_path(model_name)):
+                # Re-check now that we hold the lock, another
+                # worker/thread may have finished the download while we
+                # were waiting for it.
+                cached = self.get_hf_cached(model_name)
+                if cached:
+                    return cached
+
+                size = self._estimate_model_size(model_name)
+                if not has_space(size, self.hf_cache_dir):
+                    self.cleanup_hf_cache(size)
+
+                return snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=self.hf_cache_dir,
+                    allow_patterns=["*.safetensors", "*.bin", "*.json"],
+                    ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
+                    local_files_only=False,
+                )
 
     @staticmethod
     def _estimate_model_size(model_name: str) -> int:
@@ -106,22 +158,6 @@ class ModelCacheManager:
                 break
 
 
-# ---------------------------------------------------------------------------
-# Universal prefix resolution
-# ---------------------------------------------------------------------------
-
-
-class TiedLinear(nn.Module):
-    """Linear projection using a weight tensor tied to an Embedding."""
-
-    def __init__(self, weight: torch.Tensor):
-        super().__init__()
-        self.weight = nn.Parameter(weight, requires_grad=weight.requires_grad)
-
-    def forward(self, x):
-        return torch.nn.functional.linear(x, self.weight)
-
-
 def _iter_safetensor_keys(model_path: str):
     """Yield all weight keys from safetensors shards (or .bin as fallback)."""
     safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
@@ -137,7 +173,7 @@ def _iter_safetensor_keys(model_path: str):
             yield from shard.keys()
 
 
-def resolve_weight_prefix(model_path: str, module_path: str) -> str:
+def resolve_weight_prefix(model_path: str, module_path: str) -> Optional[str]:
     """
     Discover the actual key prefix used in the weight files for *module_path*.
 
@@ -151,19 +187,30 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
       module_path="model.lm_head"            -> "lm_head"
       module_path="model"                    -> "model"
 
-    Returns the matched prefix string, or "" if nothing matched (caller
-    should treat "" as a root/full load).
+    Returns:
+      - "" only when *module_path* itself denotes the whole model (i.e. an
+        explicit root-load request: module_path in ("", "model")).
+      - the matched prefix string on a normal match.
+      - None when nothing matched at all, or the shard scan failed. This is
+        NOT the same as "", it means "this module has no entries of its
+        own in the weight files" (e.g. RotaryEmbedding, whose buffers are
+        computed at init time rather than loaded), and callers must treat
+        it as "skip loading weights for this module", never as "load
+        everything".
     """
+    if module_path in ("", "model"):
+        return ""
+
     sampled: List[str] = []
     try:
         for key in _iter_safetensor_keys(model_path):
             sampled.append(key)
 
     except Exception:
-        return ""
+        return None
 
     if not sampled:
-        return ""
+        return None
 
     # Build candidates by dropping 0, 1, 2, … leading components.
     # e.g. "model.model.embed_tokens" ->
@@ -174,8 +221,8 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> str:
         if any(key.startswith(candidate + ".") for key in sampled):
             return candidate
 
-    # Nothing matched, signal a root/full load
-    return ""
+    # Nothing matched, this module has no weight-file entries of its own.
+    return None
 
 
 def _strip_to_local_key(key: str, matched_prefix: str) -> str:
@@ -192,14 +239,10 @@ def _strip_to_local_key(key: str, matched_prefix: str) -> str:
     return key[len(matched_prefix) + 1 :]  # +1 for the "."
 
 
-# ---------------------------------------------------------------------------
-# Core shared loading primitives
-# ---------------------------------------------------------------------------
-
-
 def apply_required_buffers(
     module: nn.Module,
     module_info: Dict[str, Any],
+    device: torch.device,
     log_fn: Callable[[str], None] = logging.debug,
     warn_fn: Callable[[str], None] = logging.warning,
     error_fn: Callable[[str], None] = logging.error,
@@ -219,6 +262,8 @@ def apply_required_buffers(
       3. Nested buffer path (navigate to the correct submodule first)
     """
     required_buffers = module_info.get("required_buffers", {})
+    module_dtype = resolve_dtype(module, device)
+
     if not required_buffers or required_buffers == b"{}":
         return
 
@@ -272,11 +317,11 @@ def apply_required_buffers(
             if hasattr(target, buf_name) and buf_name in existing_buffers:
                 existing = getattr(target, buf_name)
                 if existing.shape == tensor.shape:
-                    existing.copy_(tensor)
+                    existing.copy_(tensor.to(existing.dtype))
                 else:
                     target.register_buffer(buf_name, tensor)
             else:
-                target.register_buffer(buf_name, tensor)
+                target.register_buffer(buf_name, tensor.to(module_dtype))
 
             log_fn(f"Applied buffer '{rel_key}'")
 
@@ -330,11 +375,6 @@ def _load_tensors_from_shards(
                     state_dict[local_key] = value
 
     return state_dict
-
-
-# ---------------------------------------------------------------------------
-# Universal single-module weight loader
-# ---------------------------------------------------------------------------
 
 
 def load_module_weights(
@@ -397,15 +437,17 @@ def load_module_weights(
         warn_fn(f"All keys correct for '{module_path}': {dict_keys}")
 
     if module_info:
-        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+        apply_required_buffers(target_module, module_info, device, log_fn, warn_fn)
 
     target_module.to(device)
+
+    dtypes = {p.dtype for p in target_module.parameters()} | {
+        b.dtype for b in target_module.buffers()
+    }
+    if len(dtypes) > 1:
+        warn_fn(f"Mixed dtypes in loaded module '{module_info}': {dtypes}")
+
     return missing_keys, unexpected_keys
-
-
-# ---------------------------------------------------------------------------
-# Universal grouped-layer weight loader
-# ---------------------------------------------------------------------------
 
 
 def load_grouped_module_weights(
@@ -483,7 +525,7 @@ def load_grouped_module_weights(
     )
 
     if module_info:
-        apply_required_buffers(target_module, module_info, log_fn, warn_fn)
+        apply_required_buffers(target_module, module_info, device, log_fn, warn_fn)
 
     target_module.to(device)
 
@@ -549,19 +591,18 @@ def _fallback_full_scan(
     return state_dict
 
 
-# ---------------------------------------------------------------------------
-# Full-model loaders (unchanged)
-# ---------------------------------------------------------------------------
-
-
 def load_full_model(
     model_name: str,
     model_type: str,
     device: torch.device,
     log_fn: Callable[[str], None] = logging.debug,
-    torch_dtype: torch.dtype = torch.float16,
+    torch_dtype: Optional[torch.dtype] = None,
 ) -> nn.Module:
+    if torch_dtype is None:
+        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+
     num_gpus = torch.cuda.device_count()
+
     load_kwargs: Dict[str, Any] = {
         "low_cpu_mem_usage": True,
         "torch_dtype": torch_dtype,
@@ -589,18 +630,27 @@ def load_full_model(
     return model
 
 
-def load_model_skeleton(model_name: str, model_type: str = "chat"):
+def load_model_skeleton(
+    model_name: str, model_type: str = "chat", torch_dtype: Optional[torch.dtype] = None
+):
     model_config = AutoConfig.from_pretrained(model_name)
-
     with init_empty_weights():
         if model_type in ("causal", "chat"):
-            skeleton_model = AutoModelForCausalLM.from_config(model_config)
+            skeleton_model = AutoModelForCausalLM.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         elif model_type == "seq2seq":
-            skeleton_model = AutoModelForSeq2SeqLM.from_config(model_config)
+            skeleton_model = AutoModelForSeq2SeqLM.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         elif model_type == "audio2text":
-            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(model_config)
+            skeleton_model = AutoModelForSpeechSeq2Seq.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
         else:
-            skeleton_model = AutoModel.from_config(model_config)
+            skeleton_model = AutoModel.from_config(
+                model_config, torch_dtype=torch_dtype
+            )
 
     skeleton_model.eval()
 
@@ -613,31 +663,42 @@ def load_model_skeleton(model_name: str, model_type: str = "chat"):
 def get_nested_module(
     model: torch.nn.Module, path: str, target_class_name: str = None
 ) -> torch.nn.Module:
-    parts = path.split('.')
-    current = model
+    """
+    Get a module given its path in the model using notation from
+    distributed config generator in graphing.py (e.g. model.layers).
+    """
+    try:
+        parts = path.split('.')
+        current = model
 
-    for i in range(len(parts)):
-        part = parts[i]
+        for i in range(len(parts)):
+            part = parts[i]
 
-        if part == "":
-            continue
-
-        if part == "model":
-            # Only skip if there are further parts AND the next part
-            # is accessible without going through .model explicitly
-            has_more = len(parts) > i + 1
-            if has_more and hasattr(current, "model"):
-                next_part = parts[i + 1]
-                if hasattr(current, next_part):
-                    continue
-            elif not has_more:
-                pass
-            else:
+            if part == "":
                 continue
 
-        if part.isdigit():
-            current = current[int(part)]
-        else:
-            current = getattr(current, part)
+            if part == "model":
+                # Only skip if there are further parts AND the next part
+                # is accessible without going through .model explicitly
+                has_more = len(parts) > i + 1
+                if has_more and hasattr(current, "model"):
+                    next_part = parts[i + 1]
+                    if hasattr(current, next_part):
+                        continue
+                elif not has_more:
+                    if not hasattr(current, "model"):
+                        continue
+                    pass
+                else:
+                    continue
 
-    return current
+            if part.isdigit():
+                current = current[int(part)]
+            else:
+                current = getattr(current, part)
+
+        return current
+    except Exception as e:
+        print(
+            f"ERROR FETCHING NESTED MODULE {path} FOR MODEL {model.__class__}. (Error: {e})"
+        )

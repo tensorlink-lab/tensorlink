@@ -1,5 +1,13 @@
-from tensorlink.ml.utils.utils import get_gpu_memory
-from tensorlink.nodes.shared_memory import get_from_shared_memory
+from tensorlink.ml.utils.gpu_benchmark import (
+    get_gpu_info,
+    benchmark_matmul,
+    benchmark_memory_bandwidth,
+    get_gpu_memory,
+)
+from tensorlink.utils.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.smart_node import Smartnode
 
@@ -15,6 +23,7 @@ import psutil
 
 MSG_TOKEN = b"TOKEN"
 MSG_STREAM_END = b"END__"
+EXPECTED_MODULE_STATUSES = ("inactive", "loaded", "error")
 
 
 def _bar(current, total, width=20):
@@ -117,7 +126,9 @@ class Torchnode(Smartnode):
         local_test=False,
         priority_nodes: list = None,
         seed_validators: list = None,
-        max_memory_gb: float = 0,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
         super(Torchnode, self).__init__(
             role=role,
@@ -128,24 +139,35 @@ class Torchnode(Smartnode):
             priority_nodes=priority_nodes,
             seed_validators=seed_validators,
         )
+        # Pointers to model parameters in DistributedModels
+        self.modules = {}
+        self.state_updates = {}
 
         # Available GPU mpc estimation
         self._max_memory_gb = max_memory_gb
-        self.available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        self.available_gpu_memory = self.get_gpu_memory()
         self.total_gpu_memory = self.available_gpu_memory
         self.available_ram = psutil.virtual_memory().available
+
+        # Device info
+        self._device_info = _device_info
+        self._device_benchmark = _device_benchmark
+        self._device_benchmarked_at = time.time() if _device_info is not None else None
+
+        threading.Thread(
+            target=self._run_device_benchmark,
+            name="_device_benchmark",
+            daemon=True,
+        ).start()
 
         self._mpc_comms = None
         self.memory_manager = {}
         self.request_queue = request_queue
         self.response_queue = response_queue
 
-        # Pointers to model parameters in DistributedModels
-        self.modules = {}
-        self.state_updates = {}
-
         # Master flag for handling different types of storage as master
         self.master = False
+        self.training = False
         self.mpc_terminate_flag = threading.Event()
 
     def handle_data(self, data: bytes, node: Connection):
@@ -156,7 +178,7 @@ class Torchnode(Smartnode):
             if not handled:
                 # Define a dictionary mapping prefixes to handler methods
                 handlers = {
-                    b"LOADED": self._handle_module_loaded,
+                    b"STATUS": self._handle_module_status,
                     b"FORWARD": self._handle_forward,
                     b"BACKWARD": self._handle_backward,
                     b"GENERATE": self._handle_generate,
@@ -167,6 +189,7 @@ class Torchnode(Smartnode):
                     b"MODULE": self._handle_module,
                     b"UPDATE-TRAIN": self._update_train,
                     b"TRAIN-UPDATED": self._train_updated,
+                    b"STATS-REQUEST": self.handle_statistics_request,
                 }
 
                 # Iterate through handlers to find the matching prefix
@@ -176,7 +199,7 @@ class Torchnode(Smartnode):
                             handler(data, node)
                             if prefix
                             in (
-                                b"LOADED",
+                                b"STATUS",
                                 b"FORWARD",
                                 b"GENERATE",
                                 b"BACKWARD",
@@ -184,6 +207,7 @@ class Torchnode(Smartnode):
                                 b"OPTIMIZER",
                                 b"MODULE",
                                 b"UPDATE-TRAIN",
+                                b"STATS-REQUEST",
                             )
                             else handler(data)
                         )
@@ -192,6 +216,27 @@ class Torchnode(Smartnode):
 
         except Exception as e:
             self._log_error(f"Error handling data: {e}", tag="Torchnode")
+
+    def handle_statistics_request(self, data: bytes, node: Connection):
+        """When a validator requests a stats request, return stats"""
+        self.debug_print(f"Received stats request from: {node.node_id}", tag="Worker")
+
+        self.get_gpu_memory()
+
+        stats = {
+            "id": self.rsa_key_hash,
+            "gpu_memory": self.available_gpu_memory,
+            "total_gpu_memory": self.total_gpu_memory,
+            "role": self.role,
+            "training": self.training,
+            "device": self._device_info,
+            "benchmark": self._device_benchmark,
+            "benchmarked_at": self._device_benchmarked_at,
+        }
+
+        stats_bytes = json.dumps(stats).encode()
+        stats_bytes = b"STATS-RESPONSE" + stats_bytes
+        self.send_to_node(node, stats_bytes)
 
     def _train_updated(self, data: bytes):
         mode = False if data[13:14] == b"0" else True
@@ -297,7 +342,16 @@ class Torchnode(Smartnode):
 
             # Received a forward pass
             eos = data.find(b"::")
-            size = int(data[7:eos])
+            try:
+                size = int(data[7:eos])
+            except (ValueError, IndexError):
+                self.debug_print(
+                    "Invalid forward header",
+                    tag="Torchnode",
+                    level=logging.ERROR,
+                )
+                return False
+
             formatted_size = format_size(size)
             self.debug_print(
                 f"RECEIVED FORWARD: {formatted_size}",
@@ -308,7 +362,16 @@ class Torchnode(Smartnode):
             # TODO we must check that the forward received corresponds to a sent pass/specific module
             # must also do with backwards
             tensor = data[eos + 2 : eos + 2 + size]
-            payload = json.loads(data[eos + 2 + size :])
+
+            try:
+                payload = json.loads(data[eos + 2 + size :])
+            except json.JSONDecodeError:
+                self.debug_print(
+                    "Invalid JSON payload in forward",
+                    tag="Torchnode",
+                    level=logging.ERROR,
+                )
+                return False
 
             if isinstance(payload, dict):
                 module_id = payload.get("module_id")
@@ -333,11 +396,11 @@ class Torchnode(Smartnode):
             buffer = shm.buf[:size]
             buffer[:] = tensor
 
-            self.modules[module_id]["forward_queue"][key] = (size, shm.name)
-            self.memory_manager[key] = shm.name
-
             del buffer
             shm.close()
+
+            self.modules[module_id]["forward_queue"][key] = (size, shm.name)
+            self.memory_manager[key] = shm.name
             return True
 
         except Exception as e:
@@ -447,16 +510,40 @@ class Torchnode(Smartnode):
 
         return False
 
-    def _handle_module_loaded(self, data: bytes, node: Connection):
-        """Remove load module request to signal to distributed process"""
-        self.debug_print(
-            f"Successfully offloaded submodule to: {node.node_id}",
-            level=logging.INFO,
-            colour="bright_cyan",
-            tag="Torchnode",
-        )
+    def _handle_module_status(self, data: bytes, node: Connection):
+        """
+        Update module parameters given the worker's response to a module
+        loading request. Can be 'loaded' (success) or 'error' (failure).
+
+        If failed, try and recruit another worker.
+        """
         module_id = data[6:70].decode()
+        status = data[70:80].decode().lower()
+
+        # First remove request from worker info, regardless of status
         self._remove_request(node.node_id, "MODULE" + module_id)
+
+        if module_id in self.modules:
+            if status in EXPECTED_MODULE_STATUSES:
+                self.modules[module_id]["status"] = status
+
+        if status == "loaded":
+            self.debug_print(
+                f"Successfully offloaded submodule: {module_id} to: {node.node_id}",
+                level=logging.INFO,
+                colour="bright_cyan",
+                tag="Torchnode",
+            )
+
+        elif status == "error":
+            self.debug_print(
+                f"Error offloading submodule: {module_id} to: {node.node_id}. Attempting to recruit "
+                f"another worker...",
+                level=logging.WARNING,
+                colour="bright_cyan",
+                tag="Torchnode",
+            )
+
         return True
 
     def handle_requests(self, request=None):
@@ -479,8 +566,8 @@ class Torchnode(Smartnode):
                 "check_backward": self._handle_check_backward,
                 "check_forward": self._handle_check_forward,
                 "check_generate": self._handle_check_generate,
-                "check_loaded": self._handle_check_module_loaded,
                 "check_module": self._handle_check_module,
+                "check_module_status": self._handle_check_module_status,
                 "check_module_request": self._handle_check_module_request,
                 "check_parameters": self._handle_check_parameters,
                 "check_parameters_request": self._handle_check_parameters_request,
@@ -491,17 +578,19 @@ class Torchnode(Smartnode):
                 "connect_node": self._handle_connect_node,
                 "debug_print": self._handle_debug_print,
                 "generate": self._handle_send_generate,
+                "get_workers": self._handle_get_workers_request,
                 "get_connection": self._handle_get_connection,
                 "info": self._handle_get_info,
-                "module_loaded": self._handle_module_loaded_request,
                 "optimizer_response": self._handle_optimizer_response_request,
                 "release_memory": self._handle_release_memory,
+                "reset_module_status": self._handle_reset_module_status,
                 "request_parameters": self._handle_request_parameters,
                 "send_backward": self._handle_send_backward,
                 "send_forward": self._handle_send_forward,
                 "send_model": self._handle_send_model,
                 "send_optimizer_request": self._handle_send_optimizer_request,
                 "send_parameters": self._handle_send_parameters,
+                "send_module_status": self._handle_update_module_status_request,
                 "send_stream_end": self._handle_send_stream_end,
                 "send_token": self._handle_send_token,
                 "stop": self._handle_stop,
@@ -533,26 +622,61 @@ class Torchnode(Smartnode):
         self.send_module(name, module_id, module_info, node)
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
-    def _handle_check_module_loaded(self, request):
-        # Check if sent module has been received and loaded on the other nodes
-        worker_id, module_id = request["args"]
-        return_val = False
+    def _handle_get_workers_request(self, request):
+        """
+        Get available worker from active connections
+        """
+        workers = {
+            node_id: node.stats
+            for node_id, node in self.nodes.items()
+            if getattr(node, "role", "").startswith("W")
+        }
+        self.response_queue.put({"status": "SUCCESS", "return": workers})
 
-        if "MODULE" + module_id not in self.requests[worker_id]:
-            return_val = True
+    def _handle_reset_module_status(self, request):
+        """
+        Reset module status and assigned worker when re-sending to a replacement.
+        """
+        module_id, new_worker_id = request["args"]
+        if module_id in self.modules:
+            self.modules[module_id]["status"] = "loading"
+            # Update the host/worker reference if tracked
+            if "assigned_workers" in self.modules[module_id]:
+                self.modules[module_id]["assigned_workers"][-1] = new_worker_id
+        self.response_queue.put({"status": "SUCCESS", "return": None})
 
-        self.response_queue.put({"status": "SUCCESS", "return": return_val})
+    def _handle_check_module_status(self, request):
+        """
+        Returns the current loading status of a module.
+        Returns 'inactive', 'loading', 'loaded', or 'error' (or None if unknown module).
+        """
+        module_id = request["args"]
+        status = None
+        if module_id in self.modules:
+            status = self.modules[module_id].get("status")
 
-    def _handle_module_loaded_request(self, request):
+        if status is None:
+            status = "inactive"
+        else:
+            pass
+
+        self.response_queue.put({"status": "SUCCESS", "return": status})
+
+    def _handle_update_module_status_request(self, request):
         """
         Send module loaded message from worker back to a validator
         """
-        module_id = request["args"]
+        module_id, status = request["args"]
         module = self.modules[module_id]
         node_id = module["host"]
-        module["status"] = "loaded"
-        node = self.nodes[node_id]
-        self.send_to_node(node, b"LOADED" + module_id.encode())
+        module["status"] = status
+
+        if status in EXPECTED_MODULE_STATUSES:
+            # Send status to validator
+            bytes_status = status.upper().encode()
+            node = self.nodes[node_id]
+            self.send_to_node(node, b"STATUS" + module_id.encode() + bytes_status)
+
         self.response_queue.put({"status": "SUCCESS", "return": None})
 
     def _handle_optimizer_response_request(self, request):
@@ -580,7 +704,7 @@ class Torchnode(Smartnode):
     def _handle_send_generate(self, request):
         node_id, size, shm_name, stream = request["args"]
         node = self.nodes[node_id]
-        generate_bytes = get_from_shared_memory(size, shm_name, encoded=True)
+        generate_bytes = get_from_shared_memory(size, shm_name, encoding=None)
         stream_flag = b"\x01" if stream else b"\x00"
 
         packet = b"GENERATE" + stream_flag + generate_bytes
@@ -723,7 +847,6 @@ class Torchnode(Smartnode):
 
         else:
             n_iter, n_micro, module_id = request["args"]
-
             if module_id in self.modules:
                 if request["args"] in self.modules[module_id]["forward_queue"]:
                     return_val = self.modules[module_id]["forward_queue"][
@@ -886,15 +1009,12 @@ class Torchnode(Smartnode):
 
     def store_parameters_in_shared_memory(self, key, parameters):
         module_id = key[1:]
-        parameters = json.dumps(parameters).encode()
-        size = len(parameters)
 
-        shm = shared_memory.SharedMemory(create=True, size=size)
-        buffer = shm.buf[:size]
-        buffer[:] = parameters
+        size, shm_name = store_in_shared_memory(parameters, encoding=None)
 
-        self.modules[module_id]["parameters"][key] = (size, shm.name)
-        self.memory_manager[key] = shm.name
+        # Track the shared-memory allocation for the module and parameter key
+        self.modules[module_id]["parameters"][key] = (size, shm_name)
+        self.memory_manager[key] = shm_name
 
     def send_parameters_req(self, node: Connection, module_id: str):
         """Request parameters from a specific worker"""
@@ -990,7 +1110,7 @@ class Torchnode(Smartnode):
 
     def print_ui_status(self):
         total_vram = self.total_gpu_memory
-        used_vram = total_vram - get_gpu_memory()
+        used_vram = total_vram - self.get_gpu_memory()
 
         ram = psutil.virtual_memory()
         used_ram = ram.total - ram.available
@@ -1075,3 +1195,39 @@ class Torchnode(Smartnode):
 
         print(sep)
         print()
+
+    def get_gpu_memory(self) -> int:
+        available_gpu_memory = get_gpu_memory(self._max_memory_gb)
+        reserved_loading_memory = 0
+
+        for module_id, module_info in self.modules.items():
+            # Account for modules that are not in CUDA and are still initializing
+            if module_info.get("status", "loading") == "loading":
+                reserved_loading_memory += module_info["memory"]
+
+        available_gpu_memory = max(
+            0, int(available_gpu_memory - reserved_loading_memory)
+        )
+        return available_gpu_memory
+
+    def _run_device_benchmark(self):
+        """Populate _device_info/_device_benchmark once. Safe to call again
+        later (e.g. on a timer) if you want periodic re-benchmarking."""
+        try:
+            self._device_info = get_gpu_info()
+
+            if self._device_info.get("available"):
+                self._device_benchmark = {
+                    "compute": benchmark_matmul(),
+                    "memory": benchmark_memory_bandwidth(),
+                }
+
+            self._device_benchmarked_at = time.time()
+
+        except Exception as e:
+            self.debug_print(
+                f"Device benchmark failed: {e}",
+                colour="yellow",
+                level=logging.WARNING,
+                tag="Torchnode",
+            )

@@ -1,18 +1,19 @@
-from tensorlink.crypto.rsa import (
+from tensorlink.utils.rsa import (
     decrypt,
     encrypt,
     authenticate_public_key,
     get_rsa_pub_key,
 )
+from tensorlink.utils.logging import log_message
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.monitor import ConnectionMonitor
 from tensorlink.p2p.dht import DHT
 
-from logging.handlers import TimedRotatingFileHandler
 from dotenv import get_key, set_key
 from typing import Tuple, Union, Optional, List
 from miniupnpc import UPnP
 from web3 import Web3
+from datetime import datetime
 import hashlib
 import ipaddress
 import json
@@ -81,6 +82,10 @@ SM_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesCore.json")
 MS_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesCoordinator.json")
 TOKEN_CONFIG_PATH = os.path.join(CONFIG_PATH, "SmartnodesERC20.json")
 
+# Dirs for node storage and logs
+os.makedirs("logs", exist_ok=True)
+os.makedirs("tmp", exist_ok=True)
+
 API = get_key(".tensorlink.env", "API")
 
 with open(os.path.join(CONFIG_PATH, "config.json"), "r") as f:
@@ -111,18 +116,6 @@ SNO_EVENT_SIGNATURES = {
     "ProposalExecuted": "ProposalExecuted(uint256)",
 }
 
-
-# Configure logging with TimedRotatingFileHandler
-os.makedirs("logs", exist_ok=True)
-os.makedirs("tmp", exist_ok=True)
-
-log_handler = TimedRotatingFileHandler(
-    "logs/runtime.log", when="midnight", interval=1, backupCount=7
-)
-log_handler.setFormatter(logging.Formatter("[%(asctime)s] - %(message)s"))
-log_handler.suffix = "%Y%m%d"
-logging.getLogger().addHandler(log_handler)
-logging.getLogger().setLevel(logging.DEBUG)
 BASE_PORT = 38751
 
 
@@ -293,6 +286,24 @@ class Smartnode(threading.Thread):
             # Smart nodes parameters for additional security and contract connectivity
             self.url = CHAIN_URL
             self.chain = Web3(Web3.HTTPProvider(CHAIN_URL))
+
+            # Drop the default "validation" middleware: it silently issues an
+            # extra eth_chainId RPC call before every eth_call/sendTransaction/
+            # estimateGas/createAccessList to check a "chainId" key we never
+            # set on our transaction dicts. That means every contract read or
+            # write we make was costing 2 RPC calls instead of 1. We never rely
+            # on this middleware (no "chainId" key anywhere, no eth_getBlock*
+            # extraData validation either), so removing it is functionally a
+            # no-op and roughly halves our RPC volume.
+            try:
+                self.chain.middleware_onion.remove("validation")
+            except (KeyError, ValueError) as e:
+                self._log_debug(
+                    f"Could not remove web3 'validation' middleware "
+                    f"(may already be absent): {e}",
+                    tag="Smartnode",
+                )
+
             self.contract_address = Web3.to_checksum_address(CONTRACT)
 
             # Grab the Smartnode contract
@@ -485,7 +496,7 @@ class Smartnode(threading.Thread):
         Args:
             message (str): Error message to log
         """
-        self.debug_print(f"{message}", level=logging.ERROR, tag=tag)
+        self.debug_print(f"{message}", level=logging.WARNING, tag=tag)
 
     def _log_debug(self, message: str, tag="Smartnode") -> None:
         """
@@ -498,12 +509,27 @@ class Smartnode(threading.Thread):
 
     def debug_print(self, message, level=logging.DEBUG, colour=None, tag=None) -> None:
         """Print to console if debug is enabled"""
-        logging.log(level, message)
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        if level >= self.print_level:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        tag_width = 15
 
+        if tag:
+            centered_tag = tag.center(tag_width)
+            plain_tag = f" {centered_tag}"
+        else:
+            plain_tag = " " * (tag_width + 1)
+
+        # Include role in file logs
+        file_message = f"[{timestamp}] [{self.role}] {plain_tag} -> {message}"
+
+        should_print = level >= self.print_level
+
+        console_message = None
+
+        if should_print:
             role_colour = "\033[37m"
+
             if self.role == "U":
                 role_colour = COLOURS["magenta"]
             elif self.role.startswith("W"):
@@ -517,17 +543,22 @@ class Smartnode(threading.Thread):
             colour_code = COLOURS.get(colour, "\033[37m")
             reset_colour = "\033[0m"
 
-            tag_width = 15  # Adjust as needed
             if tag:
-                centered_tag = tag.center(tag_width)
-                background_colour = BACKGROUND_COLOURS.get(tag.strip(), "\033[40m")
-                tag = f" {background_colour}{centered_tag}{reset_colour}"
+                background_colour = BACKGROUND_COLOURS.get(
+                    tag.strip(),
+                    "\033[40m",
+                )
+                coloured_tag = f" {background_colour}{centered_tag}{reset_colour}"
             else:
-                tag = " " * (tag_width + 1)
+                coloured_tag = " " * (tag_width + 1)
 
-            print(
-                f"[{role_colour}{timestamp}{reset_colour}]{tag} -> {colour_code}{message}{reset_colour}"
+            console_message = (
+                f"[{role_colour}{timestamp}{reset_colour}] "
+                f"{coloured_tag} -> "
+                f"{colour_code}{message}{reset_colour}"
             )
+
+        log_message(level, file_message, console_message, should_print)
 
     """Methods for DHT Query and Storage"""
 

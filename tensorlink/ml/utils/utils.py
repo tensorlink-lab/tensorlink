@@ -2,16 +2,16 @@ import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Dict
+from typing import Dict, Optional, Union
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
-import psutil
 import torch
 import torch.nn as nn
 from dataclasses import is_dataclass, asdict
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
+from transformers import AutoConfig
 
 
 MODELS_CACHE_PATH = "logs/models.json"
@@ -37,128 +37,6 @@ def format_memory_size(number: int) -> str:
             return f"{number:.2f} {unit}"
         number /= 1024
     return f"{number:.2f} TB"
-
-
-def estimate_memory(
-    module: nn.Module,
-    training: bool = True,
-    batch_size: int = 256,
-    seq_length: int = 2048,
-    dtype: torch.dtype = torch.float16,
-    optimizer_type: str = "adam",
-    include_kv_cache: bool = True,
-    recursive: bool = True,
-    count_activations: bool = True,
-) -> tuple[float, dict]:
-    """Estimate GPU memory required for a model."""
-
-    dtype_size = torch.tensor([], dtype=dtype).element_size()
-
-    breakdown = {
-        "parameters": 0,
-        "gradients": 0,
-        "optimizer": 0,
-        "activations": 0,
-        "kv_cache": 0,
-    }
-
-    # ---- parameters ----
-    if recursive:
-        param_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
-        param_bytes += sum(b.numel() * b.element_size() for b in module.buffers())
-    else:
-        param_bytes = sum(
-            p.numel() * p.element_size() for p in module.parameters(recurse=False)
-        )
-        param_bytes += sum(
-            b.numel() * b.element_size() for b in module.buffers(recurse=False)
-        )
-
-    breakdown["parameters"] = param_bytes
-
-    # ---- training extras ----
-    if training:
-        breakdown["gradients"] = param_bytes
-        if optimizer_type.lower() in {"adam", "adamw"}:
-            breakdown["optimizer"] = 2 * param_bytes * (4 / dtype_size)
-        else:
-            breakdown["optimizer"] = param_bytes
-
-    # ---- activations ----
-    if count_activations:
-        if hasattr(module, "config"):
-            hidden_size = module.config.hidden_size
-        elif hasattr(module, "hidden_size"):
-            hidden_size = module.hidden_size
-        elif hasattr(module, "embed_dim"):
-            hidden_size = module.embed_dim
-        elif hasattr(module, "d_model"):
-            hidden_size = module.d_model
-        else:
-            total_params = sum(p.numel() for p in module.parameters())
-            hidden_size = max(256, min(int((total_params / 12) ** 0.5), 8192))
-
-        activation_multiplier = 4 if not training else 7
-
-        breakdown["activations"] = (
-            batch_size * seq_length * hidden_size * dtype_size * activation_multiplier
-        )
-
-        if include_kv_cache and hasattr(module, "config") and not training:
-            num_layers = module.config.num_hidden_layers
-            num_heads = getattr(
-                module.config,
-                "num_key_value_heads",
-                module.config.num_attention_heads,
-            )
-            head_dim = hidden_size // module.config.num_attention_heads
-
-            breakdown["kv_cache"] = (
-                batch_size
-                * seq_length
-                * num_layers
-                * num_heads
-                * head_dim
-                * 2
-                * dtype_size
-            )
-
-    # ---- overhead ----
-    OVERHEAD = 1.20
-    total = sum(breakdown.values()) * OVERHEAD
-
-    return total, breakdown
-
-
-def get_gpu_memory(max_vram_gb: float | None = None) -> int:
-    """
-    Returns available memory in bytes.
-    - Uses total free CUDA VRAM if available.
-    - Falls back to available system RAM if CUDA is not available.
-    - If max_vram_gb is provided, caps the returned memory.
-    """
-
-    # Determine max memory cap
-    max_memory_bytes = None
-    if max_vram_gb is not None and max_vram_gb > 0:
-        max_memory_bytes = int(max_vram_gb * 1e9)
-
-    # Case 1: CUDA available
-    if torch.cuda.is_available():
-        memory = 0
-        for device in range(torch.cuda.device_count()):
-            free, total = torch.cuda.mem_get_info(device)
-            memory += free
-
-    # Case 2: Fallback to system RAM
-    else:
-        memory = psutil.virtual_memory().available
-
-    # Apply cap if specified
-    if max_memory_bytes is not None:
-        memory = min(memory, max_memory_bytes)
-
-    return int(memory)
 
 
 def find_module(module: nn.Module, target_name: str, ids: list = []):
@@ -459,6 +337,36 @@ def tensor_to_bytes(obj):
 
     structure_len = len(structure_bytes).to_bytes(4, "big")
     return structure_len + structure_bytes + tensor_bytes
+
+
+def _get_cache_kv(cache):
+    """
+    Extract (key_list, value_list) from a DynamicCache regardless of
+    transformers version. New versions use cache.layers[i].keys/.values,
+    old versions expose cache.key_cache / cache.value_cache directly.
+    """
+    if hasattr(cache, 'key_cache'):
+        return cache.key_cache, cache.value_cache
+
+    elif hasattr(cache, 'layers'):
+        if not cache.layers:
+            return [], []
+
+        # Probe attribute names on first layer
+        layer = cache.layers[0]
+        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
+        val_attr = 'values' if hasattr(layer, 'values') else 'value'
+
+        keys, vals = [], []
+        for l in cache.layers:
+            k = getattr(l, key_attr, None)
+            v = getattr(l, val_attr, None)
+            keys.append(k)
+            vals.append(v)
+
+        return keys, vals
+    else:
+        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
 
 
 def bytes_to_tensor(data: bytes):
@@ -910,7 +818,14 @@ def resolve_module_from_path(model: nn.Module, path: str):
             continue
         parent = getattr(parent, p)
     child_name = parts[-1]
-    child = getattr(parent, child_name)
+
+    if hasattr(parent, child_name):
+        child = getattr(parent, child_name)
+    elif child_name == "model":
+        child = parent
+    else:
+        raise f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+
     return parent, child, child_name
 
 
@@ -934,110 +849,327 @@ def optimizer_to_spec(optimizer_cls):
     return optimizer_spec
 
 
-def _get_cache_kv(cache):
+def debug_structure(
+    obj,
+    name="root",
+    indent=0,
+    max_depth=6,
+    max_items=3,
+    show_stats=True,
+    visited=None,
+    _lines=None,
+    _global_stats=None,
+):
     """
-    Extract (key_list, value_list) from a DynamicCache regardless of
-    transformers version. New versions use cache.layers[i].keys/.values,
-    old versions expose cache.key_cache / cache.value_cache directly.
+    Recursively builds a compact structure/types/shapes report of nested
+    objects. Returns a single string (joined with newlines) instead of
+    printing directly, so callers can route it through their own logging/
+    debug_print pipeline. Useful for debugging transformer/model outputs
+    and KV caches without flooding logs.
     """
-    if hasattr(cache, 'key_cache'):
-        return cache.key_cache, cache.value_cache
-
-    elif hasattr(cache, 'layers'):
-        if not cache.layers:
-            return [], []
-
-        # Probe attribute names on first layer
-        layer = cache.layers[0]
-        key_attr = 'keys' if hasattr(layer, 'keys') else 'key'
-        val_attr = 'values' if hasattr(layer, 'values') else 'value'
-
-        keys, vals = [], []
-        for l in cache.layers:
-            k = getattr(l, key_attr, None)
-            v = getattr(l, val_attr, None)
-            keys.append(k)
-            vals.append(v)
-
-        return keys, vals
-    else:
-        raise TypeError(f"Unrecognised DynamicCache layout: {list(vars(cache).keys())}")
-
-
-def debug_structure(obj, name="root", indent=0, max_depth=6, visited=None):
-    """
-    Recursively prints structure/types/shapes of nested objects.
-    Useful for debugging transformer/model outputs.
-    """
-
+    top_level = _lines is None
+    if top_level:
+        _lines = []
     if visited is None:
         visited = set()
+    if _global_stats is None:
+        _global_stats = {
+            "min": None,
+            "max": None,
+            "n_tensors": 0,
+            "n_nan": 0,
+            "n_inf": 0,
+            "min_source": None,
+            "max_source": None,
+        }
 
-    prefix = "  " * indent
+    def _finish():
+        if top_level and show_stats and _global_stats["n_tensors"] > 0:
+            gmin = _global_stats["min"]
+            gmax = _global_stats["max"]
+            summary = (
+                f"\n[GLOBAL] tensors={_global_stats['n_tensors']}, "
+                f"min={gmin:.4g} (at {_global_stats['min_source']}), "
+                f"max={gmax:.4g} (at {_global_stats['max_source']})"
+            )
+            if _global_stats["n_nan"]:
+                summary += f", total_NAN={_global_stats['n_nan']}"
+            if _global_stats["n_inf"]:
+                summary += f", total_INF={_global_stats['n_inf']}"
+            _lines.append(summary)
+        return "\n".join(_lines) if top_level else None
 
-    # Prevent recursive loops
+    prefix = " " * indent
     obj_id = id(obj)
-    if obj_id in visited:
-        print(f"{prefix}{name}: <recursive reference>")
-        return
 
+    if obj_id in visited:
+        _lines.append(f"{prefix}{name}: <recursive reference>")
+        return _finish()
     visited.add(obj_id)
 
-    # Depth limit
     if indent > max_depth:
-        print(f"{prefix}{name}: <max depth reached>")
-        return
+        _lines.append(f"{prefix}{name}: <max depth reached>")
+        return _finish()
 
-    # Tensors
+    # --- Tensors ---
     if isinstance(obj, torch.Tensor):
-        print(
-            f"{prefix}{name}: "
-            f"Tensor(shape={tuple(obj.shape)}, "
-            f"dtype={obj.dtype}, "
-            f"device={obj.device}, "
-            f"requires_grad={obj.requires_grad})"
-        )
+        stats = ""
+        if show_stats and obj.numel() > 0:
+            try:
+                with torch.no_grad():
+                    flat = obj.detach()
+                    if flat.is_floating_point():
+                        n_nan = torch.isnan(flat).sum().item()
+                        n_inf = torch.isinf(flat).sum().item()
+                        t_min = flat.min().item()
+                        t_max = flat.max().item()
+                        stats = (
+                            f", min={t_min:.4g}"
+                            f", max={t_max:.4g}"
+                            f", mean={flat.float().mean().item():.4g}"
+                        )
+                        if n_nan:
+                            stats += f", NAN={n_nan}"
+                        if n_inf:
+                            stats += f", INF={n_inf}"
 
-    # Dict-like
-    elif isinstance(obj, Mapping):
-        print(f"{prefix}{name}: dict[{len(obj)}]")
-        for k, v in obj.items():
+                        # Update global stats (skip NaN/Inf so they don't
+                        # poison the running min/max).
+                        finite = flat[torch.isfinite(flat)]
+                        if finite.numel() > 0:
+                            f_min = finite.min().item()
+                            f_max = finite.max().item()
+                            if (
+                                _global_stats["min"] is None
+                                or f_min < _global_stats["min"]
+                            ):
+                                _global_stats["min"] = f_min
+                                _global_stats["min_source"] = f"{name}"
+                            if (
+                                _global_stats["max"] is None
+                                or f_max > _global_stats["max"]
+                            ):
+                                _global_stats["max"] = f_max
+                                _global_stats["max_source"] = f"{name}"
+                        _global_stats["n_nan"] += n_nan
+                        _global_stats["n_inf"] += n_inf
+                    else:
+                        t_min = flat.min().item()
+                        t_max = flat.max().item()
+                        stats = f", min={t_min}, max={t_max}"
+                        if _global_stats["min"] is None or t_min < _global_stats["min"]:
+                            _global_stats["min"] = t_min
+                            _global_stats["min_source"] = f"{name}"
+                        if _global_stats["max"] is None or t_max > _global_stats["max"]:
+                            _global_stats["max"] = t_max
+                            _global_stats["max_source"] = f"{name}"
+                    _global_stats["n_tensors"] += 1
+            except Exception as e:
+                stats = f", <stats failed: {e}>"
+        _lines.append(
+            f"{prefix}{name}: Tensor(shape={tuple(obj.shape)}, "
+            f"dtype={obj.dtype}, device={obj.device}, "
+            f"requires_grad={obj.requires_grad}{stats})"
+        )
+        return _finish()
+
+    # --- Skip class/type objects ---
+    if isinstance(obj, type):
+        _lines.append(f"{prefix}{name}: <class {obj.__name__}>")
+        return _finish()
+
+    # --- Dict-like ---
+    if isinstance(obj, Mapping):
+        _lines.append(f"{prefix}{name}: dict[{len(obj)}]")
+        items = list(obj.items())
+        shown, remaining = items[:max_items], items[max_items:]
+        for k, v in shown:
             debug_structure(
                 v,
                 name=f"[{repr(k)}]",
                 indent=indent + 1,
                 max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
                 visited=visited,
+                _lines=_lines,
+                _global_stats=_global_stats,
             )
+        if remaining:
+            _lines.append(f"{prefix} ... {len(remaining)} more keys")
+        return _finish()
 
-    # List/Tuple
-    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
-        print(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
-
-        for i, v in enumerate(obj):
+    # --- List/Tuple ---
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+        _lines.append(f"{prefix}{name}: {type(obj).__name__}[{len(obj)}]")
+        if len(obj) > max_items and _all_same_signature(obj):
+            debug_structure(
+                obj[0],
+                name="[0..%d] (all identical shape/type)" % (len(obj) - 1),
+                indent=indent + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
+                visited=visited,
+                _lines=_lines,
+                _global_stats=_global_stats,
+            )
+            _lines.append(
+                f"{prefix} ... {len(obj)} items total, showing signature of [0]"
+            )
+            return _finish()
+        shown, remaining = obj[:max_items], obj[max_items:]
+        for i, v in enumerate(shown):
             debug_structure(
                 v,
                 name=f"[{i}]",
                 indent=indent + 1,
                 max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
                 visited=visited,
+                _lines=_lines,
+                _global_stats=_global_stats,
             )
+        if remaining:
+            _lines.append(f"{prefix} ... {len(remaining)} more items")
+        return _finish()
 
-    # HF model outputs / dataclasses / custom objects
-    elif hasattr(obj, "__dict__"):
-        print(f"{prefix}{name}: {type(obj).__name__}")
-
-        for k, v in vars(obj).items():
+    # --- HF model outputs / dataclasses / custom objects ---
+    if hasattr(obj, "__dict__"):
+        _lines.append(f"{prefix}{name}: {type(obj).__name__}")
+        attrs = [
+            (k, v)
+            for k, v in vars(obj).items()
+            if not (k.startswith("__") and k.endswith("__"))
+        ]
+        shown, remaining = attrs[: max_items * 3], attrs[max_items * 3 :]
+        for k, v in shown:
             debug_structure(
-                v, name=f".{k}", indent=indent + 1, max_depth=max_depth, visited=visited
+                v,
+                name=f".{k}",
+                indent=indent + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                show_stats=show_stats,
+                visited=visited,
+                _lines=_lines,
+                _global_stats=_global_stats,
             )
+        if remaining:
+            _lines.append(f"{prefix} ... {len(remaining)} more attrs")
+        return _finish()
 
-    # Primitive
+    # --- Primitive ---
+    value = repr(obj)
+    if len(value) > 120:
+        value = value[:120] + "..."
+    _lines.append(f"{prefix}{name}: {type(obj).__name__} = {value}")
+    return _finish()
+
+
+def _all_same_signature(seq, sample_size=5):
+    """
+    Cheap heuristic: check if the first `sample_size` items in a sequence
+    share the same type and (if tensor-bearing) roughly the same structure.
+    Used to decide whether to collapse a long list (e.g. 30 KV-cache layers)
+    into a single representative summary instead of printing every item.
+    """
+    sample = seq[:sample_size]
+    if not sample:
+        return False
+    first_type = type(sample[0])
+    if any(type(x) is not first_type for x in sample):
+        return False
+
+    def _sig(x):
+        if isinstance(x, torch.Tensor):
+            return (x.shape, x.dtype)
+        if hasattr(x, "__dict__"):
+            sig = {}
+            for k, v in vars(x).items():
+                if isinstance(v, torch.Tensor):
+                    sig[k] = (v.shape, v.dtype)
+            return sig
+        return None
+
+    sigs = [_sig(x) for x in sample]
+    return all(s == sigs[0] for s in sigs) and sigs[0] is not None
+
+
+def resolve_dtype(
+    model: Union[str, nn.Module],
+    device: torch.device,
+    explicit_dtype: Optional[torch.dtype] = None,
+) -> torch.dtype:
+    """
+    Resolve the dtype to use for a model, given:
+      1. An explicit user override (always wins, no inference needed).
+      2. The model's own native/checkpoint dtype (HF config for a model name,
+         actual parameter dtype for an already-built nn.Module).
+      3. A safety clamp for dtype/device combinations known to be unreliable.
+
+    Args:
+        model: HF model name/path (str) or an already-instantiated nn.Module.
+        device: The device this model will actually run on.
+        explicit_dtype: If provided, short-circuits inference entirely —
+            but is still passed through the device safety clamp, since an
+            explicit request for fp16-on-CPU is still fp16-on-CPU.
+
+    Returns:
+        The dtype to load/build the model in.
+    """
+    # 1. Determine the "native" dtype: explicit override, or inferred.
+    if explicit_dtype is not None:
+        native_dtype = explicit_dtype
+    elif isinstance(model, nn.Module):
+        native_dtype = _infer_module_dtype(model)
     else:
-        value = repr(obj)
+        native_dtype = _infer_hf_dtype(model)
 
-        # Truncate huge reprs
-        if len(value) > 120:
-            value = value[:120] + "..."
+    if native_dtype is None:
+        native_dtype = torch.float32  # unknown provenance -> safest fallback
 
-        print(f"{prefix}{name}: {type(obj).__name__} = {value}")
+    # 2. Clamp for known-unsafe dtype/device combinations.
+    if device.type == "cpu":
+        # CPU fp16 kernels are unreliable (weak/incomplete on x86; this is
+        # the root cause of the original inf/nan bug). bf16 and fp32 are
+        # both fine on CPU, so only fp16 gets remapped.
+        return torch.bfloat16 if native_dtype == torch.float16 else native_dtype
+
+    if device.type == "cuda":
+        # bf16 needs Ampere or newer (compute capability >= 8.0);
+        # older GPUs (V100, T4, etc.) will silently misbehave or error.
+        if native_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            return torch.float16
+        return native_dtype
+
+    if device.type == "mps":
+        # bf16 support on Apple's MPS backend has historically been
+        # incomplete depending on torch version; fp16 is the safer bet.
+        return torch.float16 if native_dtype == torch.bfloat16 else native_dtype
+
+    return native_dtype
+
+
+def _infer_hf_dtype(model_name: str) -> Optional[torch.dtype]:
+    """Read the checkpoint's published dtype from its HF config, without
+    downloading any weights."""
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        dtype = getattr(config, "torch_dtype", None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if isinstance(dtype, str) and dtype != "auto":
+            return getattr(torch, dtype, None)
+    except Exception:
+        pass
+    return None
+
+
+def _infer_module_dtype(model: nn.Module) -> Optional[torch.dtype]:
+    """Read the dtype an already-instantiated module is actually holding."""
+    try:
+        return next(model.parameters()).dtype
+    except StopIteration:
+        return None
