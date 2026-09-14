@@ -1,0 +1,63 @@
+name: Release Tensorlink
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Publish Release to PyPI and GitHub
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install Poetry
+      run: pip install poetry
+
+    - name: Install dependencies
+      run: poetry install --only main --no-interaction --no-ansi
+
+    - name: Verify tag matches pyproject version
+      run: |
+        TAG_VERSION=${GITHUB_REF_NAME#v}
+        PYPROJECT_VERSION=$(poetry version -s)
+
+        if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+          echo "Tag version ($TAG_VERSION) does not match pyproject version ($PYPROJECT_VERSION)"
+          exit 1
+        fi
+
+    - name: Build wheel + sdist
+      run: poetry build
+
+    - name: Publish to PyPI
+      env:
+        POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}
+      run: poetry publish --no-interaction
+
+    - name: Build tensorlink node artifact
+      run: |
+        VERSION=${GITHUB_REF_NAME#v}
+        mkdir -p release/tensorlink-node
+        cp -r bin release/tensorlink-node/
+        cp README.md release/tensorlink-node/ || true
+        tar -czf release/tensorlink-node-v${VERSION}.tar.gz -C release tensorlink-node
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          dist/*
+          release/*.tar.gz
+        generate_release_notes: true

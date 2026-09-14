@@ -1,6 +1,6 @@
-from tensorlink.nodes.user import User
-from tensorlink.nodes.validator import Validator
-from tensorlink.nodes.worker import Worker
+from tensorlink.nodes.user_thread import UserThread
+from tensorlink.nodes.validator_thread import ValidatorThread
+from tensorlink.nodes.worker_thread import WorkerThread
 
 from multiprocessing import Queue
 import pytest
@@ -10,16 +10,16 @@ import hashlib
 @pytest.fixture(scope="module")
 def nodes():
     # Initialize nodes
-    worker = Worker(Queue(), Queue(), off_chain_test=True, local_test=True, upnp=False)
-    user = User(Queue(), Queue(), off_chain_test=True, local_test=True, upnp=False)
-    validator = Validator(
+    worker = WorkerThread(Queue(), Queue(), on_chain=False, local_test=True, upnp=False)
+    user = UserThread(Queue(), Queue(), on_chain=False, local_test=True, upnp=False)
+    validator = ValidatorThread(
         Queue(),
         Queue(),
-        off_chain_test=True,
+        on_chain=False,
         local_test=True,
         upnp=False,
         endpoint=False,
-    )  # Must turn off endpoint for pytest
+    )
 
     # Start nodes
     worker.start()
@@ -40,8 +40,8 @@ def test_node_start(nodes):
     worker, user, validator = nodes
 
     # Connect worker and user to validator
-    worker.connect_node(validator.rsa_key_hash, validator.host, validator.port)
-    user.connect_node(validator.rsa_key_hash, validator.host, validator.port)
+    worker.connect_node(validator.host, validator.port, validator.rsa_key_hash)
+    user.connect_node(validator.host, validator.port, validator.rsa_key_hash)
 
     assert (
         worker.is_alive()

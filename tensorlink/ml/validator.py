@@ -1,19 +1,35 @@
-from tensorlink.ml.graphing import ModelParser
+from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
-from tensorlink.ml.module import DistributedModel
-from tensorlink.ml.utils import load_models_cache, save_models_cache
+from tensorlink.ml.module import DistributedModel, OffloadedModule
+from tensorlink.ml.utils.formatter import (
+    ResponseFormatter,
+    normalize_generate_args,
+    format_chat_prompt,
+    extract_reasoning_and_answer,
+    post_process_output_ids,
+)
+from tensorlink.ml.utils.utils import (
+    load_models_cache,
+    save_models_cache,
+    attach_tensor,
+)
+from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.api.models import GenerationRequest
+from tensorlink.nodes.job_monitor import JobStatus
 
 from transformers import AutoTokenizer, TextIteratorStreamer
 from collections import defaultdict
-from threading import Thread
+from threading import Thread, Lock
 import torch
 import logging
+import inspect
+import hashlib
 import json
 import time
-import gc
 import re
+import gc
 import os
+
 
 # Path to package root
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,115 +43,118 @@ with open(SUPPORTED_MODELS_PATH, "rb") as f:
     DEFAULT_MODELS = MODELS["DEFAULT_MODELS"]
 
 
-def extract_assistant_response(text: str, model_name: str = None) -> str:
+class RemoteStreamer:
+    def __init__(self, poll_fn, sleep=0.01):
+        self.poll_fn = poll_fn
+        self.sleep = sleep
+        self.done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.done:
+            raise StopIteration
+
+        while True:
+            try:
+                token = self.poll_fn()
+            except Exception as e:
+                self.done = True
+                raise StopIteration from e
+
+            if token is None:
+                time.sleep(self.sleep)
+                continue
+
+            if token == "__END__":
+                self.done = True
+                raise StopIteration
+
+            return token
+
+
+def _supports_reasoning(tokenizer):
     """
-    Universal extractor that removes system/user/thought tags and returns
-    the final human-readable assistant response.
+    Check if a tokenizer supports reasoning mode (enable_thinking parameter).
+
+    Args:
+        tokenizer: HuggingFace tokenizer instance
+
+    Returns:
+        bool: True if tokenizer supports enable_thinking parameter
     """
+    if not hasattr(tokenizer, 'apply_chat_template'):
+        return False
 
-    # Remove reasoning or hidden thought blocks (e.g. <think>...</think>)
-    text = re.sub(
-        r"<\s*(think|reflection|thought|internal|analysis)\s*>.*?<\s*/\1\s*>",
-        "",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    try:
+        # Get the signature of apply_chat_template
+        sig = inspect.signature(tokenizer.apply_chat_template)
 
-    # Remove common chat tags used by newer models
-    text = re.sub(r"<\|im_start\|>\s*\w+\s*", "", text)
-    text = re.sub(r"<\|im_end\|>", "", text)
-    text = re.sub(r"<\|assistant\|>", "", text)
-    text = re.sub(r"<\|user\|>", "", text)
-    text = re.sub(r"<\|system\|>", "", text)
+        # Check if 'enable_thinking' is a parameter
+        return 'enable_thinking' in sig.parameters
 
-    # Strip out any prefixes like "assistant:" or "Assistant:"
-    text = re.sub(r"(?i)\bassistant\s*[:：]\s*", "", text)
-
-    # Remove lingering system/user scaffolding
-    text = re.sub(r"(?i)\b(system|user)\s*[:：]\s*", "", text)
-    text = text.strip().replace("\r", "")
-
-    # If multiple paragraphs, prefer the last coherent chunk
-    # (models sometimes prepend hidden reasoning)
-    if "\n\n" in text:
-        parts = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 10]
-        if parts:
-            text = parts[-1]
-
-    # Fallback: if text still empty, just return as-is (safe default)
-    return text.strip() or "[No output produced]"
+    except Exception:
+        return False
 
 
-def format_chat_prompt(model_name, current_message, history):
-    """Format the chat history and current message into a prompt suitable for the specified model."""
-
-    # Different models require different formatting
-    if "Qwen" in model_name:
-        # Qwen-specific formatting
-        system_prompt = (
-            "You are a helpful assistant. Respond directly to the user's questions."
-        )
-
-        formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-
-        # Add conversation history
-        if history and len(history) > 0:
-            for msg in history:
-                role = msg["role"]
-                content = msg["content"]
-                formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-
-        # Add the current message
-        formatted_prompt += f"<|im_start|>user\n{current_message}<|im_end|>\n"
-        formatted_prompt += "<|im_start|>assistant\n"
-
-        return formatted_prompt
-
-    elif "llama" in model_name.lower():
-        # Llama-style formatting
-        system_prompt = (
-            "You are a helpful assistant. Respond directly to the user's questions."
-        )
-        formatted_prompt = f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
-
-        # Add conversation history
-        if history and len(history) > 0:
-            for i, msg in enumerate(history):
-                if msg["role"] == "user":
-                    if i > 0:
-                        formatted_prompt += "[/INST]\n\n[INST] "
-                    formatted_prompt += f"{msg['content']}"
-                else:  # assistant
-                    formatted_prompt += f" [/INST]\n\n{msg['content']}\n\n[INST] "
-
-        # Add the current message and prepare for response
-        formatted_prompt += f"{current_message} [/INST]\n\n"
-
-        return formatted_prompt
-
+def _post_process_output(request, tokenizer, formatted_prompt, text):
+    # Remove prompt echo
+    if text.startswith(formatted_prompt):
+        text = text[len(formatted_prompt) :].strip()
     else:
-        # Generic formatting for other models
-        system_prompt = (
-            "You are a helpful assistant. Respond directly to the user's questions."
-        )
-        formatted_prompt = f"System: {system_prompt}\n\n"
+        text = text.strip()
 
-        # Add conversation history
-        if history and len(history) > 0:
-            for msg in history:
-                role_prefix = "User: " if msg["role"] == "user" else "Assistant: "
-                formatted_prompt += f"{role_prefix}{msg['content']}\n\n"
+    reasoning_text = None
 
-        # Add the current message
-        formatted_prompt += f"User: {current_message}\n\nAssistant: "
+    # Only extract reasoning if chat format AND reasoning is supported/enabled
+    if request.input_format == "chat":
+        reasoning_supported = getattr(request, '_reasoning_supported', False)
 
-        return formatted_prompt
+        # Extract reasoning blocks if the model/tokenizer supports it
+        if reasoning_supported:
+            reasoning_text, text = extract_reasoning_and_answer(text)
+
+            # Only include reasoning in response if explicitly requested
+            if not request.reasoning:
+                reasoning_text = None
+
+    return reasoning_text, text
 
 
 class DistributedValidator(DistributedWorker):
-    def __init__(self, node, trusted=False, endpoint=True):
+    """
+    Backend logic for handling Distributed Models, assigning workers, and
+    handling job requests from users. To be run alongside the background
+    ValidatorThread that manages its networking, event loops, connections, etc.
+    Validators do not perform heavy computation by default but can be configured
+    to also host modules via enable_hosting.
+    """
+
+    def __init__(
+        self,
+        node,
+        trusted: bool = False,
+        endpoint: bool = True,
+        enable_hosting: bool = False,
+        max_memory_gb: float = 0,
+        max_module_gb: float = 0,
+    ):
+        """
+        Args:
+
+        """
         super().__init__(node, trusted)
         self.endpoint = endpoint
+        self._hosting_enabled = enable_hosting
+
+        self._max_memory_bytes = int(max_memory_gb * 1e9)  # Convert to bytes
+        self._max_module_bytes = int(max_module_gb * 1e9)
+
+        if not self._hosting_enabled:
+            self._max_module_bytes = 0
+            self._max_memory_bytes = 0
+
         self.model_cache = load_models_cache()
         self.models = {}  # job_id -> model instance
         self.model_state = (
@@ -144,16 +163,21 @@ class DistributedValidator(DistributedWorker):
         self.public_models = defaultdict(list)  # Model name -> list(job_id)
 
         self.tokenizers = {}
-        self.GC_CHECK_INTERVAL = 1_000
-        self.CHECK_COUNTER = 1
 
-        # Track models that are in the process of being initialized (job_id)
-        self.models_initializing = set()
+        # Track models that are in the process of being initialized
+        self.models_initializing = set()  # job_id
 
         # Configuration
-        self.TRACKING_DAYS = 7  # Track requests for past 7 days
+        self.TRACKING_DAYS = 7  # Track requests for past 1 day
         self.MIN_REQUESTS_THRESHOLD = 10  # Minimum requests to consider auto-loading
         self.MAX_AUTO_MODELS = 10  # Maximum models to auto-load
+
+        # Track reserved host memory during initialization
+        self.host_memory_reserved = 0
+        self.initializing_reservations = {}  # job_id -> reserved_memory
+
+        # Lock for thread-safe memory operations
+        self.memory_lock = Lock()
 
     def _ensure_model_entry(self, model_name: str):
         """Ensure a model has an entry in the cache with proper structure"""
@@ -293,6 +317,7 @@ class DistributedValidator(DistributedWorker):
             desired_instances[model_name] = round(share * self.MAX_AUTO_MODELS)
 
         can_allocate = True
+
         # Ensure each model has at least one instance
         for model_name, desired in desired_instances.items():
             if not can_allocate:
@@ -314,6 +339,8 @@ class DistributedValidator(DistributedWorker):
                     ),
                 )
                 can_allocate = self._initialize_hosted_job(model_name)
+                if not can_allocate:
+                    break
 
         # Finalize any first-load initializations
         if self.models_initializing:
@@ -321,9 +348,6 @@ class DistributedValidator(DistributedWorker):
 
         # Allocate duplicates based on proportional demand
         for model_name, target_count in desired_instances.items():
-            if not can_allocate:
-                break
-
             current_total = len(self.public_models.get(model_name, []))
             current_total += sum(
                 1 if job_id in self.models_initializing else 0
@@ -346,11 +370,16 @@ class DistributedValidator(DistributedWorker):
                     if not can_allocate:
                         break
 
+            if not can_allocate:
+                break
+
         # Finalize any duplicate initializations
         if self.models_initializing:
             self._try_finalize_initializing_models()
 
-    def inspect_model(self, model_name: str, job_data: dict, hosted=False) -> dict:
+    def inspect_model(
+        self, model_name: str, job_data: dict, hosted: bool = False
+    ) -> dict:
         """Inspect a model to determine network requirements and store distribution in JSON cache"""
         parser = ModelParser()
         model_name: str = job_data.get("model_name", model_name)
@@ -373,23 +402,31 @@ class DistributedValidator(DistributedWorker):
             optimizer_type = job_data["optimizer"]["type"]
             optimizer_spec = job_data.get("optimizer")
 
+        # Get available host memory accounting for concurrent initializations
+        if hosted:
+            available_host_memory = self._get_available_host_memory()
+            host_memory_budget = available_host_memory
+        else:
+            host_memory_budget = 0
+            # host_memory_budget = job_data.get("available_memory", 0)
+
         # Load HF model, create and save distribution
         distribution = parser.create_distributed_config(
             model_name,
             workers=workers,
             training=job_data.get("training", False),
             trusted=False,
-            handle_layers=False,
             input_obfuscation=False,
             optimizer_type=optimizer_type,
             optimizer_spec=optimizer_spec,
-            host_load_small=hosted,
+            host_max_memory_bytes=host_memory_budget,
+            host_max_module_bytes=self._max_module_bytes,
             host_max_depth=1,
-            host_threshold_mb=75,
             max_offload_depth=3,
             batch_size=job_data.get("batch_size", batch_size),
             max_seq_len=job_data.get("max_seq_len", 4096),
             model_type=job_data.get("model_type", "chat"),
+            force_tied_to_host=True if host_memory_budget > 0 else False,
         )
 
         job_data["distribution"] = distribution
@@ -403,10 +440,20 @@ class DistributedValidator(DistributedWorker):
         if (
             len(distribution["config"]) == 0
             or offloaded_count
-            > 4  # TODO This limit on number of distributions is not ideal
+            > 6  # TODO This limit on number of distributions is not ideal
             or not distribution["success"]
         ):
             return {}
+
+        if job_data.get("id") is None:
+            job_data["time"] = time.time()
+            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
+            job_data["id"] = job_id
+
+        # Reserve the host memory this model will use
+        host_memory_used = distribution.get("host_memory_used", 0)
+        if host_memory_used > 0:
+            self._reserve_host_memory(job_data["id"], host_memory_used)
 
         # Store distribution in JSON cache
         self._ensure_model_entry(model_name)
@@ -416,13 +463,15 @@ class DistributedValidator(DistributedWorker):
         self.send_request(
             "debug_print",
             (
-                f"DistributedValidator -> Retrieved HF model: {job_data}",
+                f"DistributedValidator -> Retrieved HF model: {job_data}, Reserved: {host_memory_used / 1e9:.2f}GB",
                 "bright_blue",
                 logging.DEBUG,
             ),
         )
 
-        gc.collect()  # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Send out job request
         try:
@@ -430,68 +479,75 @@ class DistributedValidator(DistributedWorker):
             return new_job_data
 
         except Exception as e:
-            print(str(e))
+            self._release_host_memory(job_data["id"])
+            raise e
 
     def check_node(self):
         """Check for node requests/updates"""
         try:
             # When running on the public network, manage models automatically
-            if not self.node.init_kwargs.get("endpoint", False):
+            if self.node.config.endpoint and self.node.config.on_chain:
                 # Periodic cleanup and model management
                 if self.CHECK_COUNTER % self.GC_CHECK_INTERVAL == 0:
                     # Clean up old request data
                     self._cleanup_old_requests()
 
-                    # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
-                    self._manage_auto_loaded_models()
+                    # Manage any ghost memory caches
+                    self._audit_memory_reservations()
 
                     # Check if jobs are still active
                     for job_id, model in self.models.items():
                         model_name = model.model_name
                         if self._is_model_ready(job_id):
                             is_active = self.send_request(
-                                "check_job", (model_name, job_id)
+                                "check_job_status", (model_name, job_id)
                             )
                             if not is_active:
                                 self._remove_hosted_job(job_id)
 
+                if (
+                    self.CHECK_COUNTER % (self.GC_CHECK_INTERVAL * 20) == 0
+                ):  # less frequent than garbage collection
+                    # Manage autoloaded models based on popularity (or DEFAULT_MODELS fallback)
+                    # self._manage_auto_loaded_models()
                     self.CHECK_COUNTER = 1
 
-                if self.models_initializing:
-                    # Only call model management if we have models actively initializing
-                    self._try_finalize_initializing_models()
+                # Only call model management if we have models actively initializing
+                self._try_finalize_initializing_models()
 
-            # Get job data for inspection to see if we can accommodate the model
-            job_data = self.send_request("get_jobs", None)
-            if isinstance(job_data, dict):
-                model_name: str = job_data.get("model_name", "")
+            if self.CHECK_COUNTER % self.GC_CHECK_INTERVAL // 5 == 0:
+                # Get job data for inspection to see if we can accommodate the model
+                job_data = self.send_request("get_jobs", None)
+                if isinstance(job_data, dict):
+                    model_name: str = job_data.get("model_name", "")
 
-                if job_data.get("api"):
-                    payment = job_data.get("payment", 0)
-                    time_limit = job_data.get("time", 1800)
-                    job_id = job_data.get("id")
+                    if job_data.get("api"):
+                        payment = job_data.get("payment", 0)
+                        time_limit = job_data.get("time", 1800)
+                        job_id = job_data.get("id")
 
-                    # Check if this is a public job and there are already models of this type
-                    self._initialize_hosted_job(
-                        model_name,
-                        job_data=job_data,
-                        payment=payment,
-                        time_limit=time_limit,
-                    )
+                        # Check if this is a public job and there are already models of this type
+                        can_allocate = self._initialize_hosted_job(
+                            model_name,
+                            job_data=job_data,
+                            payment=payment,
+                            time_limit=time_limit,
+                        )
 
-                    # Try to finalize if already initializing
-                    if job_id in self.models_initializing:
-                        self._finalize_hosted_job(model_name)
+                        # Try to finalize if already initializing
+                        if can_allocate:
+                            self._finalize_hosted_job(job_id)
 
-                else:
-                    # If request via user node, begin the model reqs inspection for the job request
-                    self.inspect_model(model_name, job_data, hosted=False)
+                    else:
+                        # If request via user node, begin the model reqs inspection for the job request
+                        self.inspect_model(model_name, job_data, hosted=False)
 
             # Check for inference generate calls
             for job_id, distributed_model in self.models.items():
                 if self._is_model_ready(job_id):
                     model_name = distributed_model.model_name
-                    # TODO Distinguish private generate requests from public ones so we dont use the same model?
+                    # TODO Distinguish private generate requests from public ones so we dont use the same model
+
                     generate_request = self.send_request(
                         "update_api_request", (model_name, job_id)
                     )
@@ -499,213 +555,350 @@ class DistributedValidator(DistributedWorker):
                         self._handle_generate_request(generate_request, job_id)
 
         except Exception as e:
-            logging.error(f"Error checking for jobs: {str(e)}")
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> Error checking for jobs: {e}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
 
         self.CHECK_COUNTER += 1
 
-    # def _handle_check_model_status(self, model_name: str):
-    #     """Check the loading status of a model"""
-    #     if model_name in self.models:
-    #         if self._is_model_ready(model_name):
-    #             # Model is fully loaded
-    #             return {
-    #                 "status": "loaded",
-    #                 "message": f"Model {model_name} is loaded and ready",
-    #             }
-    #         else:
-    #             # Model is in the process of loading
-    #             return {
-    #                 "status": "loading",
-    #                 "message": f"Model {model_name} is currently loading",
-    #             }
-    #
-    #     elif model_name in self.models_initializing:
-    #         return {
-    #             "status": "loading",
-    #             "message": f"Model {model_name} initialization in progress",
-    #         }
-    #     else:
-    #         return {
-    #             "status": "not_loaded",
-    #             "message": f"Model {model_name} is not loaded",
-    #         }
+    def _prepare_generation(self, request, job_id):
+        distributed_model = self.models[job_id]
+        tokenizer = self.tokenizers[request.hf_name]
+
+        # Format Prompt
+        if request.input_format == "chat":
+            formatted_prompt, reasoning_supported = format_chat_prompt(
+                request.message,
+                request.history,
+                enable_thinking=request.reasoning,
+                tokenizer=tokenizer,
+            )
+
+            # Track whether reasoning is actually supported
+            request._reasoning_supported = reasoning_supported
+
+            # Log if reasoning was requested but not supported
+            if request.reasoning and not reasoning_supported:
+                print(
+                    f"Note: Reasoning requested for {request.hf_name} but tokenizer "
+                    f"doesn't support enable_thinking. Using manual prompt formatting."
+                )
+        else:
+            formatted_prompt = request.message
+            request._reasoning_supported = False
+
+        # Tokenize
+        model_max_length = getattr(tokenizer, "model_max_length", 2048)
+        if model_max_length > 100000:
+            model_max_length = 2048
+
+        max_length = getattr(request, "max_length", 512) or 512
+        max_length = min(max_length, model_max_length - 10)
+
+        inputs = tokenizer(
+            formatted_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+        )
+
+        input_ids = inputs.input_ids.to(self.device)
+        prompt_tokens = input_ids.shape[1]
+
+        # Normalize args
+        args = normalize_generate_args(
+            request,
+            tokenizer,
+            prompt_tokens=prompt_tokens,
+            model_max_length=model_max_length,
+        )
+
+        return {
+            "distributed_model": distributed_model,
+            "tokenizer": tokenizer,
+            "formatted_prompt": formatted_prompt,
+            "input_ids": input_ids,
+            "prompt_tokens": prompt_tokens,
+            "reasoning_supported": getattr(request, '_reasoning_supported', False),
+            "args": args,
+        }
 
     def _handle_generate_request(self, request: GenerationRequest, job_id: str):
-        # Record the request for tracking
+        """Main entry point for generate requests"""
         self._record_request(request.hf_name)
 
         if not self._is_model_ready(job_id):
-            request.output = (
-                "Model is currently not available through the Tensorlink API."
+            error_response = ResponseFormatter.format_error_response(
+                error_message="Model is currently not available through the Tensorlink API.",
+                error_type="model_unavailable",
+                status_code=503,
+                request_id=str(request.id),
             )
-        elif hasattr(request, "stream") and request.stream:
+            request.output = error_response["error"]["message"]
+            request.formatted_response = error_response
+            self.send_request("update_api_request", (request,))
+            return
+
+        request.start_time = getattr(request, "start_time", time.time())
+
+        if hasattr(request, "stream") and request.stream:
+            # Streaming generation
             self._generate_streaming(request, job_id)
         else:
-            distributed_model = self.models[job_id]
-
-            tokenizer = self.tokenizers[request.hf_name]
-
-            # Format chat history into a standardized prompt
-            formatted_prompt = format_chat_prompt(
-                request.hf_name, request.message, request.history
-            )
-
-            # Tokenize formatted prompt
-            inputs = tokenizer(
-                formatted_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=request.max_length if request.max_length else 512,
-            )
-
             # Generate
-            with torch.no_grad():
-                outputs = distributed_model.generate(
-                    inputs.input_ids,
-                    max_new_tokens=(
-                        request.max_new_tokens
-                        if hasattr(request, 'max_new_tokens')
-                        else 2048
-                    ),
-                    temperature=request.temperature if request.temperature else 0.6,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    do_sample=(
-                        request.do_sample if hasattr(request, 'do_sample') else True
-                    ),
-                    num_beams=request.num_beams if request.num_beams else 1,
-                )
+            self._generate(request, job_id)
 
-            # Decode generated tokens
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # Many models echo the prompt, so remove it
-            if generated_text.startswith(formatted_prompt):
-                request.output = generated_text[len(formatted_prompt) :].strip()
-            else:
-                request.output = generated_text
-
-        # Return the clean response
         self.send_request("update_api_request", (request,))
+
+    def _generate(self, request, job_id):
+        """
+        Fetches tokenizer, ensures generate arguments are not problematic with
+        normalize_generate_args, and calls DistributedModel.generate.
+        """
+        try:
+            ctx = self._prepare_generation(request, job_id)
+        except ValueError as e:
+            request.output = f"Error: {str(e)}"
+            request.formatted_response = ResponseFormatter.format_error_response(
+                error_message=str(e),
+                error_type="prompt_too_long",
+                status_code=400,
+                request_id=str(request.id),
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> {request.output}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+            return
+
+        distributed_model = ctx["distributed_model"]
+        tokenizer = ctx["tokenizer"]
+        formatted_prompt = ctx["formatted_prompt"]
+        input_ids = attach_tensor(ctx["input_ids"], self.device)
+        prompt_tokens = ctx["prompt_tokens"]
+        args = ctx["args"]
+
+        try:
+            with torch.no_grad():
+                outputs = distributed_model.generate(input_ids, **args)
+
+            new_token_ids = outputs[0][prompt_tokens:].tolist()
+            reasoning_text, text = post_process_output_ids(
+                new_token_ids, tokenizer, enable_thinking=ctx["reasoning_supported"]
+            )
+
+            request.output = text
+            completion_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+
+            request.formatted_response = (
+                ResponseFormatter.format_non_streaming_response(
+                    request=request,
+                    output_text=text,
+                    reasoning_text=reasoning_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    start_time=request.start_time,
+                )
+            )
+
+        except RuntimeError as e:
+            error_msg = f"Generation failed: {str(e)}"
+            request.output = error_msg
+            request.formatted_response = ResponseFormatter.format_error_response(
+                error_message=error_msg,
+                error_type="generation_error",
+                status_code=500,
+                request_id=str(request.id),
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> {error_msg}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+            return
 
     def _generate_streaming(self, request: GenerationRequest, job_id: str):
         """
-        Handle streaming generation requests using TextIteratorStreamer.
-        Sends tokens to the API as they're generated.
+        Fetches tokenizer, ensures generate arguments are not problematic with
+        normalize_generate_args, and calls DistributedModel.generate with stream.
         """
         try:
-            # Prepare input
-            distributed_model = self.models[job_id]
-            tokenizer = self.tokenizers[request.hf_name]
+            start_time = getattr(request, "start_time", time.time())
 
-            # Format chat history into a standardized prompt
-            formatted_prompt = format_chat_prompt(
-                request.hf_name, request.message, request.history
-            )
+            ctx = self._prepare_generation(request, job_id)
+            distributed_model = ctx["distributed_model"]
+            tokenizer = ctx["tokenizer"]
+            formatted_prompt = ctx["formatted_prompt"]
+            input_ids = ctx["input_ids"]
+            prompt_tokens = ctx["prompt_tokens"]
+            args = ctx["args"]
 
-            # Tokenize formatted prompt
-            inputs = tokenizer(
-                formatted_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=request.max_length if request.max_length else 512,
-            )
-            input_ids = inputs.input_ids.to(self.device)
+            # Build kwargs
+            generation_kwargs = {
+                "input_ids": input_ids,
+                **args,
+            }
 
-            # Calculate prompt tokens for usage stats
-            prompt_tokens = input_ids.shape[1]
+            # Setup streamer + thread
+            if isinstance(distributed_model.model, OffloadedModule):
+                generation_kwargs["stream"] = True
 
-            # Create text generation streamer
-            streamer = TextIteratorStreamer(
-                tokenizer, skip_prompt=True, skip_special_tokens=True
-            )
+                module_id = distributed_model.model.module_id
+                streamer = RemoteStreamer(
+                    poll_fn=lambda: self._poll_remote_token(module_id, tokenizer)
+                )
 
-            generation_kwargs = dict(
-                input_ids=input_ids,
-                streamer=streamer,
-                max_new_tokens=(
-                    request.max_new_tokens
-                    if hasattr(request, 'max_new_tokens')
-                    else 2048
-                ),
-                temperature=request.temperature if request.temperature else 0.6,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                do_sample=(
-                    request.do_sample if hasattr(request, 'do_sample') else True
-                ),
-                num_beams=request.num_beams if request.num_beams else 1,
-            )
+                generation_thread = Thread(
+                    target=distributed_model.generate,
+                    kwargs=generation_kwargs,
+                    daemon=True,
+                )
+                generation_thread.start()
 
-            # Start generation in a separate thread
-            generation_thread = Thread(
-                target=distributed_model.generate, kwargs=generation_kwargs
-            )
-            generation_thread.start()
+            else:
+                streamer = TextIteratorStreamer(
+                    tokenizer, skip_prompt=True, skip_special_tokens=True
+                )
 
-            # Stream tokens as they're generated
+                generation_kwargs["streamer"] = streamer
+
+                generation_thread = Thread(
+                    target=distributed_model.generate,
+                    kwargs=generation_kwargs,
+                    daemon=True,
+                )
+                generation_thread.start()
+
+            # Stream tokens
             full_text = ""
             token_count = 0
+            in_reasoning_block = False
+            reasoning_buffer = ""
+
+            # Try and identify think sections via regex
+            start_re = re.compile(
+                r"<\s*(think|reflection|thought|internal|analysis)\s*>",
+                re.IGNORECASE,
+            )
+            end_re = re.compile(
+                r"<\s*/\s*(think|reflection|thought|internal|analysis)\s*>",
+                re.IGNORECASE,
+            )
 
             for token_text in streamer:
                 full_text += token_text
-                token_count += 1
 
-                # Send token update to API
-                self.send_request(
-                    "update_stream",
-                    (
-                        request.id,
-                        {
-                            "token": token_text,
-                            "done": False,
-                            "token_id": token_count,
-                            "timestamp": time.time(),
-                        },
-                    ),
-                )
+                if request.input_format == "chat" and not request.reasoning:
 
-            # Wait for generation thread to complete
-            generation_thread.join()
+                    if not in_reasoning_block:
+                        if start_re.search(token_text):
+                            in_reasoning_block = True
+                            reasoning_buffer = token_text
+                            continue
+                    else:
+                        reasoning_buffer += token_text
+                        if end_re.search(reasoning_buffer):
+                            in_reasoning_block = False
+                            reasoning_buffer = ""
+                        continue
 
-            # Clean up the response
-            cleaned_text = extract_assistant_response(full_text, request.hf_name)
+                if not in_reasoning_block:
+                    token_count += 1
 
-            # Send final completion message
-            self.send_request(
-                "update_stream",
-                (
-                    request.id,
-                    {
-                        "token": "",
-                        "done": True,
-                        "full_text": cleaned_text,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": token_count,
-                        "total_tokens": token_count,
-                        "timestamp": time.time(),
-                    },
-                ),
+                    formatted_chunk = ResponseFormatter.format_stream_chunk(
+                        request=request,
+                        token_text=token_text,
+                        index=token_count,
+                        start_time=start_time,
+                    )
+
+                    self.send_request(
+                        "update_stream",
+                        (request.id, {"chunk": formatted_chunk, "done": False}),
+                    )
+
+            if generation_thread.is_alive():
+                generation_thread.join(timeout=1)
+                if generation_thread.is_alive():
+                    self.send_request(
+                        "debug_print",
+                        (
+                            "Generation thread did not finish within timeout",
+                            "yellow",
+                            logging.WARNING,
+                        ),
+                    )
+
+            # Finalize output
+            reasoning_text = None
+            cleaned_text = full_text
+            if request.input_format == "chat":
+                reasoning_text, cleaned_text = extract_reasoning_and_answer(full_text)
+                if not request.reasoning:
+                    reasoning_text = None
+
+            request.output = cleaned_text
+            final_chunk = ResponseFormatter.format_stream_final(
+                request=request,
+                start_time=start_time,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=token_count,
+                full_text=cleaned_text,
+                reasoning_text=reasoning_text,
             )
 
-            # Also set the final output on the request object
-            request.output = cleaned_text
+            self.send_request(
+                "update_stream",
+                (request.id, {"done": True, "final_chunk": final_chunk}),
+            )
 
         except Exception as e:
-            # Send error to API
+            error_chunk = ResponseFormatter.format_stream_error(
+                error_message=str(e),
+                error_type="generation_error",
+            )
+
             self.send_request(
                 "update_stream",
-                (
-                    request.id,
-                    {
-                        "token": "",
-                        "done": True,
-                        "error": str(e),
-                        "timestamp": time.time(),
-                    },
-                ),
+                (request.id, {"done": True, "final_chunk": error_chunk}),
             )
+
             request.output = f"Error during generation: {str(e)}"
+
+    def _poll_remote_token(self, module_id: str, tokenizer):
+        item = self.send_request("check_token", (module_id,))
+
+        if item is None:
+            return None
+
+        if item["type"] == "end":
+            return "__END__"
+
+        if item["type"] == "token":
+            token_id = item["token"]
+
+            # Decode exactly one token
+            text = tokenizer.decode(
+                [token_id],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+
+            return text
+
+        return None
 
     def _try_finalize_initializing_models(self):
         """Attempt to finalize all models that are currently initializing."""
@@ -735,8 +928,9 @@ class DistributedValidator(DistributedWorker):
             # Prepare job data for inspection
             defaults = {
                 "author": None,
-                "active": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": True,
+                "api": True,
                 "training": False,
                 "payment": payment,
                 "time": time_limit,
@@ -766,14 +960,15 @@ class DistributedValidator(DistributedWorker):
                 model_name,
                 node=self.node,
                 training=False,
+                config=job_data.get("distribution"),
             )
-            distributed_model.config = job_data.get("distribution")
 
             self.models[job_id] = distributed_model
 
             if job_data.get("public"):
                 self.public_models[model_name].append(job_id)
 
+            self.send_request("update_job_status", (job_id, "initializing"))
             self.model_state[job_id] = "initializing"
             self.models_initializing.add(job_id)
             return True
@@ -782,6 +977,7 @@ class DistributedValidator(DistributedWorker):
             logging.error(f"Error initializing hosted job for {model_name}: {str(e)}")
             job_id = job_data.get("id")
             self.models_initializing.discard(job_id)
+            self._release_host_memory(job_id)
             del self.models[job_id]
             if job_id in self.model_state:
                 del self.model_state[job_id]
@@ -798,7 +994,6 @@ class DistributedValidator(DistributedWorker):
                 # Module not ready yet
                 return False
 
-            model_name = args["model_name"]
             distribution = args["distribution"]
             optimizer_name = args["optimizer"]
             training = args["training"]
@@ -809,6 +1004,9 @@ class DistributedValidator(DistributedWorker):
 
             # Get the DistributedModel instance
             distributed_model = self.models[job_id]
+
+            if not distribution:
+                distribution = distributed_model.config
 
             # Update state
             self.model_state[job_id] = "distributing"
@@ -822,10 +1020,19 @@ class DistributedValidator(DistributedWorker):
             # Distribute the model across workers
             distributed_model.distribute_model(distribution)
             distributed_model.job_id = job_id
+            model_name = distributed_model.model_name
+
+            # Update available GPU memory
+            self._release_host_memory(job_id)
+
+            self.send_request("update_job_status", (job_id, "active"))
 
             # Load tokenizer
             if model_name not in self.tokenizers:
-                self.tokenizers[model_name] = AutoTokenizer.from_pretrained(model_name)
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                setattr(tokenizer, "supports_reasoning", _supports_reasoning(tokenizer))
+                self.tokenizers[model_name] = tokenizer
+
             setattr(distributed_model, 'tokenizer', self.tokenizers[model_name])
 
             # Mark as ready
@@ -835,7 +1042,7 @@ class DistributedValidator(DistributedWorker):
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedValidator -> Finalized hosted job for {model_name} with module_id {module_id}",
+                    f"Finalized hosted job for {model_name} with job_id {job_id}",
                     "green",
                     logging.INFO,
                 ),
@@ -846,6 +1053,7 @@ class DistributedValidator(DistributedWorker):
         except Exception as e:
             logging.error(f"Error finalizing hosted job for {model_name}: {str(e)}")
             self.models_initializing.discard(job_id)
+            self._release_host_memory(job_id)
             if job_id in self.models:
                 del self.models[job_id]
             return False
@@ -853,6 +1061,8 @@ class DistributedValidator(DistributedWorker):
     def _remove_hosted_job(self, job_id: str):
         """Remove a hosted job and clean up all associated resources"""
         try:
+            self._release_host_memory(job_id)
+
             # Remove from initializing set if present
             self.models_initializing.discard(job_id)
 
@@ -930,6 +1140,8 @@ class DistributedValidator(DistributedWorker):
 
             # Force garbage collection to free memory
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             self.send_request(
                 "debug_print",
@@ -951,6 +1163,74 @@ class DistributedValidator(DistributedWorker):
                 ),
             )
 
+    def _reserve_host_memory(self, job_id: str, amount: int):
+        """Reserve host memory for a model being initialized"""
+        with self.memory_lock:
+            self.host_memory_reserved += amount
+            self.initializing_reservations[job_id] = amount
+
+    def _release_host_memory(self, job_id: str):
+        """Release reserved host memory when initialization completes or fails"""
+        with self.memory_lock:
+            if job_id in self.initializing_reservations:
+                reserved = self.initializing_reservations[job_id]
+                self.host_memory_reserved -= reserved
+                del self.initializing_reservations[job_id]
+
+    def _get_available_host_memory(self) -> int:
+        """Get currently available host memory accounting for reservations"""
+        available_memory = 0
+        max_memory_bytes = self._max_memory_bytes
+        if max_memory_bytes <= 0:
+            max_memory_bytes = (
+                1e15  # Set to massive number (1PB) when max vram was not specified
+            )
+
+        if self._hosting_enabled:
+            with self.memory_lock:
+                total_memory = min(get_gpu_memory(), max_memory_bytes)
+                available_memory += total_memory - self.host_memory_reserved
+
+        return available_memory
+
+    def _audit_memory_reservations(self):
+        """
+        Audit memory reservations and clean up any orphaned reservations.
+        Called periodically to prevent memory leaks from edge cases.
+        """
+        with self.memory_lock:
+            # Find job_ids that have reservations but aren't in models or models_initializing
+            orphaned_reservations = []
+
+            for job_id in list(self.initializing_reservations.keys()):
+                if job_id not in self.models and job_id not in self.models_initializing:
+                    orphaned_reservations.append(job_id)
+
+            # Release orphaned reservations
+            for job_id in orphaned_reservations:
+                reserved = self.initializing_reservations[job_id]
+                self.host_memory_reserved -= reserved
+                del self.initializing_reservations[job_id]
+
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Released orphaned reservation: {job_id} ({reserved / 1e9:.2f}GB)",
+                        "yellow",
+                        logging.WARNING,
+                    ),
+                )
+
+            if orphaned_reservations:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Memory audit: Released {len(orphaned_reservations)} orphaned reservations. "
+                        f"Total reserved: {self.host_memory_reserved / 1e9:.2f}GB",
+                        "cyan",
+                        logging.INFO,
+                    ),
+                )
+
     def main_loop(self):
         self.check_node()
-        time.sleep(0.001)

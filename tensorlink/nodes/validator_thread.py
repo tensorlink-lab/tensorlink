@@ -1,7 +1,7 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
-from tensorlink.nodes.contract_manager import ContractManager
-from tensorlink.nodes.job_monitor import JobMonitor
+from tensorlink.eth.contract_manager import ContractManager
+from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
 
@@ -16,10 +16,20 @@ import time
 import os
 
 
-FREE_JOB_MAX_TIME = 60 * 30  # 30 minutes in seconds for a free job
+FREE_JOB_MAX_TIME = 12 * 60 * 60  # 12 hours in seconds for a free job
 
 
-class Validator(Torchnode):
+class ValidatorThread(Torchnode):
+    """
+    Coordinates connections, job requests, and smart contract updates across
+    the Tensorlink network.
+
+    The ValidatorThread is responsible for:
+    - Discovering and maintaining connections to workers and peers.
+    - Validating job requests and proposals.
+    - Interacting with the underlying smart contract layer (Smartnodes).
+    """
+
     def __init__(
         self,
         request_queue,
@@ -27,20 +37,34 @@ class Validator(Torchnode):
         print_level=logging.DEBUG,
         max_connections: int = 0,
         upnp=True,
-        off_chain_test=False,
+        on_chain=False,
         local_test=False,
         endpoint=True,
-        endpoint_ip="0.0.0.0",
+        endpoint_url="0.0.0.0",
+        endpoint_port=64747,
         load_previous_state=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
-        super(Validator, self).__init__(
+        """
+        Initialize a Validator P2P Node.
+        """
+        super(ValidatorThread, self).__init__(
             request_queue,
             response_queue,
             "V",
             max_connections=max_connections,
             upnp=upnp,
-            off_chain_test=off_chain_test,
+            on_chain=on_chain,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
 
         # Additional attributes specific to the Validator class
@@ -71,7 +95,7 @@ class Validator(Torchnode):
         self.latest_network_status_time = 0
         self.proposals = []
 
-        if off_chain_test is False:
+        if on_chain:
             # Ensure validator is activated on smartnodes first
             self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
             if self.public_key is None:
@@ -96,7 +120,6 @@ class Validator(Torchnode):
                 self.current_proposal = (
                     self.multi_sig_contract.functions.nextProposalId.call()
                 )
-                # self.bootstrap()
 
             else:
                 self.debug_print(
@@ -109,12 +132,14 @@ class Validator(Torchnode):
 
         # Start up the API for handling public jobs
         if endpoint:
-            self.endpoint = TensorlinkAPI(self, host=endpoint_ip)
+            self.endpoint = TensorlinkAPI(self, host=endpoint_url, port=endpoint_port)
             if not local_test:
-                self.add_port_mapping(64747, 64747)
+                self.add_port_mapping(endpoint_port, endpoint_port)
+
+        self.stream_buffers = {}
 
         # Finally, load up previous saved state if any
-        if not off_chain_test or load_previous_state:
+        if on_chain or load_previous_state:
             self.keeper.load_previous_state()
 
     def handle_data(self, data, node: Connection):
@@ -130,9 +155,14 @@ class Validator(Torchnode):
                 # Job acceptance from worker
                 if b"ACCEPT-JOB" == data[:10]:
                     return self._handle_accept_job(data, node)
+
                 # Job decline from worker
                 elif b"DECLINE-JOB" == data[:11]:
                     return self._handle_decline_job(data, node)
+
+                elif data.startswith((b"END__", b"TOKEN")):
+                    return self._handle_token(data, node)
+
                 # Job creation request from user
                 elif b"JOB-REQ" == data[:7]:
                     return self._handle_job_req(data, node)
@@ -183,6 +213,62 @@ class Validator(Torchnode):
                 tag="Validator",
             )
             raise e
+
+    def _handle_token(self, data: bytes, node: Connection):
+        """
+        Receive streamed token from worker and store it for ML process polling.
+        Packet format:
+            b"TOKEN" + module_id + token
+            b"END__" + module_id
+        """
+        try:
+            tag = data[:5]
+
+            if tag == b"TOKEN":
+                self.debug_print("RECEIVED TOKEN", tag="Torchnode")
+                payload = data[5:]
+                if b"|" not in payload:
+                    return False
+
+                module_id, token_bytes = payload.split(b"|", 1)
+                token = int.from_bytes(token_bytes, "big", signed=True)
+                buf = self._get_stream_buffer(module_id.decode())
+                buf.put(
+                    {
+                        "type": "token",
+                        "token": token,
+                        "timestamp": time.time(),
+                        "worker": node.node_id,
+                    }
+                )
+
+            elif tag == b"END__":
+                self.debug_print("RECEIVED TOKEN END", tag="Torchnode")
+                module_id = data[5:]
+
+                buf = self._get_stream_buffer(module_id.decode())
+                buf.put(
+                    {
+                        "type": "end",
+                        "timestamp": time.time(),
+                        "worker": node.node_id,
+                    }
+                )
+
+            return True
+
+        except Exception as e:
+            self.debug_print(
+                f"Stream token error: {e}",
+                colour="bright_red",
+                tag="Validator",
+            )
+            return False
+
+    def _get_stream_buffer(self, request_id):
+        if request_id not in self.stream_buffers:
+            self.stream_buffers[request_id] = queue.Queue()
+        return self.stream_buffers[request_id]
 
     def _handle_worker_stats_response(self, data: bytes, node: Connection):
         self.debug_print(
@@ -246,10 +332,12 @@ class Validator(Torchnode):
 
             handlers = {
                 "get_jobs": self._handle_get_jobs,
-                "check_job": self._handle_check_job,
+                "check_job_status": self._handle_check_job,
+                "check_token": self._handle_check_token,
+                "update_job_status": self._handle_update_job,
+                "update_stream": self._handle_update_stream,
                 "send_job_request": self.create_base_job,
                 "update_api_request": self._handle_update_api,
-                "update_stream": self._handle_update_stream,
                 "get_model_demand_stats": self._get_api_demand,
                 "get_workers": self._get_workers,
             }
@@ -268,6 +356,79 @@ class Validator(Torchnode):
         self.response_queue.put(
             {"status": "SUCCESS", "return": self.endpoint.model_name_to_request}
         )
+
+    def _handle_check_token(self, request):
+        """
+        Args:
+            request = (module_id,)
+        """
+        module_id = request[0]
+
+        buf = self.stream_buffers.get(module_id)
+
+        if not buf:
+            self.response_queue.put({"status": "SUCCESS", "return": None})
+            return
+
+        try:
+            item = buf.get_nowait()
+            if item.get("type") == "end":
+                self.stream_buffers.pop(module_id, None)
+
+            self.response_queue.put({"status": "SUCCESS", "return": item})
+
+        except queue.Empty:
+            self.response_queue.put({"status": "SUCCESS", "return": None})
+
+    def _handle_update_stream(self, request: tuple):
+        """
+        Forward streaming tokens from ML process to API endpoint.
+        Args:
+            request: Tuple of (request_id, token_data)
+                token_data = {
+                    "chunk": pre-formatted SSE chunk (optional),
+                    "done": bool,
+                    "final_chunk": full SSE chunk when done (optional)
+                }
+        """
+        try:
+            if len(request) != 2:
+                self.response_queue.put(
+                    {"status": "FAILURE", "error": "Invalid stream update format"}
+                )
+                return
+
+            request_id, token_data = request
+
+            if not self.endpoint:
+                self.response_queue.put(
+                    {"status": "FAILURE", "error": "API endpoint not available"}
+                )
+                return
+
+            # If generation is done, send the final_chunk
+            if token_data.get("done"):
+                chunk = token_data.get("final_chunk")
+                if not chunk:
+                    chunk = "data: [DONE]\n\n"
+
+                # Send with both token AND final_chunk for clarity
+                self.endpoint.send_token_to_stream(
+                    request_id, token=chunk, final_chunk=chunk, done=True  # Add this
+                )
+            else:
+                # Otherwise, send the validator-formatted chunk directly
+                chunk = token_data.get("chunk")
+                if not chunk:
+                    self.response_queue.put({"status": "SUCCESS", "return": None})
+                    return
+
+                self.endpoint.send_token_to_stream(request_id, token=chunk, done=False)
+
+            self.response_queue.put({"status": "SUCCESS", "return": None})
+
+        except Exception as e:
+            self.response_queue.put({"status": "FAILURE", "error": str(e)})
 
     def _handle_get_jobs(self, request):
         """
@@ -310,81 +471,38 @@ class Validator(Torchnode):
         model_name, job_id = request
 
         job_data = self.dht.query(job_id)
-        return_val = job_data.get("active", False)
+        return_val = (
+            job_data.get("status", JobStatus.PENDING_OFFLINE) == JobStatus.ACTIVE
+        )
 
         self.response_queue.put({"status": "SUCCESS", "return": return_val})
 
-    # def _handle_send_job(self, job_data: dict):
-    #     distribution = job_data.get("distribution", {})
-    #
-    #     if distribution:
-    #         worker = distribution
+    def _handle_update_job(self, request):
+        job_id, loading_status = request
+        job_data = self.dht.query(job_id)
 
-    # # Send the updated job data with worker info to the user
-    # self.send_to_node(
-    #     requesting_node,
-    #     b"ACCEPT-JOB" + job_id.encode() + json.dumps(job_data).encode(),
-    # )
-    #
-    # self.jobs.append(job_id)
-    #
-    # for module, module_info in job_data["distribution"].items():
-    #     # Remove worker info and just replace with id
-    #     worker_ids = list(a[0] for a in module_info["workers"])
-    #     module_info["workers"] = worker_ids
-    #
-    # job_data["timestamp"] = time.time()
-    # job_data["last_seen"] = time.time()
-    #
-    # self.dht.store(job_id, job_data)
-    #
-    # # Start monitor_job as a background task and store it in the list
-    # job_monitor = JobMonitor(self)
-    # t = threading.Thread(target=job_monitor.monitor_job, args=(job_id,))
-    # t.start()
+        response_status = "FAILURE"
+        if job_data:
+            if loading_status in JobStatus.values():
+                job_data["status"] = loading_status
+                response_status = "SUCCESS"
 
-    def create_hf_job(self, job_info: dict, requesters_ip: str = None):
-        """
-        This can be invoked directly from the API endpoint for a hosted HF model, or via a UserNode
-        request for hosting on the user's device. This will trigger HF model inspection in the
-        Validator ML process and will create a config of eligible workers and their assigned modules.
-        """
-
-        # Rate limitation checks for requested jobs
-        if requesters_ip:
-            if self.rate_limiter.is_blocked(requesters_ip):
-                self.debug_print(
-                    f"Job declined! Reason: UserIPBlocked ({requesters_ip})",
-                    tag="Validator",
-                )
-                return False
-
-            self.rate_limiter.record_attempt(requesters_ip)
-
-        if job_info.get("payment", 0) == 0:
-            _time = FREE_JOB_MAX_TIME
-        else:
-            _time = job_info.get("time")
-
-        job_data = job_info
-        job_data["time"] = _time
-
-        if not job_data.get("id"):
-            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
-            job_data["id"] = job_id
-
-        # Hand off model dissection and worker assignment to DistributedValidator process
-        request_value = "HF-JOB-REQ" + json.dumps(job_data)
-        self._store_request(self.rsa_key_hash, request_value)
+        self.response_queue.put({"status": response_status, "return": None})
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""
-        # Case 1: ML process is checking for incoming requests
+        # Case 1: ML process polling for incoming requests
         if len(request) == 2:
             model_name, model_id = request
 
             if self.endpoint_requests["incoming"]:
                 for i, api_request in enumerate(self.endpoint_requests["incoming"]):
+                    # Skip cancelled requests and clean them up
+                    if getattr(api_request, 'cancelled', False):
+                        self.endpoint_requests["incoming"].pop(i)
+                        self.response_queue.put({"status": "SUCCESS", "return": None})
+                        return
+
                     if not api_request.processing and api_request.hf_name == model_name:
                         api_request.processing = True
                         api_request = self.endpoint_requests["incoming"].pop(i)
@@ -393,63 +511,36 @@ class Validator(Torchnode):
                         )
                         return
 
-            # No matching request found
             self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Case 2: ML process is returning completed result
+        # Case 2: ML process returning completed result
         elif len(request) == 1:
             response = request[0]
-            if response.processing:
-                self.endpoint_requests["outgoing"].append(response)
+
+            if getattr(response, 'cancelled', False):
+                # Client already gone, drop result
                 self.response_queue.put({"status": "SUCCESS", "return": None})
+                return
+
+            if response.processing and self.endpoint:
+                if response.stream:
+                    # Streaming is already handled token-by-token via send_token_to_stream
+                    pass
+                else:
+                    # Resolve the waiting Future directly
+                    self.endpoint.resolve_pending_request(response)
+
+            self.response_queue.put({"status": "SUCCESS", "return": None})
             return
 
-        # Invalid request format
         self.response_queue.put(
             {"status": "FAILURE", "error": "Invalid request format"}
         )
 
-    def _handle_update_stream(self, request: tuple):
-        """
-        Forward streaming tokens from ML process to API endpoint.
-
-        Args:
-            request: Tuple of (request_id, token_data)
-                token_data = {
-                    "token": str,
-                    "done": bool,
-                    "full_text": str (optional, only when done),
-                    "total_tokens": int (optional),
-                    "error": str (optional),
-                    "timestamp": float
-                }
-        """
-        try:
-            if len(request) != 2:
-                self.response_queue.put(
-                    {"status": "FAILURE", "error": "Invalid stream update format"}
-                )
-                return
-
-            request_id, token_data = request
-
-            # Forward to API endpoint if it exists
-            if self.endpoint and hasattr(self.endpoint, 'send_token_to_stream'):
-                self.endpoint.send_token_to_stream(request_id, **token_data)
-                self.response_queue.put({"status": "SUCCESS", "return": None})
-            else:
-                self.response_queue.put(
-                    {"status": "FAILURE", "error": "API endpoint not available"}
-                )
-
-        except Exception as e:
-            self.response_queue.put({"status": "FAILURE", "error": str(e)})
-
     def _handle_job_req(self, data: bytes, node: Connection):
         """
-        This method is invoked by a job request directly from a UserNode. If a model name
-        was provided, we call create_hf_job, otherwise we create_base_job
+        This method is invoked by a job request directly from a User.
         """
         job_req = json.loads(data[7:])
 
@@ -467,10 +558,12 @@ class Validator(Torchnode):
             node.role != "U" or not node_info or node_info["reputation"] < 50
         ):  # TODO reputation
             node.ghosts += 1
+        # HF model loading path
         elif job_req.get("model_name"):
             threading.Thread(
                 target=self.create_hf_job, args=(job_req, node.host)
             ).start()
+        # Custom torch model loading path
         else:
             threading.Thread(target=self.create_base_job, args=(job_req,)).start()
 
@@ -507,25 +600,11 @@ class Validator(Torchnode):
         else:
             node.ghosts += 1
 
-    def check_job_availability(self, job_data: dict):
-        """Asserts that the specified user does not have an active job."""
-        user_id = job_data.get("author")
-
-        if user_id and user_id != self.rsa_key_hash:
-            # Check that user doesn't have an active job already
-            user_info = self.dht.query(user_id, keys_to_exclude=[self.rsa_key_hash])
-
-            # Check for active job
-            if user_info:
-                current_user_job_id = user_info.get("job")
-
-                if current_user_job_id:
-                    current_user_job = self.dht.query(current_user_job_id)
-
-                    if current_user_job and current_user_job["active"]:
-                        return False
-
     def create_base_job(self, job_data: dict):
+        """
+        Initializes job creation and model distribution. This pathway is
+        triggered both by distributed torch models and HF API models.
+        """
         modules, job_id, author, n_pipelines = self._prepare_job(job_data)
         requesting_node = self._get_requesting_node(job_data, author)
         distribution = job_data.get("distribution", {})
@@ -542,6 +621,7 @@ class Validator(Torchnode):
 
         # Store job info in DHT
         self.dht.store(job_id, job_data)
+        self.jobs.append(job_id)
 
         # Recruit the workers
         worker_connection_info = self._assign_workers_to_modules(
@@ -574,6 +654,60 @@ class Validator(Torchnode):
             self._setup_hosted_job(job_id, job_data)
 
         self._finalize_job(job_id, job_data)
+
+    def create_hf_job(self, job_info: dict, requesters_ip: str = None):
+        """
+        This can be invoked directly from the API endpoint for a hosted HF model, or via a User
+        request for hosting on the user's device. This will trigger HF model inspection in the
+        Validator ML process and will create a config of eligible workers and their assigned modules.
+        """
+
+        # Rate limitation checks for requested jobs
+        if requesters_ip:
+            if self.rate_limiter.is_blocked(requesters_ip):
+                self.debug_print(
+                    f"Job declined! Reason: UserIPBlocked ({requesters_ip})",
+                    tag="Validator",
+                )
+                return False
+
+            self.rate_limiter.record_attempt(requesters_ip)
+
+        if job_info.get("payment", 0) == 0:
+            _time = min(job_info.get("time", FREE_JOB_MAX_TIME), FREE_JOB_MAX_TIME)
+        else:
+            _time = job_info.get("time", FREE_JOB_MAX_TIME)
+
+        job_data = job_info
+
+        if not job_data.get("id"):
+            job_data["time"] = _time
+            job_id = hashlib.sha256(json.dumps(job_data).encode()).hexdigest()
+            job_data["id"] = job_id
+
+        # Store job info in DHT
+        self.dht.store(job_data.get("id"), job_data)
+
+        # Hand off model dissection and worker assignment to DistributedValidator process
+        request_value = "HF-JOB-REQ" + json.dumps(job_data)
+        self._store_request(self.rsa_key_hash, request_value)
+
+    def check_job_availability(self, job_data: dict):
+        """Asserts that the specified user does not have an active job."""
+        user_id = job_data.get("author")
+
+        if user_id and user_id != self.rsa_key_hash:
+            # Check that user doesn't have an active job already
+            for job_id in self.jobs:
+                if job_id != job_data.get("id"):
+                    job_info = self.dht.query(job_id)
+                    if job_info.get("author") == user_id and job_info.get("status") in [
+                        JobStatus.INITIALIZING,
+                        JobStatus.ACTIVE,
+                    ]:
+                        return False
+
+        return True
 
     def _prepare_job(self, job_data):
         modules = job_data.get("distribution").copy()
@@ -615,6 +749,7 @@ class Validator(Torchnode):
             self.decline_job(requesting_node, reason)
 
     def _assign_workers_to_modules(self, modules, author, job_id, job_data):
+        """Recruit workers and load their assigned modules"""
         worker_connection_info = {}
         groups = {}
         job_data["worker_modules"] = {}
@@ -627,9 +762,9 @@ class Validator(Torchnode):
                 self.recruit_worker(worker_id, author, job_id, module_info, module_id)
                 job_data["worker_modules"][worker_id] = module_id
                 worker_connection_info[module_id] = worker_id
-            else:
-                # Hosted modules on our device
-                groups[module_id] = module_info
+
+            # For both offloaded and hosted modules, store module info
+            groups[module_id] = module_info
 
         job_data["distribution"] = groups
 
@@ -674,6 +809,7 @@ class Validator(Torchnode):
                     "assigned_workers": [worker_id],
                     "distribution": module_info,
                     "public": job_data.get("public", True),
+                    "status": "inactive",
                 }
                 self.state_updates[module_id] = []
 
@@ -688,13 +824,12 @@ class Validator(Torchnode):
                     return
 
     def _finalize_job(self, job_id, job_data):
+        """Begin the job monitoring thread"""
         self.response_queue.put({"status": "SUCCESS", "return": job_data})
 
-        self.jobs.append(job_id)
-
+        # Update dht with latest job rendition to be safe
         job_data["timestamp"] = time.time()
         job_data["last_seen"] = time.time()
-
         self.dht.store(job_id, job_data)
 
         job_monitor = JobMonitor(self)
@@ -730,19 +865,20 @@ class Validator(Torchnode):
         )
 
         # Send a job request to the worker
-        self._store_request(node.node_id, job_id + module_id)
+        worker_recruitment_id = job_id + module_id
+        self._store_request(node.node_id, worker_recruitment_id)
         self.send_to_node(node, data)
 
         # Await 3 seconds for the job request
         timeout = 3
         start_time = time.time()
-        while module_id in self.requests[node.node_id]:
+        while worker_recruitment_id in self.requests[node.node_id]:
             if time.time() - start_time > timeout:
                 self.debug_print(
                     f"Worker: '{worker_id}' timed out during recruitment request.",
                     tag="Validator",
                 )
-                self.requests[node.node_id].remove(module_id)
+                self.requests[node.node_id].remove(worker_recruitment_id)
                 return False
 
         # Worker accepted the job, update stats
@@ -842,42 +978,43 @@ class Validator(Torchnode):
     #                 ]
 
     def run(self):
-        super().run()
+        try:
+            super().run()
 
-        if self.off_chain_test is False:
-            time.sleep(15)
-            self.execution_listener = threading.Thread(
-                target=self.contract_manager.proposal_creator, daemon=True
-            )
-            self.execution_listener.start()
-            self.proposal_listener = threading.Thread(
-                target=self.contract_manager.proposal_validator, daemon=True
-            )
-            self.proposal_listener.start()
+            if self.on_chain:
+                time.sleep(15)
+                self.execution_listener = threading.Thread(
+                    target=self.contract_manager.proposal_creator, daemon=True
+                )
+                self.execution_listener.start()
+                self.proposal_listener = threading.Thread(
+                    target=self.contract_manager.proposal_validator, daemon=True
+                )
+                self.proposal_listener.start()
 
-        counter = 0
-        # Loop for active job and network moderation
-        while not self.terminate_flag.is_set():
-            if counter % 300 == 0:
-                self.keeper.write_state()
-            if counter % 120 == 0:
-                self.keeper.clean_node()
-                self.clean_port_mappings()
-                self.get_workers()
-            if counter % 180 == 0:
-                self.print_status()
+            counter = 0
+            # Loop for active job and network moderation
+            while not self.terminate_flag.is_set():
+                if counter % 300 == 0:
+                    self.keeper.write_state()
+                if counter % 120 == 0:
+                    self.keeper.clean_node()
+                    self.clean_port_mappings()
+                    self.get_workers()
+                if counter % 180 == 0:
+                    self.print_ui_status()
 
-            time.sleep(1)
-            counter += 1
+                time.sleep(1)
+                counter += 1
+        except KeyboardInterrupt:
+            self.terminate_flag.set()
+
+        finally:
+            self.stop()
 
     def stop(self):
         self.keeper.write_state()
         super().stop()
-
-    def print_status(self):
-        self.print_base_status()
-        print(f" Current Proposal: {self.current_proposal}")
-        print("=============================================\n")
 
     def get_tensorlink_status(self):
         # Path to package root (where this file lives)
@@ -902,6 +1039,12 @@ class Validator(Torchnode):
         }
 
     def get_network_status(
-        self, days: int = 30, include_weekly: bool = False, include_summary: bool = True
+        self,
+        days: int = 30,
+        include_weekly: bool = False,
+        include_summary: bool = True,
+        include_device=True,
     ) -> Dict:
-        return self.keeper.get_network_status(days, include_weekly, include_summary)
+        return self.keeper.get_network_status(
+            days, include_weekly, include_summary, include_device
+        )

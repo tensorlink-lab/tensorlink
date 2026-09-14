@@ -5,7 +5,7 @@
 <h3 align="center">Peer-to-peer AI Inference & Distributed Execution with PyTorch</h3>
 
 <p align="center">
- <img src="https://img.shields.io/github/v/release/mattjhawken/tensorlink?label=Latest%20Release&color=ff69b4" alt="Latest Release Version" />
+  <img src="https://img.shields.io/github/v/release/mattjhawken/tensorlink?label=Latest%20Release&color=ff69b4" alt="Latest Release Version" />
   <img src="https://img.shields.io/github/downloads/mattjhawken/tensorlink/total?label=Node%20Downloads&color=e5e52e" alt="Node Downloads"/>
   <img src="https://img.shields.io/github/stars/mattjhawken/tensorlink?style=social" alt="GitHub Repo stars"/>
   <a href="https://discord.gg/aCW2kTNzJ2">
@@ -16,107 +16,168 @@
   </a>
 </p>
 
+## Table of Contents
+
+- [What is Tensorlink?](#what-is-tensorlink)
+- [Quick Start](#quick-start)
+- [Learn More](#learn-more)
+- [Contributing](#contributing)
+
+---
+
 ## What is Tensorlink?
 
-Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across a 
-peer-to-peer network of GPUs. It enables:
-- Running large models without local VRAM 
-- Hosting models on your own hardware and accessing them remotely via API 
-- Distributing model execution across multiple consumer GPUs 
-- Contributing idle compute to earn network rewards
-
-All without relying on centralized cloud inference providers.
-
-> **Early Access:** Tensorlink is under active development. APIs and internals may evolve. [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
+Tensorlink is a Python library and decentralized compute platform for running PyTorch and Hugging Face models across
+peer-to-peer networks. It enables you to easily distribute and remotely access models across devices through 
+PyTorch-facing wrappers or HTTP endpoints via your own hardware or by tapping into public peer-to-peer resources. 
+Hardware owners can leverage their own GPUs for private remote AI services or contribute resources to the public network 
+and earn rewards.
 
 ### Key Features
-- **Native PyTorch Integration** - Wrap Hugging Face or custom PyTorch models and execute them across the network.
-- **REST API for Inference** - Access hosted models via HTTP without PyTorch dependencies.  
-- **Distributed Model Execution** - Run models larger than a single GPU by partitioning execution across peers.
-- **Privacy Options**: Route queries exclusively to your own hardware for private usage.
-- **Incentivized Compute Sharing** - Earn rewards by contributing idle GPUs to the network.
+
+- **Run Large Models** - Automatic offloading and model sharding across peers
+- **Native PyTorch & REST API** - Use models directly in Python or via HTTP endpoints
+- **Streaming Generation** - Token-by-token streaming for real-time responses
+- **Privacy Controls** - Route queries exclusively to your own hardware
+- **Earn Rewards** - Contribute GPU resources to the network and get compensated
+
+> **Early Access:** Tensorlink is under active development. APIs and internals may evolve.
+> [Join our Discord](https://discord.gg/aCW2kTNzJ2) for updates, support, and roadmap discussions.
+
+---
 
 ## Quick Start
 
-Tensorlink can be accessed via API or directly within Python. 
+There are three ways to interact with Tensorlink. Choose the path that fits your use case:
 
-### Use the Inference API
+- **[Distributed Models in Python](#distributed-models-in-python)** - run PyTorch/Hugging Face models directly from Python
+- **[HTTP API](#http-api)** - OpenAI-style REST endpoints for distributed inference
+- **[Run a Node](#run-a-node)** - contribute GPU compute or host your own private cluster
 
-```python
-import requests
+### Distributed Models in Python
 
-inference_query = requests.post(
-    "http://smartnodes.ddns.net/tensorlink-api/generate",
-    json={
-        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
-        "message": "Does this user query require an internet search? Response with either only yes, or no.",
-        "max_new_tokens": 32,
-        "stream": False,
-    }
-)
-
-
-request_model = requests.post(
-    "http://smartnodes.ddns.net/tensorlink-api/request-model",
-    json={}
-)
-
-```
-
-### Installation
+**Installation**
 
 ```bash
 pip install tensorlink
 ```
 
-**Requirements:** Python 3.10+, PyTorch 2.3+, UNIX/MacOS (Windows support coming soon)
+**Requirements:** Python 3.10+, UNIX/macOS (Windows: use WSL). No GPU required to use the public network.
 
-### Run Your First Distributed Model
-
-This example illustrates how to spawn a HuggingFace Pre-trained model on the tensorlink public network. If you  wish to 
-leverage your own hardware, or for a more complex breakdown, proceed to the Examples section.
+**Inference**
 
 ```python
-from tensorlink import DistributedModel
-import torch
+from tensorlink.ml import DistributedModel
+from transformers import AutoTokenizer
 
-# Connect to a pre-trained model on the network
-model = DistributedModel(
-    model="Qwen/Qwen3-8B-Instruct",
-    training=False,
-    device="cuda",
-    dtype=torch.float16
-)
+MODEL_NAME = "Qwen/Qwen3-14B"
 
-# Use it like any PyTorch model
-inputs = tokenizer("Hello, world!", return_tensors="pt")
-outputs = model.generate(inputs, max_new_tokens=100)
+model = DistributedModel(model=MODEL_NAME)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+inputs = tokenizer("Explain the theory of relativity.", return_tensors="pt")
+
+outputs = model.generate(**inputs, max_new_tokens=100)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-### Contribute Compute (Mining)
+**Distributed Training**
 
-1. Download the latest `tensorlink-miner` from [Releases](...)
-2. Configure your wallet address in `config.json`
-3. Run: `./run-worker.sh`
+```python
+from tensorlink.ml import DistributedModel
 
-That's it! Your GPU will earn rewards by processing AI workloads from the network.
+model = DistributedModel(model="Qwen/Qwen3-14B", training=True)
+optimizer = model.create_optimizer(optimizer_type="adamw", lr=1e-4, weight_decay=0.01)
+
+# Training loop works like standard PyTorch
+outputs = model(**inputs, labels=inputs["input_ids"])
+outputs.loss.backward()
+optimizer.step()
+optimizer.zero_grad()
+```
+
+> For private clusters, custom architectures, and full parameter reference, see [**docs/distributed-models.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/distributed-models.md).
+
+---
+
+### HTTP API
+
+Access models via HTTP - either through the public network or your own private node. The API is OpenAI-compatible and requires no GPU or Python on the client side.
+
+**Simple generation**
+
+```python
+import requests
+
+response = requests.post(
+    "http://smartnodes.ddns.net/tensorlink-api/v1/generate",
+    json={
+        "hf_name": "Qwen/Qwen2.5-7B-Instruct",
+        "message": "Explain quantum computing in one sentence.",
+        "max_new_tokens": 50,
+        "stream": False,
+    }
+)
+print(response.json()["generated_text"])
+```
+
+**OpenAI-compatible chat**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:64747/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What are the benefits of distributed computing?"}
+        ],
+        "max_tokens": 150,
+        "stream": False,
+    }
+)
+print(response.json()["choices"][0]["message"]["content"])
+```
+
+> For all endpoints, streaming, the responses API, and model preloading, see [**docs/api.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/api.md).
+
+---
+
+### Run a Node
+
+Run worker or validator nodes to contribute compute to the public network, host a private cluster, or expose models as API endpoints.
+
+1. Download the latest `tensorlink-node` from [Releases](https://github.com/mattjhawken/tensorlink/releases)
+2. Edit `config.json` to configure your node
+3. Run `./run-node.sh`
+
+The default config runs a public worker node, where your GPU will process network jobs and earn rewards on the public
+network via [Smartnodes](https://smartnodes.ca).
+
+> For configuration reference, private cluster setup, and network architecture patterns, see [**docs/nodes.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/nodes.md).  
+> To contribute your GPU in the fastest way possible, see [**docs/worker-guide.md**](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/worker-guide.md).
+
+---
 
 ## Learn More
 
-- 📚 **[Documentation](https://smartnodes.ca/tensorlink/docs)** - Full API reference and guides
-- 💬 **[Discord Community](https://discord.gg/aCW2kTNzJ2)** - Get help and connect with developers
-- 🎮 **[Live Demo](https://smartnodes.ca/localhostGPT)** - Try localhostGPT powered by Tensorlink
-- 📘 **[Litepaper](docs/LITEPAPER.md)** - Technical overview and architecture
+| Resource                                                                                      | Description                                                  |
+|-----------------------------------------------------------------------------------------------|--------------------------------------------------------------|
+| [Getting Started](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/getting-started.md)       | Installation, requirements, and first steps                  |
+| [Distributed Models](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/distributed-models.md) | `DistributedModel`, `DistributedOptimizer`, private clusters |
+| [API Reference](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/api.md)                     | HTTP endpoints, parameters, and examples                     |
+| [Node Setup](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/nodes.md)                      | Workers, validators, config reference, network topologies    |
+| [Worker Quick Start](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/worker-guide.md)       | Contribute GPU compute in minutes                            |
+| [Discord Community](https://discord.gg/aCW2kTNzJ2)                                            | Get help and connect with developers                         |
+| [Live Demo](https://tensorlink.io)                                                            | Try a chatbot powered by Tensorlink                          |
+| [Litepaper](https://github.com/tensorlink-lab/tensorlink/tree/main/docs/LITEPAPER.md)                   | Technical overview and architecture                          |
+
+---
 
 ## Contributing
 
-We welcome contributions! Here's how to get involved:
-
-- 🐛 **Report bugs** via [GitHub Issues](https://github.com/mattjhawken/tensorlink/issues)
-- 💡 **Suggest features** on our [Discord](https://discord.gg/aCW2kTNzJ2)
-- 🔧 **Submit PRs** to improve code or documentation
-- ☕ **Support the project** via [Buy Me a Coffee](https://www.buymeacoffee.com/smartnodes)
-
-## License
+Read our [contribution guide](https://github.com/mattjhawken/tensorlink/blob/main/.github/CONTRIBUTING.md).
 
 Tensorlink is released under the [MIT License](LICENSE).

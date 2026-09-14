@@ -13,10 +13,57 @@ NETWORK_STATS = "logs/network_stats.json"
 DHT_STATE = "logs/dht_state.json"
 CATEGORIES = ["workers", "validators", "users", "jobs", "proposals"]
 
+DAILY_STAT_DEFAULTS = {
+    "workers": 0,
+    "validators": 0,
+    "users": 0,
+    "jobs": 0,
+    "proposals": 0,
+    "available_capacity": 0,
+    "used_capacity": 0,
+    "total_capacity": 0,
+    "avg_tflops": None,
+    "avg_bandwidth_gb_s": None,
+    "total_benchmarked": 0,
+    "by_backend": {},
+    "by_gpu_model": {},
+}
+
+WEEKLY_STAT_DEFAULTS = {
+    "week_start": 0,
+    "week_end": 0,
+    "days_count": 0,
+    "avg_workers": 0,
+    "avg_validators": 0,
+    "avg_users": 0,
+    "avg_jobs": 0,
+    "avg_proposals": 0,
+    "avg_available_capacity": 0,
+    "avg_used_capacity": 0,
+    "avg_total_capacity": 0,
+    "avg_tflops": None,
+    "avg_bandwidth_gb_s": None,
+    "total_benchmarked": 0,
+}
+
 THIRTY_DAYS_SECONDS = 60 * 60 * 24 * 30
 SEVEN_DAYS_SECONDS = 60 * 60 * 24 * 7
 ONE_DAY_SECONDS = 60 * 60 * 24
 CLEAN_ARCHIVE_FREQ = 10
+MAX_DAILY_STATS = 1093
+
+
+def _normalize_daily_stat(stat: Dict) -> Dict:
+    """Backfill fields on stats written before device/benchmark tracking
+    existed, so nothing downstream has to special-case missing keys."""
+    return {**DAILY_STAT_DEFAULTS, **stat}
+
+
+def _normalize_weekly_stat(stat: Dict) -> Dict:
+    """Backfill fields on weekly rollups written before this schema
+    existed (or partially written), so downstream code never has to
+    special-case missing keys."""
+    return {**WEEKLY_STAT_DEFAULTS, **stat}
 
 
 def _load_historical_stats() -> Dict:
@@ -125,16 +172,14 @@ def _fill_missing_daily_days(daily_stats: List[Dict]) -> List[Dict]:
 
     # Convert to date objects
     parsed = {datetime.fromtimestamp(s["timestamp"]).date(): s for s in daily_stats}
-
     min_day = min(parsed.keys())
     max_day = max(parsed.keys())
 
     filled = []
     current = min_day
-
     while current <= max_day:
         if current in parsed:
-            filled.append(parsed[current])
+            filled.append(_normalize_daily_stat(parsed[current]))
         else:
             # Insert zero-filled entry
             filled.append(
@@ -144,21 +189,14 @@ def _fill_missing_daily_days(daily_stats: List[Dict]) -> List[Dict]:
                         current.year, current.month, current.day
                     ).timestamp(),
                     "last_updated": 0,
-                    "workers": 0,
-                    "validators": 0,
-                    "users": 0,
-                    "jobs": 0,
-                    "proposals": 0,
-                    "available_capacity": 0,
-                    "used_capacity": 0,
-                    "total_capacity": 0,
+                    **DAILY_STAT_DEFAULTS,
                 }
             )
+
         current = current + timedelta(days=1)
 
     # Always sorted
     filled.sort(key=lambda x: x["timestamp"])
-
     return filled
 
 
@@ -259,18 +297,16 @@ class Keeper:
     def _archive_daily_to_weekly(self):
         """Archive daily statistics older than 90 days into weekly aggregates."""
         current_time = time.time()
-        ninety_days_ago = current_time - THIRTY_DAYS_SECONDS * 3
+        two_years_ago = current_time - THIRTY_DAYS_SECONDS * 24
         today = datetime.fromtimestamp(current_time).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         today_timestamp = today.timestamp()
 
-        # Find daily stats that are older than 90 days and not from today
         daily_to_archive = [
             stat
             for stat in self.network_stats["daily"]
-            if stat["timestamp"] < ninety_days_ago
-            and stat["timestamp"] < today_timestamp
+            if stat["timestamp"] < two_years_ago and stat["timestamp"] < today_timestamp
         ]
 
         if not daily_to_archive:
@@ -282,61 +318,75 @@ class Keeper:
             stat_date = datetime.fromtimestamp(daily_stat["timestamp"])
             iso_year, iso_week, _ = stat_date.isocalendar()
             week_key = f"{iso_year}-W{iso_week:02d}"
+            weekly_groups.setdefault(week_key, []).append(daily_stat)
 
-            if week_key not in weekly_groups:
-                weekly_groups[week_key] = []
-            weekly_groups[week_key].append(daily_stat)
+        # --- everything below is now OUTSIDE the daily_stat loop ---
+        metric_keys = [
+            "workers",
+            "validators",
+            "users",
+            "jobs",
+            "proposals",
+            "available_capacity",
+            "used_capacity",
+            "total_capacity",
+        ]
 
-            # Create weekly aggregates
-            metric_keys = [
-                "workers",
-                "validators",
-                "users",
-                "jobs",
-                "proposals",
-                "available_capacity",
-                "used_capacity",
-                "total_capacity",
+        for week_key, stats in weekly_groups.items():
+            # Skip if already archived
+            if any(w["week"] == week_key for w in self.network_stats["weekly"]):
+                continue
+
+            n = len(stats)
+            tflops_vals = [
+                s.get("avg_tflops") for s in stats if s.get("avg_tflops") is not None
+            ]
+            bandwidth_vals = [
+                s.get("avg_bandwidth_gb_s")
+                for s in stats
+                if s.get("avg_bandwidth_gb_s") is not None
             ]
 
-            for week_key, stats in weekly_groups.items():
-                # Skip if already archived
-                if any(w["week"] == week_key for w in self.network_stats["weekly"]):
-                    continue
+            weekly_stat = {
+                "week": week_key,
+                "week_start": min(s["timestamp"] for s in stats),
+                "week_end": max(s["timestamp"] for s in stats),
+                "days_count": n,
+                **{
+                    f"avg_{key}": sum(s.get(key, 0) for s in stats) / n
+                    for key in metric_keys
+                },
+                "avg_tflops": (
+                    round(sum(tflops_vals) / len(tflops_vals), 2)
+                    if tflops_vals
+                    else None
+                ),
+                "avg_bandwidth_gb_s": (
+                    round(sum(bandwidth_vals) / len(bandwidth_vals), 2)
+                    if bandwidth_vals
+                    else None
+                ),
+                "total_benchmarked": sum(s.get("total_benchmarked", 0) for s in stats),
+            }
+            self.network_stats["weekly"].append(weekly_stat)
 
-                n = len(stats)
-                weekly_stat = {
-                    "week": week_key,
-                    "week_start": min(s["timestamp"] for s in stats),
-                    "week_end": max(s["timestamp"] for s in stats),
-                    "days_count": n,
-                    **{
-                        f"avg_{key}": sum(s.get(key, 0) for s in stats) / n
-                        for key in metric_keys
-                    },
-                }
+        # Remove archived daily stats
+        self.network_stats["daily"] = [
+            s
+            for s in self.network_stats["daily"]
+            if s["timestamp"] >= two_years_ago or s["timestamp"] >= today_timestamp
+        ]
 
-                self.network_stats["weekly"].append(weekly_stat)
+        # Keep last 104 weeks
+        self.network_stats["weekly"].sort(key=lambda x: x["week_start"])
+        self.network_stats["weekly"] = self.network_stats["weekly"][-104:]
 
-            # Remove archived daily stats
-            self.network_stats["daily"] = [
-                s
-                for s in self.network_stats["daily"]
-                if s["timestamp"] >= ninety_days_ago
-                or s["timestamp"] >= today_timestamp
-            ]
-
-            # Keep last 104 weeks
-            self.network_stats["weekly"].sort(key=lambda x: x["week_start"])
-            self.network_stats["weekly"] = self.network_stats["weekly"][-104:]
-
-            if daily_to_archive:
-                self.node.debug_print(
-                    f"Archived {len(daily_to_archive)} daily stats into {len(weekly_groups)} weeks",
-                    level=logging.INFO,
-                    colour="blue",
-                    tag="Keeper",
-                )
+        self.node.debug_print(
+            f"Archived {len(daily_to_archive)} daily stats into {len(weekly_groups)} weeks",
+            level=logging.INFO,
+            colour="blue",
+            tag="Keeper",
+        )
 
     def _update_daily_statistics(self):
         current_time = time.time()
@@ -355,6 +405,7 @@ class Keeper:
         try:
             merged_data = self._get_merged_entities()
             capacity = self._calculate_worker_capacities()
+            device_breakdown = self.get_device_breakdown()
 
             daily_stat = {
                 "date": today_str,
@@ -365,6 +416,7 @@ class Keeper:
                     for cat in CATEGORIES
                 },
                 **capacity,
+                **device_breakdown,
             }
 
             # Adjust validators count (add 1 for self)
@@ -453,17 +505,19 @@ class Keeper:
         }
 
     def get_daily_statistics(self, days: int = 30) -> List[Dict]:
-        """Get daily statistics for last N days (max 90)."""
+        """Get daily statistics for last N days."""
         if days <= 0:
             return []
-        days = min(days, 90)
-        return self.network_stats["daily"][-days:]
+        days = min(days, MAX_DAILY_STATS)
+        return [_normalize_daily_stat(s) for s in self.network_stats["daily"][-days:]]
 
     def get_weekly_statistics(self, weeks: int = 12) -> List[Dict]:
         """Get weekly statistics for last N weeks."""
         if weeks <= 0:
             return []
-        return self.network_stats["weekly"][-weeks:]
+        return [
+            _normalize_weekly_stat(s) for s in self.network_stats["weekly"][-weeks:]
+        ]
 
     def get_network_summary(self) -> Dict:
         """Get summary of current network statistics."""
@@ -504,12 +558,12 @@ class Keeper:
         days: int = 30,
         include_weekly: bool = False,
         include_summary: bool = True,
+        include_device: bool = True,
         cache_duration: int = 300,
     ) -> Dict:
         """Get network statistics with caching for API consumption."""
         current_time = time.time()
 
-        # Return cached if still valid
         if (
             self._status_cache
             and (current_time - self._status_cache_time) < cache_duration
@@ -518,15 +572,13 @@ class Keeper:
 
         try:
             raw_daily = self.get_daily_statistics(days)
-
-            # Fill missing days between min and max date
             daily_stats = _fill_missing_daily_days(raw_daily)
 
             result = {
                 "daily": {
                     "labels": [s["date"] for s in daily_stats],
                     "datasets": {
-                        cat: [s[cat] for s in daily_stats]
+                        cat: [s.get(cat, 0) for s in daily_stats]
                         for cat in CATEGORIES + ["total_capacity", "used_capacity"]
                     },
                     "timestamps": [s["timestamp"] for s in daily_stats],
@@ -534,15 +586,37 @@ class Keeper:
             }
 
             if include_weekly:
-                weekly_stats = self.get_weekly_statistics(12)
+                weekly_stats = self.get_weekly_statistics(days // 7)
                 result["weekly"] = {
                     "labels": [s["week"] for s in weekly_stats],
                     "datasets": {
-                        f"avg_{cat}": [s[f"avg_{cat}"] for s in weekly_stats]
-                        for cat in CATEGORIES
+                        f"avg_{cat}": [s.get(f"avg_{cat}", 0) for s in weekly_stats]
+                        for cat in CATEGORIES + ["total_capacity", "used_capacity"]
                     },
                     "week_starts": [s["week_start"] for s in weekly_stats],
                     "week_ends": [s["week_end"] for s in weekly_stats],
+                }
+
+            if include_device:
+                result["device"] = {
+                    "labels": [s["date"] for s in daily_stats],
+                    "datasets": {
+                        "avg_tflops": [s.get("avg_tflops") for s in daily_stats],
+                        "avg_bandwidth_gb_s": [
+                            s.get("avg_bandwidth_gb_s") for s in daily_stats
+                        ],
+                        "total_benchmarked": [
+                            s.get("total_benchmarked", 0) for s in daily_stats
+                        ],
+                    },
+                    "backend_breakdown_by_day": {
+                        s["date"]: s.get("by_backend", {}) for s in daily_stats
+                    },
+                    "gpu_model_breakdown_by_day": {
+                        s["date"]: s.get("by_gpu_model", {}) for s in daily_stats
+                    },
+                    "current": self.get_device_breakdown(),
+                    "timestamps": [s["timestamp"] for s in daily_stats],
                 }
 
             if include_summary:
@@ -556,10 +630,8 @@ class Keeper:
                 "generated_at_iso": datetime.now().isoformat(),
             }
 
-            # Cache result
             self._status_cache = result
             self._status_cache_time = current_time
-
             return result
 
         except Exception as e:
@@ -853,3 +925,45 @@ class Keeper:
                 colour="bright_red",
                 tag="Keeper",
             )
+
+    def get_device_breakdown(self) -> Dict:
+        """Summarize device types and benchmark results across all_workers."""
+        by_backend = {}
+        by_gpu_model = {}
+        tflops_values = []
+        bandwidth_values = []
+
+        if hasattr(self.node, "all_workers"):
+            for worker_data in self.node.all_workers.values():
+                device = worker_data.get("device") or {}
+                benchmark = worker_data.get("benchmark") or {}
+
+                backend = device.get("backend", "unknown")
+                by_backend[backend] = by_backend.get(backend, 0) + 1
+
+                name = device.get("name", "unknown")
+                by_gpu_model[name] = by_gpu_model.get(name, 0) + 1
+
+                compute = benchmark.get("compute") or {}
+                if "tflops" in compute:
+                    tflops_values.append(compute["tflops"])
+
+                memory = benchmark.get("memory") or {}
+                if "bandwidth_gb_s" in memory:
+                    bandwidth_values.append(memory["bandwidth_gb_s"])
+
+        return {
+            "by_backend": by_backend,
+            "by_gpu_model": by_gpu_model,
+            "avg_tflops": (
+                round(sum(tflops_values) / len(tflops_values), 2)
+                if tflops_values
+                else None
+            ),
+            "avg_bandwidth_gb_s": (
+                round(sum(bandwidth_values) / len(bandwidth_values), 2)
+                if bandwidth_values
+                else None
+            ),
+            "total_benchmarked": len(tflops_values),
+        }

@@ -1,7 +1,7 @@
 from tensorlink.p2p.connection import Connection
 from tensorlink.p2p.torch_node import Torchnode
+from tensorlink.nodes.job_monitor import JobStatus
 
-from dotenv import get_key
 import hashlib
 import json
 import logging
@@ -11,7 +11,7 @@ import threading
 import time
 
 
-class User(Torchnode):
+class UserThread(Torchnode):
     def __init__(
         self,
         request_queue,
@@ -19,17 +19,27 @@ class User(Torchnode):
         print_level=logging.DEBUG,
         max_connections: int = 0,
         upnp=True,
-        off_chain_test=False,
+        on_chain=False,
         local_test=False,
+        priority_nodes: list = None,
+        seed_validators: list = None,
+        max_memory_gb: float = None,
+        _device_info=None,
+        _device_benchmark=None,
     ):
-        super(User, self).__init__(
+        super(UserThread, self).__init__(
             request_queue,
             response_queue,
             "U",
             max_connections=max_connections,
             upnp=upnp,
-            off_chain_test=off_chain_test,
+            on_chain=on_chain,
             local_test=local_test,
+            priority_nodes=priority_nodes,
+            seed_validators=seed_validators,
+            max_memory_gb=max_memory_gb,
+            _device_info=_device_info,
+            _device_benchmark=_device_benchmark,
         )
         self.print_level = print_level
         self.distributed_graph = {}
@@ -63,39 +73,6 @@ class User(Torchnode):
         #         <= 0
         #     ):
         #         time.sleep(5)
-
-        if self.off_chain_test is False:
-            self.public_key = get_key(".tensorlink.env", "PUBLIC_KEY")
-            if not self.public_key:
-                self.debug_print(
-                    "Public key not found in .env file, using donation wallet...",
-                    tag="User",
-                )
-                self.public_key = "0x1Bc3a15dfFa205AA24F6386D959334ac1BF27336"
-
-            self.dht.store(hashlib.sha256(b"ADDRESS").hexdigest(), self.public_key)
-
-            if self.local_test is False:
-                attempts = 0
-
-                self.debug_print("Bootstrapping...", tag="User")
-                while attempts < 3 and len(self.validators) == 0:
-                    self.bootstrap()
-                    if len(self.validators) == 0:
-                        time.sleep(15)
-                        self.debug_print(
-                            "No validators found, trying again...", tag="User"
-                        )
-                        attempts += 1
-
-                if len(self.validators) == 0:
-                    self.debug_print(
-                        "No validators found, shutting down...",
-                        level=logging.WARNING,
-                        tag="User",
-                    )
-                    self.stop()
-                    self.terminate_flag.set()
 
     def handle_data(self, data: bytes, node: Connection) -> bool:
         """
@@ -228,9 +205,9 @@ class User(Torchnode):
 
                         # Connect to workers for each model
                         connected = self.connect_worker(
-                            worker_info["id"],
                             worker_info["host"],
                             worker_info["port"],
+                            worker_info["id"],
                             mod_id,
                         )
 
@@ -272,42 +249,9 @@ class User(Torchnode):
     def request_job(self, n_pipelines, dp_factor, distribution, training):
         """Request job through smart contract and set up the relevant connections for a distributed model.
         Returns a distributed nn.Module with built-in RPC calls to workers."""
-        # Commented out code as user contract interactions will come later
-        # Publish job request to smart contract (args: n_seed_validators, requested_capacity), returns validator IDs
-        # TODO check if user already has job and switch to that if so, (re initialize a job if failed to start or
-        #  disconnected, request data from validators/workers if disconnected and have to reset info.
-        # job_id = self.contract.functions.jobIdByUser(user_id).call()
-        # if job_id >= 1:
-        #     self.debug_print(
-        #         f"request_job: User has active job, loading active job. Delete job request if this was unintentional!"
-        #     )
-        # else:
-        #     tx_hash = self.contract.functions.requestJob(1, capacity).transact(
-        #         {"from": self.account.address}
-        #     )
-        #     tx_receipt = self.chain.eth.wait_for_transaction_receipt(tx_hash)
-        #
-        #     if tx_receipt.status != 1:
-        #         try:
-        #             tx = self.chain.eth.get_transaction(tx_hash)
-        #             tx_input = tx.input
-        #             revert_reason = self.chain.eth.call(
-        #                 {"to": tx.to, "data": tx_input}, tx.blockNumber
-        #             )
-        #
-        #         except ContractLogicError as e:
-        #             revert_reason = f"ContractLogicError: {e}"
-        #
-        #         except Exception as e:
-        #             revert_reason = f"Could not fetch revert reason: {e}"
-        #
-        #         self.debug_print(f"request_job: Job request reverted; {revert_reason}")
-        #
-        # self.debug_print("request_job: Job requested on Smart Contract!")
-        # validator_ids = self.contract.functions.getJobValidators(job_id).call()
         validator_ids = [random.choice(self.validators)]
+        # The case where we do not have a Hugging Face model (i.e. custom model)
         if not distribution.get("model_name"):
-            # The case where we have a custom model with distributed config
             distribution = {
                 k: v for k, v in distribution.items() if v["type"] == "offloaded"
             }
@@ -324,7 +268,8 @@ class User(Torchnode):
 
             job_request = {
                 "author": self.rsa_key_hash,
-                "active": True,
+                "loading": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": False,
                 "capacity": capacity,
                 "payment": 0,
@@ -335,10 +280,11 @@ class User(Torchnode):
                 "seed_validators": validator_ids,
             }
         else:
-            # The case where we have a huggingface model name for inference
+            # The case where we have a Hugging Face model name for inference
             job_request = {
                 "author": self.rsa_key_hash,
-                "active": True,
+                "loading": True,
+                "status": JobStatus.INITIALIZING,
                 "hosted": False,
                 "training": training,
                 "payment": 0,
@@ -351,6 +297,7 @@ class User(Torchnode):
                 "model_name": distribution.get("model_name"),
                 "optimizer": distribution.get("optimizer"),
                 "seed_validators": validator_ids,
+                "available_memory": self.get_gpu_memory(),
             }
 
         # Get validator connections
@@ -392,28 +339,29 @@ class User(Torchnode):
         dist_model_config = {}
         for mod_id, module in distribution.items():
             # Wait for loading confirmation from worker roles
-            module_info = self.modules[mod_id]
-            if len(module_info["assigned_workers"]) < 1:
-                self.debug_print(
-                    "Network could not find workers for job.",
-                    level=logging.INFO,
-                    colour="red",
-                    tag="User",
-                )
-                return
+            if module["type"] == "offloaded":
+                module_info = self.modules[mod_id]
+                if len(module_info["assigned_workers"]) < 1:
+                    self.debug_print(
+                        "Network could not find workers for job.",
+                        level=logging.INFO,
+                        colour="red",
+                        tag="User",
+                    )
+                    return
 
-            # worker_id = worker_info["workers"][0]
-            # module, name = access_module(model, config[mod_id]["mod_id"])
+                # worker_id = worker_info["workers"][0]
+                # module, name = access_module(model, config[mod_id]["mod_id"])
 
-            # Update job with selected worker
-            # TODO Takes the last (most recent model for now, should accommodate all pipelines in the future)
-            # job_request["workers"][0][
-            #     worker_id
-            # ] = mod_id  # TODO 0 hardcoded and must be replaced with n_pipelines
-            dist_model_config[mod_id] = module.copy()
+                # Update job with selected worker
+                # TODO Takes the last (most recent model for now, should accommodate all pipelines in the future)
+                # job_request["workers"][0][
+                #     worker_id
+                # ] = mod_id  # TODO 0 hardcoded and must be replaced with n_pipelines
+                dist_model_config[mod_id] = module.copy()
 
-            self.modules[mod_id]["forward_queue"] = {}
-            self.modules[mod_id]["backward_queue"] = {}
+                self.modules[mod_id]["forward_queue"] = {}
+                self.modules[mod_id]["backward_queue"] = {}
 
         # TODO Send activation message to validators
         # for validator in validators:
@@ -446,27 +394,27 @@ class User(Torchnode):
 
     def connect_worker(
         self,
-        id_hash: bytes,
         host: str,
         port: int,
-        module_id: bytes,
+        id_hash: bytes = None,
+        module_id: bytes = None,
         reconnect: bool = False,
     ) -> bool:
         """
         Connect to a worker node in the Smartnodes network.
 
         Args:
-            id_hash (bytes): Unique identifier of the worker node.
             host (str): Worker host address.
             port (int): Worker port.
-            module_id (bytes): Identifier of the worker's module/service.
+            id_hash (bytes, optional): Unique identifier of the worker node.
+            module_id (bytes, optional): Identifier of the worker's module/service.
             reconnect (bool, optional): Whether to attempt reconnecting
                 if already connected. Defaults to False.
 
         Returns:
             bool: True if the worker connection succeeds, False otherwise.
         """
-        connected = self.connect_node(id_hash, host, port, reconnect)
+        connected = self.connect_node(host, port, id_hash, reconnect)
         return connected
 
     # def activate_job(self, job_id, workers):
@@ -476,15 +424,6 @@ class User(Torchnode):
         # Update the job state to the overseeing validators
         job_bytes = b"JOB-UPDATE" + json.dumps(job).encode()
         self.send_to_node(node, job_bytes)
-
-    def get_self_info(self):
-        data = super().get_self_info()
-
-        if len(self.jobs) > 0:
-            job = self.jobs[-1]
-            data["job"] = {"capacity": job["id"]}
-
-        return data
 
     def request_worker_info(self):
         for validator in self.validators:
@@ -499,10 +438,31 @@ class User(Torchnode):
         # Get proposees from SC and send our state to them
         # If we are the next proposee, accept info from validators and only add info to the final state if there are
         # 2 or more of the identical info
-        super().run()
+        try:
+            super().run()
 
-        while not self.terminate_flag.is_set():
-            # Handle job oversight, and inspect other jobs (includes job verification and reporting)
-            time.sleep(3)
+            should_bootstrap = bool(self._priority_nodes) or self.on_chain
+            if should_bootstrap:
+                attempts = 0
+                while attempts < 3 and len(self.validators) == 0:
+                    self.bootstrap()
 
-        self.stop()
+                    if len(self.nodes) == 0:
+                        time.sleep(3)
+                        attempts += 1
+            else:
+                self.debug_print(
+                    "Skipping bootstrap (no priority nodes and not on-chain).",
+                    tag="Worker",
+                    level=logging.INFO,
+                )
+
+            while not self.terminate_flag.is_set():
+                # Handle job oversight, and inspect other jobs (includes job verification and reporting)
+                time.sleep(3)
+
+        except KeyboardInterrupt:
+            self.terminate_flag.set()
+
+        finally:
+            self.stop()

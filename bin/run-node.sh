@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VENV_PATH="venv"
+VENV_PATH=".venv"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -40,6 +40,21 @@ try:
 except ImportError:
     # Fallback to simple string comparison if packaging not available
     print('$1' != '$2')
+"
+}
+
+# Function to get node type from config
+get_node_type() {
+    python3 -c "
+import json
+import sys
+try:
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+        node_type = config.get('node', {}).get('type', 'worker')
+        print(str(node_type).strip().lower())
+except Exception as e:
+    print(f'Warning: Could not read node type from config.json, defaulting to worker. Error: {e}', file=sys.stderr)
 "
 }
 
@@ -129,8 +144,17 @@ if [ "$EUID" -eq 0 ]; then
     RUN_AS_SUDO="sudo"
 fi
 
-# Run Tensorlink validator
-echo "Starting validator..."
-$RUN_AS_SUDO python run_validator.py
+# Detect node type from config
+NODE_TYPE=$(get_node_type)
+echo "Detected node type from config.json: $NODE_TYPE"
+
+# Validate node type
+if [[ "$NODE_TYPE" != "worker" && "$NODE_TYPE" != "validator" ]]; then
+    handle_error "Invalid node type '$NODE_TYPE' in config.json. Must be 'worker' or 'validator'"
+fi
+
+# Run the unified node script
+echo "Starting $NODE_TYPE node..."
+$RUN_AS_SUDO python run_node.py
 
 deactivate

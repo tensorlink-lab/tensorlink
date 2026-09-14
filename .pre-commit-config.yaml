@@ -4,13 +4,8 @@ repos:
     hooks:
       - id: black
 
-#  - repo: https://github.com/pre-commit/mirrors-mypy
-#    rev: v1.14.1
-#    hooks:
-#      - id: mypy
-
   - repo: https://github.com/PyCQA/flake8
     rev: 7.1.1
     hooks:
       - id: flake8
-        files: ^(tensorlink/p2p|tensorlink/nodes)/
+        files: ^(tensorlink/p2p|tensorlink/nodes|tensorlink/api)/

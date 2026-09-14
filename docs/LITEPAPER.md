@@ -37,7 +37,7 @@ Beyond cost, existing cloud-based AI services present several critical barriers:
 
 We can leverage concepts of volunteer computing to distribute the required work among a network of regular PCs. A single PC may be slow and unreliable, but the combined performance of a fleet of PCs can match that of the largest supercomputers. 
 
-The key to obtaining such a network is to incentivize the gaming demographic to offer up their idle compute for rewards. It is estimated that there are approximately 1.855 billion PC gaming users worldwide. According to several PC building websites, most popular desktops are equipped with RTX 2080/2080 Ti or GTX 1080Ti GPUs—devices that are 50–80% as fast as Tesla V100 for deep learning, a popular GPU among researchers. 
+The key to obtaining such a network is to incentivize the gaming demographic to offer up their idle compute for rewards. It is estimated that there are approximately 1.855 billion PC gaming users worldwide. According to several PC building websites, most popular desktops are equipped with RTX 2080/2080 Ti or GTX 1080Ti GPUs-devices that are 50–80% as fast as Tesla V100 for deep learning, a popular GPU among researchers. 
 
 As a rough estimate, the combined throughput of 10,000 desktops is 8-15 times that of server pods with 512 V100 GPUs. With the profitability of cryptocurrency mining being much lower than in the past, running Tensorlink presents a promising alternative for those who wish to monetize their compute. At the highest level, running Tensorlink and crypto mining can essentially be seen as the same thing: both are means to earn rewards for computational work.
 
@@ -65,7 +65,7 @@ By incentivizing the contribution of idle computing power through smart contract
 
 #### Private Inference Setups
 - **Scenario:** Organizations or individuals requiring AI capabilities with strict privacy requirements.
-- **Solution:** Host an LLM on a home PC or private cluster, access it securely from mobile/web apps via API. Tensorlink enables semi-private or fully private AI usage—not entirely private if using public nodes, but still not centralized in one database. Users can specify their own Tensorlink API key from their Worker node, allowing fully private chat with models via their own hardware.
+- **Solution:** Host an LLM on a home PC or private cluster, access it securely from mobile/web apps via API. Tensorlink enables semi-private or fully private AI usage-not entirely private if using public nodes, but still not centralized in one database. Users can specify their own Tensorlink API key from their Worker node, allowing fully private chat with models via their own hardware.
 
 #### Research & Development
 - **Scenario:** Academic researchers training or fine-tuning large language models without institutional GPU clusters.
@@ -80,7 +80,7 @@ By incentivizing the contribution of idle computing power through smart contract
 - **Solution:** Tensorlink enables coordinated inference across device clusters, keeping data local while leveraging distributed compute power.
 
 #### Monetizing Idle Hardware
-- **Scenario:** GPU owners with idle compute capacity—gamers when not gaming, former mining rigs, or workstations during off-hours.
+- **Scenario:** GPU owners with idle compute capacity-gamers when not gaming, former mining rigs, or workstations during off-hours.
 - **Solution:** Running Tensorlink workers generates passive income by processing distributed AI workloads. Provides an alternative to cryptocurrency mining with potentially better returns.
 
 ---

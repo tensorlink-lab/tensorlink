@@ -7,16 +7,5 @@
         "chain-url": "https://sepolia.base.org",
         "chain-url-local": "http://127.0.0.1:8545",
         "endpoint-url": "http://127.0.0.1:5029"
-    },
-    "network": {
-        "mainnet": {
-            "seeds": [
-                [
-                    "58ef79797cd451e19df4a73fbd9871797f9c6a2995783c7f6fd2406978a2ba2e",
-                    "smartnodes.ddns.net",
-                    38751
-                ]
-            ]
-        }
     }
 }

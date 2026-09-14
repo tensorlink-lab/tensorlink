@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, List, Literal
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Optional, List, Literal, Union, Dict, Any
 
 
 class NodeRequest(BaseModel):
@@ -9,33 +9,160 @@ class NodeRequest(BaseModel):
 class JobRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     hf_name: str
-    model_type: Optional[str] = None
+    model_type: Optional[str] = "chat"
     time: int = 1800
     payment: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Internal generation request, used by the ML pipeline only.
+# Not exposed directly as an API request body.
+# ---------------------------------------------------------------------------
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
+
     hf_name: str
     message: str
+    cancelled: bool = False
+
+    # Generation params (all optional)
+    max_new_tokens: Optional[int] = None
+    max_length: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    do_sample: Optional[bool] = None
+    num_beams: Optional[int] = None
+    reasoning: Optional[bool] = False
+    stream: bool = False
+
     prompt: str = None
     model_type: Optional[str] = "auto"
-    max_length: int = 2048
-    max_new_tokens: int = 2048
-    temperature: float = 0.4
-    do_sample: bool = True
-    num_beams: int = 4
+
+    # Chat/history
     history: Optional[List[dict]] = None
+
+    # Output fields
     output: str = None
+    formatted_response: Optional[Dict[str, Any]] = None
+
+    # Processing metadata
     processing: bool = False
     id: int = None
-    stream: bool = False
-    response_format: Literal["simple", "openai", "full"] = "full"
+    start_time: float = 0
+
+    # Format control
+    input_format: Literal["chat", "raw"] = "raw"
+    output_format: Literal["raw", "openai"] = "raw"
+    is_chat_completion: bool = False
+
+
+# ---------------------------------------------------------------------------
+# v1/chat/completions, OpenAI-compatible chat completion request
+# ---------------------------------------------------------------------------
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model: str
+    messages: List[ChatMessage]
+
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    max_tokens: Optional[int] = 1024
+
+    presence_penalty: Optional[float] = 0.0
+    frequency_penalty: Optional[float] = 0.0
+
+    # Chat completions always use chat input and openai-style output
+    input_format: Literal["chat", "raw"] = "chat"
+    output_format: Literal["raw", "openai"] = "openai"
+
+    user: Optional[str] = None
+
+
+class _BaseResponseRequest(BaseModel):
+    """Shared fields inherited by every modality request"""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model: str
+    stream: Optional[bool] = False
+    user: Optional[str] = None
+
+
+class TextResponseRequest(_BaseResponseRequest):
+    """Text-generation variant of _BaseResponseRequest.
+    Functionally equivalent to ChatCompletionRequest but under the new envelope."""
+
+    type: Literal["text"] = "text"
+    messages: List[ChatMessage]
+
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[int] = 1024
+    stop: Optional[Union[str, List[str]]] = None
+
+
+class ImageResponseRequest(_BaseResponseRequest):
+    """Text-to-image via /v1/responses. TODO: implement handler."""
+
+    type: Literal["image"] = "image"
+    prompt: str
+
+    n: Optional[int] = 1
+    size: Optional[str] = "1024x1024"
+    quality: Optional[str] = "standard"  # "standard" | "hd"
+    response_format: Optional[Literal["url", "b64_json"]] = "url"
+
+
+class EmbeddingResponseRequest(_BaseResponseRequest):
+    """Text embeddings via /v1/responses. TODO: implement handler."""
+
+    type: Literal["embedding"] = "embedding"
+    input: Union[str, List[str]]
+
+    encoding_format: Optional[Literal["float", "base64"]] = "float"
+    dimensions: Optional[int] = None
+
+
+AnyResponseRequest = Annotated[
+    Union[TextResponseRequest, ImageResponseRequest, EmbeddingResponseRequest],
+    Field(discriminator="type"),
+]
 
 
 class ModelStatusResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    model_name: str
+    model: str
     status: str
     message: str
+
+
+class ModelDistributionEntry(BaseModel):
+    """Describes a single module's distribution state."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    worker_id: Optional[str] = None  # null for validator-hosted modules
+    loaded: bool = False
+    type: str = ""
+    memory: int = 0
+
+
+class ModelStatusDistributionResponse(BaseModel):
+    """Extended model status response including per-module distribution."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_name: str
+    status: str  # "active" | "initializing" | "inactive"
+    message: str
+    distribution: Optional[Dict[str, ModelDistributionEntry]] = None
