@@ -485,7 +485,7 @@ class DistributedModel(nn.Module):
                     if isinstance(assoc_input, torch.Tensor):
                         assoc_input.backward(loss)
                 else:
-                    raise "Expect vals to be of length 1 or 2."
+                    raise ValueError("Expect vals to be of length 1 or 2.")
 
     def get_info_from_module_id(self, mod_id: list, micro: int = None):
         for info in self.distributed_graph.values():
@@ -708,7 +708,7 @@ class DistributedModel(nn.Module):
                     self._wrap_hf_module(module_id, module_info)
 
             else:
-                raise "Custom models are currently not supported."
+                raise NotImplementedError("Custom models are currently not supported.")
 
         if offloaded_groups:
             self._wrap_grouped_layers(offloaded_groups)

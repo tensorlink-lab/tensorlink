@@ -824,7 +824,9 @@ def resolve_module_from_path(model: nn.Module, path: str):
     elif child_name == "model":
         child = parent
     else:
-        raise f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+        raise AttributeError(
+            f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+        )
 
     return parent, child, child_name
 

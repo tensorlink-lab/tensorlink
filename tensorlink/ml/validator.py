@@ -386,6 +386,31 @@ class DistributedValidator(DistributedWorker):
 
         # Get network worker information to assign modules
         workers = self.send_request("get_workers", None)
+        if not workers:
+            self.send_request(
+                "debug_print",
+                (
+                    f"inspect_model({model_name}, hosted={hosted}) -> "
+                    f"get_workers returned {workers!r}; no workers available "
+                    "to assign modules to.",
+                    "bright_red",
+                    logging.WARNING,
+                ),
+            )
+        else:
+            self.send_request(
+                "debug_print",
+                (
+                    f"inspect_model({model_name}, hosted={hosted}) -> "
+                    f"{len(workers)} worker(s) available: "
+                    + ", ".join(
+                        f"{wid}={w.get('gpu_memory', '?')}"
+                        for wid, w in workers.items()
+                    ),
+                    "cyan",
+                    logging.DEBUG,
+                ),
+            )
 
         batch_size = job_data.get("batch_size", None)
 
@@ -410,24 +435,40 @@ class DistributedValidator(DistributedWorker):
             host_memory_budget = 0
             # host_memory_budget = job_data.get("available_memory", 0)
 
-        # Load HF model, create and save distribution
-        distribution = parser.create_distributed_config(
-            model_name,
-            workers=workers,
-            training=job_data.get("training", False),
-            trusted=False,
-            input_obfuscation=False,
-            optimizer_type=optimizer_type,
-            optimizer_spec=optimizer_spec,
-            host_max_memory_bytes=host_memory_budget,
-            host_max_module_bytes=self._max_module_bytes,
-            host_max_depth=1,
-            max_offload_depth=3,
-            batch_size=job_data.get("batch_size", batch_size),
-            max_seq_len=job_data.get("max_seq_len", 4096),
-            model_type=job_data.get("model_type", "chat"),
-            force_tied_to_host=True if host_memory_budget > 0 else False,
-        )
+        try:
+            # Load HF model, create and save distribution
+            distribution = parser.create_distributed_config(
+                model_name,
+                workers=workers,
+                training=job_data.get("training", False),
+                trusted=False,
+                input_obfuscation=False,
+                optimizer_type=optimizer_type,
+                optimizer_spec=optimizer_spec,
+                host_max_memory_bytes=host_memory_budget,
+                host_max_module_bytes=self._max_module_bytes,
+                host_max_depth=1,
+                max_offload_depth=3,
+                batch_size=job_data.get("batch_size", batch_size),
+                max_seq_len=job_data.get("max_seq_len", 4096),
+                model_type=job_data.get("model_type", "chat"),
+                force_tied_to_host=True if host_memory_budget > 0 else False,
+            )
+        except Exception as e:
+            logging.exception(
+                f"inspect_model({model_name}, hosted={hosted}) -> "
+                f"create_distributed_config raised {type(e).__name__}: {e}"
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"Failed to build distribution for {model_name} "
+                    f"(hosted={hosted}): {type(e).__name__}: {e}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+            return {}
 
         job_data["distribution"] = distribution
 
@@ -443,6 +484,24 @@ class DistributedValidator(DistributedWorker):
             > 6  # TODO This limit on number of distributions is not ideal
             or not distribution["success"]
         ):
+            worker_memory = {
+                wid: w.get("gpu_memory") for wid, w in (workers or {}).items()
+            }
+            self.send_request(
+                "debug_print",
+                (
+                    f"Rejecting distribution for {model_name} (hosted={hosted}): "
+                    f"success={distribution['success']}, "
+                    f"error={distribution.get('error')!r}, "
+                    f"offloaded_count={offloaded_count}, "
+                    f"config_entries={len(distribution['config'])}, "
+                    f"model_memory={distribution.get('model_memory', 0) / 1e6:.2f}MB, "
+                    f"host_budget={host_memory_budget / 1e6:.2f}MB, "
+                    f"workers={worker_memory}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
             return {}
 
         if job_data.get("id") is None:
