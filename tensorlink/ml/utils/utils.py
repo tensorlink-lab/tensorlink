@@ -2,7 +2,7 @@ import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List, TYPE_CHECKING
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
@@ -13,6 +13,8 @@ from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
 from transformers import AutoConfig
 
+if TYPE_CHECKING:
+    from tensorlink.ml.module import OffloadedModule
 
 MODELS_CACHE_PATH = "logs/models.json"
 DTYPE_STR_MAP = {
@@ -829,6 +831,32 @@ def resolve_module_from_path(model: nn.Module, path: str):
         )
 
     return parent, child, child_name
+
+
+def find_meta_tensors(module: nn.Module, prefix: str = "") -> List[str]:
+    """
+    Walk the local skeleton and report every parameter/buffer still on the 'meta' device.
+    """
+    meta_found: List[str] = []
+
+    if isinstance(module, OffloadedModule):
+        return meta_found
+
+    for name, param in module.named_parameters(recurse=False):
+        if param.device.type == "meta":
+            label = f"{prefix}.{name}" if prefix else name
+            meta_found.append(f"{label} (param, shape={tuple(param.shape)})")
+
+    for name, buf in module.named_buffers(recurse=False):
+        if buf is not None and buf.device.type == "meta":
+            label = f"{prefix}.{name}" if prefix else name
+            meta_found.append(f"{label} (buffer, shape={tuple(buf.shape)})")
+
+    for child_name, child in module.named_children():
+        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        meta_found.extend(find_meta_tensors(child, child_prefix))
+
+    return meta_found
 
 
 def get_optimizer_from_spec(optimizer_spec: dict):

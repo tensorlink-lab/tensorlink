@@ -43,6 +43,7 @@ from tensorlink.ml.utils import (
     attach_tensor,
     resolve_module_from_path,
     resolve_dtype,
+    find_meta_tensors,
 )
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
@@ -741,7 +742,35 @@ class DistributedModel(nn.Module):
             with _set_micro(self._thread_local, 0):
                 return self.model.generate(*args, **kwargs)
         except Exception as e:
-            raise e
+            meta_leftovers = None
+            if isinstance(self.model, nn.Module):
+                meta_leftovers = find_meta_tensors(self.model)
+
+            if meta_leftovers:
+                logging.error(
+                    "DistributedModel.generate failed with %s: %s -- found "
+                    "%d tensor(s) still on 'meta' device that likely caused "
+                    "this: %s",
+                    type(e).__name__,
+                    e,
+                    len(meta_leftovers),
+                    meta_leftovers,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"{e} (likely cause: {len(meta_leftovers)} un-materialized "
+                    f"'meta' tensor(s) still present locally: "
+                    f"{meta_leftovers[:10]}"
+                    f"{' ...' if len(meta_leftovers) > 10 else ''})"
+                ) from e
+
+            logging.error(
+                "DistributedModel.generate failed with %s: %s",
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
+            raise
 
     def _wrap_hf_module(self, module_id: str, module_info: dict):
         """Handle single module offloading"""

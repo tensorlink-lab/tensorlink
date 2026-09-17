@@ -769,7 +769,7 @@ class DistributedValidator(DistributedWorker):
                 )
             )
 
-        except RuntimeError as e:
+        except Exception as e:
             error_msg = f"Generation failed: {str(e)}"
             request.output = error_msg
             request.formatted_response = ResponseFormatter.format_error_response(
@@ -777,6 +777,10 @@ class DistributedValidator(DistributedWorker):
                 error_type="generation_error",
                 status_code=500,
                 request_id=str(request.id),
+            )
+            logging.exception(
+                f"DistributedValidator._generate(job_id={job_id}) -> "
+                f"{type(e).__name__}: {e}"
             )
             self.send_request(
                 "debug_print",
@@ -810,6 +814,14 @@ class DistributedValidator(DistributedWorker):
                 **args,
             }
 
+            gen_errors: list = []
+
+            def _run_generate(**gen_kwargs):
+                try:
+                    distributed_model.generate(**gen_kwargs)
+                except Exception as exc:
+                    gen_errors.append(exc)
+
             # Setup streamer + thread
             if isinstance(distributed_model.model, OffloadedModule):
                 generation_kwargs["stream"] = True
@@ -820,7 +832,7 @@ class DistributedValidator(DistributedWorker):
                 )
 
                 generation_thread = Thread(
-                    target=distributed_model.generate,
+                    target=_run_generate,
                     kwargs=generation_kwargs,
                     daemon=True,
                 )
@@ -834,7 +846,7 @@ class DistributedValidator(DistributedWorker):
                 generation_kwargs["streamer"] = streamer
 
                 generation_thread = Thread(
-                    target=distributed_model.generate,
+                    target=_run_generate,
                     kwargs=generation_kwargs,
                     daemon=True,
                 )
@@ -900,6 +912,18 @@ class DistributedValidator(DistributedWorker):
                         ),
                     )
 
+            if gen_errors:
+                exc = gen_errors[0]
+                logging.error(
+                    "DistributedValidator._generate_streaming(job_id=%s) -> "
+                    "background generate() failed with %s: %s",
+                    job_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                raise exc
+
             # Finalize output
             reasoning_text = None
             cleaned_text = full_text
@@ -924,6 +948,15 @@ class DistributedValidator(DistributedWorker):
             )
 
         except Exception as e:
+            # distributed_model.generate() itself also runs inside a background
+            # Thread further up (for the streaming case) whose exceptions
+            # are NOT propagated here. If streaming just silently produces
+            # no tokens, check for that separately; this handler only covers
+            # errors raised directly in this method's own body.
+            logging.exception(
+                f"DistributedValidator._generate_streaming(job_id={job_id}) -> "
+                f"{type(e).__name__}: {e}"
+            )
             error_chunk = ResponseFormatter.format_stream_error(
                 error_message=str(e),
                 error_type="generation_error",
