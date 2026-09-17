@@ -1066,18 +1066,24 @@ class DistributedValidator(DistributedWorker):
             return True
 
         except Exception as e:
-            logging.error(f"Error initializing hosted job for {model_name}: {str(e)}")
-            job_id = job_data.get("id")
-            self.models_initializing.discard(job_id)
-            self._release_host_memory(job_id)
-            del self.models[job_id]
-            if job_id in self.model_state:
-                del self.model_state[job_id]
+            job_id = job_data.get("id") if job_data else None
+
+            logging.exception(
+                f"Error initializing hosted job for {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
+
+            if job_id is not None:
+                self.models_initializing.discard(job_id)
+                self._release_host_memory(job_id)
+                self.models.pop(job_id, None)
+                self.model_state.pop(job_id, None)
 
             return False
 
     def _finalize_hosted_job(self, job_id: str):
         """Finalize a hosted job by setting up the distributed model with workers."""
+        model_name = job_id  # fallback value in case of failure
         try:
             # Check if we have module info ready
             args = self.send_request("check_module", job_id)
@@ -1143,7 +1149,10 @@ class DistributedValidator(DistributedWorker):
             return True
 
         except Exception as e:
-            logging.error(f"Error finalizing hosted job for {model_name}: {str(e)}")
+            logging.error(
+                f"Error finalizing hosted job for {model_name} "
+                f"(job_id={job_id}: {type(e).__name__}: {e}"
+            )
             self.models_initializing.discard(job_id)
             self._release_host_memory(job_id)
             if job_id in self.models:
@@ -1152,6 +1161,7 @@ class DistributedValidator(DistributedWorker):
 
     def _remove_hosted_job(self, job_id: str):
         """Remove a hosted job and clean up all associated resources"""
+        model_name = job_id  # fallback value in case of failure
         try:
             self._release_host_memory(job_id)
 
@@ -1245,7 +1255,10 @@ class DistributedValidator(DistributedWorker):
             )
 
         except Exception as e:
-            logging.error(f"Error removing hosted job {model_name}: {str(e)}")
+            logging.exception(
+                f"Error removing hosted job {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
             self.send_request(
                 "debug_print",
                 (
