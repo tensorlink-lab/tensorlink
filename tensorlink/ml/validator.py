@@ -435,25 +435,40 @@ class DistributedValidator(DistributedWorker):
             host_memory_budget = 0
             # host_memory_budget = job_data.get("available_memory", 0)
 
+        kwargs = {
+            "workers": workers,
+            "training": job_data.get("training", False),
+            "trusted": False,
+            "input_obfuscation": False,
+            "optimizer_type": optimizer_type,
+            "optimizer_spec": optimizer_spec,
+            "host_max_memory_bytes": host_memory_budget,
+            "host_max_module_bytes": self._max_module_bytes,
+            "host_max_depth": 1,
+            "max_offload_depth": 3,
+            "batch_size": job_data.get("batch_size", batch_size),
+            "max_seq_len": job_data.get("max_seq_len", 4096),
+            "model_type": job_data.get("model_type", "chat"),
+            "force_tied_to_host": host_memory_budget > 0,
+        }
+
         try:
+            self.send_request(
+                "debug_print",
+                (
+                    f"Creating distributed config for model '{model_name}' "
+                    f"with requirements: {kwargs}",
+                    "green",
+                    logging.INFO,
+                ),
+            )
+
             # Load HF model, create and save distribution
             distribution = parser.create_distributed_config(
                 model_name,
-                workers=workers,
-                training=job_data.get("training", False),
-                trusted=False,
-                input_obfuscation=False,
-                optimizer_type=optimizer_type,
-                optimizer_spec=optimizer_spec,
-                host_max_memory_bytes=host_memory_budget,
-                host_max_module_bytes=self._max_module_bytes,
-                host_max_depth=1,
-                max_offload_depth=3,
-                batch_size=job_data.get("batch_size", batch_size),
-                max_seq_len=job_data.get("max_seq_len", 4096),
-                model_type=job_data.get("model_type", "chat"),
-                force_tied_to_host=True if host_memory_budget > 0 else False,
+                **kwargs,
             )
+
         except Exception as e:
             logging.exception(
                 f"inspect_model({model_name}, hosted={hosted}) -> "

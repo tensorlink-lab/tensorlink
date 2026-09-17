@@ -25,6 +25,7 @@ from tensorlink.ml.utils.loading import (
     ModelCacheManager,
     load_module_weights,
     get_nested_module,
+    find_meta_tensors,
 )
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.ml.utils import (
@@ -43,7 +44,6 @@ from tensorlink.ml.utils import (
     attach_tensor,
     resolve_module_from_path,
     resolve_dtype,
-    find_meta_tensors,
 )
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
@@ -174,6 +174,33 @@ def _collect_buffers(buffer_map, module_path, module_info):
                 break
 
     return collected
+
+
+def _drop_replaced_layer_container(parent_module: nn.Module) -> None:
+    """
+    Remove the original layer container (e.g. `.layers`/`.h`/`.blocks`)
+    once `_inject_grouped_layer_forward` has rewritten the parent's
+    forward to call the offloaded layer group.
+    """
+    for attr_name in ("layers", "h", "blocks", "layer", "decoder", "encoder"):
+        container = getattr(parent_module, attr_name, None)
+        if isinstance(container, nn.ModuleList):
+            setattr(parent_module, attr_name, nn.ModuleList())
+            logging.info(
+                "Dropped original %s.%s (%d meta-device layer(s), now "
+                "unused after grouped-layer forward rewrite)",
+                type(parent_module).__name__,
+                attr_name,
+                len(container),
+            )
+            return
+
+    logging.warning(
+        "Could not find the original layer container on %s to drop after "
+        "grouped-layer forward rewrite, it may still hold un-materialized "
+        "'meta' tensors.",
+        type(parent_module).__name__,
+    )
 
 
 class DistributedModel(nn.Module):
@@ -731,7 +758,22 @@ class DistributedModel(nn.Module):
         # Await for all modules to be loaded by workers
         all_offloaded = offloaded_modules | offloaded_groups
         self._wait_all_modules_loaded(all_offloaded)
-        # of queues if we wish to perform multiple epochs concurrently
+
+        # Anything still on the 'meta' device at this point was supposed to be
+        # host-loaded or replaced by an OffloadedModule but was not, throw an error.
+        if isinstance(self.model, nn.Module):
+            meta_leftovers = find_meta_tensors(
+                self.model, skip_types=(OffloadedModule,)
+            )
+            if meta_leftovers:
+                logging.error(
+                    "distribute_model: %d tensor(s) still on 'meta' device after "
+                    "distribution for %s, these will fail the first time they're "
+                    "used: %s",
+                    len(meta_leftovers),
+                    self.model_name,
+                    meta_leftovers,
+                )
 
     def generate(self, *args, **kwargs):
         # Attach all input tensors to the model's device
@@ -742,30 +784,27 @@ class DistributedModel(nn.Module):
             with _set_micro(self._thread_local, 0):
                 return self.model.generate(*args, **kwargs)
         except Exception as e:
-            try:
+            if isinstance(self.model, nn.Module):
                 meta_leftovers = find_meta_tensors(
                     self.model, skip_types=(OffloadedModule,)
                 )
-            except RecursionError:
-                meta_leftovers = []
-
-            if meta_leftovers:
-                logging.error(
-                    "DistributedModel.generate failed with %s: %s -- found "
-                    "%d tensor(s) still on 'meta' device that likely caused "
-                    "this: %s",
-                    type(e).__name__,
-                    e,
-                    len(meta_leftovers),
-                    meta_leftovers,
-                    exc_info=True,
-                )
-                raise RuntimeError(
-                    f"{e} (likely cause: {len(meta_leftovers)} un-materialized "
-                    f"'meta' tensor(s) still present locally: "
-                    f"{meta_leftovers[:10]}"
-                    f"{' ...' if len(meta_leftovers) > 10 else ''})"
-                ) from e
+                if meta_leftovers:
+                    logging.error(
+                        "DistributedModel.generate failed with %s: %s, found "
+                        "%d tensor(s) still on 'meta' device that likely caused "
+                        "this: %s",
+                        type(e).__name__,
+                        e,
+                        len(meta_leftovers),
+                        meta_leftovers,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        f"{e} (likely cause: {len(meta_leftovers)} un-materialized "
+                        f"'meta' tensor(s) still present locally: "
+                        f"{meta_leftovers[:10]}"
+                        f"{' ...' if len(meta_leftovers) > 10 else ''})"
+                    ) from e
 
             logging.error(
                 "DistributedModel.generate failed with %s: %s",
@@ -864,6 +903,7 @@ class DistributedModel(nn.Module):
         )
 
         parent_module.forward = types.MethodType(new_forward, parent_module)
+        _drop_replaced_layer_container(parent_module)
 
     def _initialize_distribution(self):
         """Initialize the distributed model."""

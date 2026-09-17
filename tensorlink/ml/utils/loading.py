@@ -698,7 +698,39 @@ def get_nested_module(
                 current = getattr(current, part)
 
         return current
+
     except Exception as e:
         print(
             f"ERROR FETCHING NESTED MODULE {path} FOR MODEL {model.__class__}. (Error: {e})"
         )
+        raise e
+
+
+def find_meta_tensors(
+    _module: nn.Module, _prefix: str = "", skip_types: tuple = ()
+) -> List[str]:
+    """
+    Walk the local skeleton and report every parameter/buffer still on the 'meta' device.
+    """
+    meta_found: List[str] = []
+
+    def walk(module: nn.Module, prefix: str):
+        if isinstance(module, skip_types):
+            return
+
+        for name, param in module.named_parameters(recurse=False):
+            if param.device.type == "meta":
+                label = f"{prefix}.{name}" if prefix else name
+                meta_found.append(f"{label} (param, shape={tuple(param.shape)})")
+
+        for name, buf in module.named_buffers(recurse=False):
+            if buf is not None and buf.device.type == "meta":
+                label = f"{prefix}.{name}" if prefix else name
+                meta_found.append(f"{label} (buffer, shape={tuple(buf.shape)})")
+
+        for child_name, child in module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            walk(child, child_prefix)
+
+    walk(_module, "")
+    return meta_found

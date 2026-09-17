@@ -830,34 +830,6 @@ def resolve_module_from_path(model: nn.Module, path: str):
     return parent, child, child_name
 
 
-def find_meta_tensors(
-    module: nn.Module, prefix: str = "", skip_types: tuple = ()
-) -> List[str]:
-    """
-    Walk the local skeleton and report every parameter/buffer still on the 'meta' device.
-    """
-    meta_found: List[str] = []
-
-    if isinstance(module, skip_types):
-        return meta_found
-
-    for name, param in module.named_parameters(recurse=False):
-        if param.device.type == "meta":
-            label = f"{prefix}.{name}" if prefix else name
-            meta_found.append(f"{label} (param, shape={tuple(param.shape)})")
-
-    for name, buf in module.named_buffers(recurse=False):
-        if buf is not None and buf.device.type == "meta":
-            label = f"{prefix}.{name}" if prefix else name
-            meta_found.append(f"{label} (buffer, shape={tuple(buf.shape)})")
-
-    for child_name, child in module.named_children():
-        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-        meta_found.extend(find_meta_tensors(child, child_prefix))
-
-    return meta_found
-
-
 def get_optimizer_from_spec(optimizer_spec: dict):
     module_path, class_name = optimizer_spec["class_path"].rsplit(".", 1)
     import_module = importlib.import_module(module_path)
