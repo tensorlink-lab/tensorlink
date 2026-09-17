@@ -742,11 +742,12 @@ class DistributedModel(nn.Module):
             with _set_micro(self._thread_local, 0):
                 return self.model.generate(*args, **kwargs)
         except Exception as e:
-            meta_leftovers = None
-            if isinstance(self.model, nn.Module):
+            try:
                 meta_leftovers = find_meta_tensors(
                     self.model, skip_types=(OffloadedModule,)
                 )
+            except RecursionError:
+                meta_leftovers = []
 
             if meta_leftovers:
                 logging.error(
