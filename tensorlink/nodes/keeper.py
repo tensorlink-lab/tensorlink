@@ -275,6 +275,10 @@ class Keeper:
                 if _is_entity_current(entity_data, cutoff_time):
                     state[category][entity_id] = entity_data
 
+        # This node is itself an active validator, but it's never in its own
+        # DHT-derived collection.
+        state["validators"][self.node.rsa_key_hash] = {"last_seen": current_time}
+
         # Add capacity info
         capacity = self._calculate_worker_capacities()
         state.update(capacity)
@@ -419,9 +423,6 @@ class Keeper:
                 **device_breakdown,
             }
 
-            # Adjust validators count (add 1 for self)
-            daily_stat["validators"] += 1
-
             if existing_stat_index is not None:
                 self.network_stats["daily"][existing_stat_index] = daily_stat
                 action = "Updated"
@@ -453,21 +454,21 @@ class Keeper:
             )
 
     def _calculate_worker_capacities(self) -> Dict:
-        """Calculate total available and used capacity from workers."""
-        total_available = 0
-        total_used = 0
+        """Total available/used GPU memory across everything serving model components."""
+        total_available = getattr(self.node, "available_gpu_memory", 0)
+        total_used = getattr(self.node, "total_gpu_memory", 0) - total_available
 
-        if hasattr(self.node, "all_workers"):
-            for worker_data in self.node.all_workers.values():
-                total = worker_data.get('total_gpu_memory', 0)
-                available = worker_data.get('gpu_memory', 0)
+        for source in ("all_workers", "all_validators"):
+            for peer_data in getattr(self.node, source, {}).values():
+                total = peer_data.get("total_gpu_memory", 0)
+                available = peer_data.get("gpu_memory", 0)
                 total_available += available
                 total_used += total - available
 
         return {
-            'available_capacity': total_available,
-            'used_capacity': total_used,
-            'total_capacity': total_available + total_used,
+            "available_capacity": total_available,
+            "used_capacity": total_used,
+            "total_capacity": total_available + total_used,
         }
 
     def _save_network_stats(self):
@@ -788,7 +789,9 @@ class Keeper:
 
                     # If we are a validator deleting a worker, remove it from the worker stats
                     if role.startswith("W") and hasattr(self.node, "all_workers"):
-                        del self.node.all_workers[node_id]
+                        self.node.all_workers.pop(node_id, None)
+                    elif role.startswith("V") and hasattr(self.node, "all_validators"):
+                        self.node.all_validators.pop(node_id, None)
 
             for node_id in to_remove:
                 nodes.remove(node_id)

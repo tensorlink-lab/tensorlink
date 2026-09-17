@@ -2,7 +2,7 @@ import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
@@ -12,7 +12,6 @@ from dataclasses import is_dataclass, asdict
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
 from transformers import AutoConfig
-
 
 MODELS_CACHE_PATH = "logs/models.json"
 DTYPE_STR_MAP = {
@@ -824,7 +823,9 @@ def resolve_module_from_path(model: nn.Module, path: str):
     elif child_name == "model":
         child = parent
     else:
-        raise f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+        raise AttributeError(
+            f"Module '{child_name}' not found for parent model {parent}! (path: {path})"
+        )
 
     return parent, child, child_name
 
