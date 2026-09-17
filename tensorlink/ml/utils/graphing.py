@@ -487,7 +487,9 @@ class ModelParser:
             if isinstance(model, str):
                 self.model_name = model
                 self._log("", f"Loading model skeleton for '{model}'...")
-                model = load_model_skeleton(self.model_name, model_type)
+                model = load_model_skeleton(
+                    self.model_name, model_type, torch_dtype=dtype
+                )
                 self._log("", f"Loaded model skeleton for '{self.model_name}'.")
 
             workers_state = self._build_workers_state(workers or {})
