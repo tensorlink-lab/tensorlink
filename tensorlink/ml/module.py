@@ -744,7 +744,9 @@ class DistributedModel(nn.Module):
         except Exception as e:
             meta_leftovers = None
             if isinstance(self.model, nn.Module):
-                meta_leftovers = find_meta_tensors(self.model)
+                meta_leftovers = find_meta_tensors(
+                    self.model, skip_types=(OffloadedModule,)
+                )
 
             if meta_leftovers:
                 logging.error(

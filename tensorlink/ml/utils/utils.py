@@ -2,7 +2,7 @@ import importlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from typing import Dict, Optional, Union, List, TYPE_CHECKING
+from typing import Dict, Optional, Union, List
 import time
 import os
 from safetensors.torch import save as st_save_bytes, load as st_load_bytes
@@ -12,9 +12,6 @@ from dataclasses import is_dataclass, asdict
 from transformers.utils import ModelOutput
 from transformers.cache_utils import DynamicCache
 from transformers import AutoConfig
-
-if TYPE_CHECKING:
-    from tensorlink.ml.module import OffloadedModule
 
 MODELS_CACHE_PATH = "logs/models.json"
 DTYPE_STR_MAP = {
@@ -833,13 +830,15 @@ def resolve_module_from_path(model: nn.Module, path: str):
     return parent, child, child_name
 
 
-def find_meta_tensors(module: nn.Module, prefix: str = "") -> List[str]:
+def find_meta_tensors(
+    module: nn.Module, prefix: str = "", skip_types: tuple = ()
+) -> List[str]:
     """
     Walk the local skeleton and report every parameter/buffer still on the 'meta' device.
     """
     meta_found: List[str] = []
 
-    if isinstance(module, OffloadedModule):
+    if isinstance(module, skip_types):
         return meta_found
 
     for name, param in module.named_parameters(recurse=False):
