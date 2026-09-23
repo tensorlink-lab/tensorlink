@@ -1213,8 +1213,7 @@ class Smartnode(threading.Thread):
                 elif result is True:
                     break
                 else:
-                    raise "Error binding port."
-
+                    raise RuntimeError("Error binding port.")
         try:
             self.sock.bind((self.host, port))
         except OSError:

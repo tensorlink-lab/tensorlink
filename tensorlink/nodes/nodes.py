@@ -14,7 +14,7 @@ from tensorlink.nodes.validator_thread import ValidatorThread
 from tensorlink.nodes.worker_thread import WorkerThread
 
 
-MIN_PUBLIC_VALIDATOR_MEMORY_GB = 12
+MIN_PUBLIC_VALIDATOR_MEMORY_GB = 4
 MAX_PUBLIC_VALIDATOR_MODULE_SIZE = 5e8
 
 

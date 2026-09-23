@@ -218,7 +218,7 @@ class Torchnode(Smartnode):
             self._log_error(f"Error handling data: {e}", tag="Torchnode")
 
     def handle_statistics_request(self, data: bytes, node: Connection):
-        """When a validator requests a stats request, return stats"""
+        """When a validator requests stats, return stats"""
         self.debug_print(f"Received stats request from: {node.node_id}", tag="Worker")
 
         self.get_gpu_memory()

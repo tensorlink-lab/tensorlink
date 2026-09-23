@@ -386,6 +386,31 @@ class DistributedValidator(DistributedWorker):
 
         # Get network worker information to assign modules
         workers = self.send_request("get_workers", None)
+        if not workers:
+            self.send_request(
+                "debug_print",
+                (
+                    f"inspect_model({model_name}, hosted={hosted}) -> "
+                    f"get_workers returned {workers!r}; no workers available "
+                    "to assign modules to.",
+                    "bright_red",
+                    logging.WARNING,
+                ),
+            )
+        else:
+            self.send_request(
+                "debug_print",
+                (
+                    f"inspect_model({model_name}, hosted={hosted}) -> "
+                    f"{len(workers)} worker(s) available: "
+                    + ", ".join(
+                        f"{wid}={w.get('gpu_memory', '?')}"
+                        for wid, w in workers.items()
+                    ),
+                    "cyan",
+                    logging.DEBUG,
+                ),
+            )
 
         batch_size = job_data.get("batch_size", None)
 
@@ -410,24 +435,55 @@ class DistributedValidator(DistributedWorker):
             host_memory_budget = 0
             # host_memory_budget = job_data.get("available_memory", 0)
 
-        # Load HF model, create and save distribution
-        distribution = parser.create_distributed_config(
-            model_name,
-            workers=workers,
-            training=job_data.get("training", False),
-            trusted=False,
-            input_obfuscation=False,
-            optimizer_type=optimizer_type,
-            optimizer_spec=optimizer_spec,
-            host_max_memory_bytes=host_memory_budget,
-            host_max_module_bytes=self._max_module_bytes,
-            host_max_depth=1,
-            max_offload_depth=3,
-            batch_size=job_data.get("batch_size", batch_size),
-            max_seq_len=job_data.get("max_seq_len", 4096),
-            model_type=job_data.get("model_type", "chat"),
-            force_tied_to_host=True if host_memory_budget > 0 else False,
-        )
+        kwargs = {
+            "workers": workers,
+            "training": job_data.get("training", False),
+            "trusted": False,
+            "input_obfuscation": False,
+            "optimizer_type": optimizer_type,
+            "optimizer_spec": optimizer_spec,
+            "host_max_memory_bytes": host_memory_budget,
+            "host_max_module_bytes": self._max_module_bytes,
+            "host_max_depth": 1,
+            "max_offload_depth": 3,
+            "batch_size": job_data.get("batch_size", batch_size),
+            "max_seq_len": job_data.get("max_seq_len", 4096),
+            "model_type": job_data.get("model_type", "chat"),
+            "force_tied_to_host": host_memory_budget > 0,
+        }
+
+        try:
+            self.send_request(
+                "debug_print",
+                (
+                    f"Creating distributed config for model '{model_name}' "
+                    f"with requirements: {kwargs}",
+                    "green",
+                    logging.INFO,
+                ),
+            )
+
+            # Load HF model, create and save distribution
+            distribution = parser.create_distributed_config(
+                model_name,
+                **kwargs,
+            )
+
+        except Exception as e:
+            logging.exception(
+                f"inspect_model({model_name}, hosted={hosted}) -> "
+                f"create_distributed_config raised {type(e).__name__}: {e}"
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"Failed to build distribution for {model_name} "
+                    f"(hosted={hosted}): {type(e).__name__}: {e}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
+            return {}
 
         job_data["distribution"] = distribution
 
@@ -443,6 +499,24 @@ class DistributedValidator(DistributedWorker):
             > 6  # TODO This limit on number of distributions is not ideal
             or not distribution["success"]
         ):
+            worker_memory = {
+                wid: w.get("gpu_memory") for wid, w in (workers or {}).items()
+            }
+            self.send_request(
+                "debug_print",
+                (
+                    f"Rejecting distribution for {model_name} (hosted={hosted}): "
+                    f"success={distribution['success']}, "
+                    f"error={distribution.get('error')!r}, "
+                    f"offloaded_count={offloaded_count}, "
+                    f"config_entries={len(distribution['config'])}, "
+                    f"model_memory={distribution.get('model_memory', 0) / 1e6:.2f}MB, "
+                    f"host_budget={host_memory_budget / 1e6:.2f}MB, "
+                    f"workers={worker_memory}",
+                    "bright_red",
+                    logging.ERROR,
+                ),
+            )
             return {}
 
         if job_data.get("id") is None:
@@ -710,7 +784,7 @@ class DistributedValidator(DistributedWorker):
                 )
             )
 
-        except RuntimeError as e:
+        except Exception as e:
             error_msg = f"Generation failed: {str(e)}"
             request.output = error_msg
             request.formatted_response = ResponseFormatter.format_error_response(
@@ -718,6 +792,10 @@ class DistributedValidator(DistributedWorker):
                 error_type="generation_error",
                 status_code=500,
                 request_id=str(request.id),
+            )
+            logging.exception(
+                f"DistributedValidator._generate(job_id={job_id}) -> "
+                f"{type(e).__name__}: {e}"
             )
             self.send_request(
                 "debug_print",
@@ -751,6 +829,14 @@ class DistributedValidator(DistributedWorker):
                 **args,
             }
 
+            gen_errors: list = []
+
+            def _run_generate(**gen_kwargs):
+                try:
+                    distributed_model.generate(**gen_kwargs)
+                except Exception as exc:
+                    gen_errors.append(exc)
+
             # Setup streamer + thread
             if isinstance(distributed_model.model, OffloadedModule):
                 generation_kwargs["stream"] = True
@@ -761,7 +847,7 @@ class DistributedValidator(DistributedWorker):
                 )
 
                 generation_thread = Thread(
-                    target=distributed_model.generate,
+                    target=_run_generate,
                     kwargs=generation_kwargs,
                     daemon=True,
                 )
@@ -775,7 +861,7 @@ class DistributedValidator(DistributedWorker):
                 generation_kwargs["streamer"] = streamer
 
                 generation_thread = Thread(
-                    target=distributed_model.generate,
+                    target=_run_generate,
                     kwargs=generation_kwargs,
                     daemon=True,
                 )
@@ -841,6 +927,18 @@ class DistributedValidator(DistributedWorker):
                         ),
                     )
 
+            if gen_errors:
+                exc = gen_errors[0]
+                logging.error(
+                    "DistributedValidator._generate_streaming(job_id=%s) -> "
+                    "background generate() failed with %s: %s",
+                    job_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                raise exc
+
             # Finalize output
             reasoning_text = None
             cleaned_text = full_text
@@ -865,6 +963,15 @@ class DistributedValidator(DistributedWorker):
             )
 
         except Exception as e:
+            # distributed_model.generate() itself also runs inside a background
+            # Thread further up (for the streaming case) whose exceptions
+            # are NOT propagated here. If streaming just silently produces
+            # no tokens, check for that separately; this handler only covers
+            # errors raised directly in this method's own body.
+            logging.exception(
+                f"DistributedValidator._generate_streaming(job_id={job_id}) -> "
+                f"{type(e).__name__}: {e}"
+            )
             error_chunk = ResponseFormatter.format_stream_error(
                 error_message=str(e),
                 error_type="generation_error",
@@ -974,18 +1081,24 @@ class DistributedValidator(DistributedWorker):
             return True
 
         except Exception as e:
-            logging.error(f"Error initializing hosted job for {model_name}: {str(e)}")
-            job_id = job_data.get("id")
-            self.models_initializing.discard(job_id)
-            self._release_host_memory(job_id)
-            del self.models[job_id]
-            if job_id in self.model_state:
-                del self.model_state[job_id]
+            job_id = job_data.get("id") if job_data else None
+
+            logging.exception(
+                f"Error initializing hosted job for {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
+
+            if job_id is not None:
+                self.models_initializing.discard(job_id)
+                self._release_host_memory(job_id)
+                self.models.pop(job_id, None)
+                self.model_state.pop(job_id, None)
 
             return False
 
     def _finalize_hosted_job(self, job_id: str):
         """Finalize a hosted job by setting up the distributed model with workers."""
+        model_name = job_id  # fallback value in case of failure
         try:
             # Check if we have module info ready
             args = self.send_request("check_module", job_id)
@@ -1051,7 +1164,10 @@ class DistributedValidator(DistributedWorker):
             return True
 
         except Exception as e:
-            logging.error(f"Error finalizing hosted job for {model_name}: {str(e)}")
+            logging.error(
+                f"Error finalizing hosted job for {model_name} "
+                f"(job_id={job_id}: {type(e).__name__}: {e}"
+            )
             self.models_initializing.discard(job_id)
             self._release_host_memory(job_id)
             if job_id in self.models:
@@ -1060,6 +1176,7 @@ class DistributedValidator(DistributedWorker):
 
     def _remove_hosted_job(self, job_id: str):
         """Remove a hosted job and clean up all associated resources"""
+        model_name = job_id  # fallback value in case of failure
         try:
             self._release_host_memory(job_id)
 
@@ -1153,7 +1270,10 @@ class DistributedValidator(DistributedWorker):
             )
 
         except Exception as e:
-            logging.error(f"Error removing hosted job {model_name}: {str(e)}")
+            logging.exception(
+                f"Error removing hosted job {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
             self.send_request(
                 "debug_print",
                 (

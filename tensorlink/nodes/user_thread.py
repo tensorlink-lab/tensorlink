@@ -372,7 +372,7 @@ class UserThread(Torchnode):
     def _send_job_req(self, validator: Connection, job_info):
         """Send a request to a validator to oversee our job"""
         if validator.node_id not in job_info["seed_validators"]:
-            raise "Validator not a seed validator"
+            raise ValueError("Validator not a seed validator")
 
         message = b"JOB-REQ" + json.dumps(job_info).encode()
         self._store_request(validator.node_id, job_info["id"])

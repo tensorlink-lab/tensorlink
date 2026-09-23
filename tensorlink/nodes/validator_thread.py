@@ -78,6 +78,7 @@ class ValidatorThread(Torchnode):
 
         self.worker_memories = {}
         self.all_workers = {}
+        self.all_validators = {}
 
         # Params for smart contract state aggregation
         self.proposal_flag = threading.Event()
@@ -148,60 +149,28 @@ class ValidatorThread(Torchnode):
         """
         try:
             handled = super().handle_data(data, node)
-            ghost = 0
 
-            # Try worker-related tags if not found in parent class
             if not handled:
-                # Job acceptance from worker
-                if b"ACCEPT-JOB" == data[:10]:
-                    return self._handle_accept_job(data, node)
-
-                # Job decline from worker
-                elif b"DECLINE-JOB" == data[:11]:
-                    return self._handle_decline_job(data, node)
-
-                elif data.startswith((b"END__", b"TOKEN")):
+                if data.startswith((b"END__", b"TOKEN")):
                     return self._handle_token(data, node)
 
-                # Job creation request from user
-                elif b"JOB-REQ" == data[:7]:
-                    return self._handle_job_req(data, node)
+                # Map prefixes to handlers
+                handlers = {
+                    b"ACCEPT-JOB": self._handle_accept_job,
+                    b"DECLINE-JOB": self._handle_decline_job,
+                    b"JOB-REQ": self._handle_job_req,
+                    b"REQUEST-WORKERS": self._handle_request_workers,
+                    b"ALL-STATS": self._handle_all_stats,
+                    b"STATS-RESPONSE": self._handle_stats_response,
+                    b"JOB-UPDATE": self._handle_job_update,
+                    b"USER-GET-WORKERS": self._handle_user_get_workers,
+                }
 
-                elif b"REQUEST-WORKERS" == data[:15]:
-                    return self._handle_request_workers(data, node)
+                for prefix, handler in handlers.items():
+                    if data.startswith(prefix):
+                        return handler(data, node)
 
-                elif b"ALL-WORKER-STATS" == data[:16]:
-                    return self._handle_worker_aggregation_response(data, node)
-
-                elif b"STATS-RESPONSE" == data[:14]:
-                    return self._handle_worker_stats_response(data, node)
-
-                elif b"JOB-UPDATE" == data[:10]:
-                    self.debug_print(
-                        "User requested update to job structure", tag="Validator"
-                    )
-                    self.update_job(data[10:])
-
-                elif b"USER-GET-WORKERS" == data[:16]:
-                    self.debug_print(
-                        "User requested workers.", colour="bright_blue", tag="Validator"
-                    )
-                    self.request_worker_stats()
-                    time.sleep(0.5)
-                    stats = {}
-
-                    for worker in self.workers:
-                        stats[worker] = self.nodes[worker].stats
-
-                    stats = json.dumps(stats)
-                    self.send_to_node(node, b"WORKERS" + stats.encode())
-
-                else:
-                    return False
-
-            if ghost > 0:
-                node.ghosts += ghost
-                # TODO: potentially some form of reporting mechanism via ip and port
+                return False
 
             return True
 
@@ -213,6 +182,36 @@ class ValidatorThread(Torchnode):
                 tag="Validator",
             )
             raise e
+
+    def _handle_all_stats(self, data: bytes, node: Connection):
+        """Route an ALL-STATS message to the worker or validator handler."""
+        if data[9:14] == b"-WORK":
+            return self._handle_worker_aggregation_response(data, node)
+        return self._handle_validator_aggregation_response(data, node)
+
+    def _handle_stats_response(self, data: bytes, node: Connection):
+        """Route a STATS-RESPONSE to the worker or validator handler."""
+        if data.startswith(b"STATS-RESPONSE-V"):
+            return self._handle_request_validators(data, node)
+        return self._handle_worker_stats_response(data, node)
+
+    def _handle_job_update(self, data: bytes, node: Connection):
+        """Apply a user-requested update to the job structure."""
+        self.debug_print("User requested update to job structure", tag="Validator")
+        self.update_job(data[10:])
+        return True
+
+    def _handle_user_get_workers(self, data: bytes, node: Connection):
+        """Reply to a user request with current worker stats."""
+        self.debug_print(
+            "User requested workers.", colour="bright_blue", tag="Validator"
+        )
+        self.request_worker_stats()
+        time.sleep(0.5)
+
+        stats = {worker: self.nodes[worker].stats for worker in self.workers}
+        self.send_to_node(node, b"WORKERS" + json.dumps(stats).encode())
+        return True
 
     def _handle_token(self, data: bytes, node: Connection):
         """
@@ -298,9 +297,9 @@ class ValidatorThread(Torchnode):
     def _handle_worker_aggregation_response(self, data: bytes, node: Connection):
         if (
             node.node_id in self.requests.keys()
-            and b"ALL-WORKER-STATS" in self.requests[node.node_id]
+            and b"ALL-STATS-WORKER" in self.requests[node.node_id]
         ):
-            self.requests[node.node_id].remove(b"ALL-WORKER-STATS")
+            self.requests[node.node_id].remove(b"ALL-STATS-WORKER")
             workers = json.loads(data[16:])
             # TODO thread for aggregation and worker stats aggregation (ie average/most common values)
             for worker, stats in workers.items():
@@ -927,7 +926,7 @@ class ValidatorThread(Torchnode):
                 if stats:
                     workers[worker] = stats
 
-            self.send_to_node(node, b"ALL-WORKER-STATS" + json.dumps(workers).encode())
+            self.send_to_node(node, b"ALL-STATS-WORKER" + json.dumps(workers).encode())
 
     def distribute_job(self):
         """Distribute job to a few other non-seed validators"""
@@ -977,6 +976,56 @@ class ValidatorThread(Torchnode):
     #                     == most_common
     #                 ]
 
+    def get_validators(self):
+        """Request GPU/memory stats from all known validators. Validators
+        host and serve model components just like workers, so their
+        memory needs to be counted toward network capacity too."""
+        self.all_validators = {}
+        self.request_validator_stats()
+
+        for node_id, node in self.nodes.items():
+            if node.role == "V":
+                self.send_to_node(node, b"STATS-RESPONSE-V")
+                self._store_request(node_id, "ALL-VALIDATOR-STATS")
+
+        for validator in self.validators:
+            if hasattr(self.nodes[validator], "stats"):
+                self.all_validators[validator] = self.nodes[validator].stats
+
+    def request_validator_stats(self, send_to=None):
+        for validator_id in self.validators:
+            connection = self.nodes[validator_id]
+            self.send_to_node(connection, b"STATS-REQUEST")
+            self._store_request(connection.node_id, b"STATS")
+
+        time.sleep(1)
+
+        if send_to is not None:
+            node = self.nodes[send_to]
+            validators = {
+                v: self.nodes[v].stats for v in self.validators if self.nodes[v].stats
+            }
+            self.send_to_node(
+                node, b"ALL-STATS-VALIDATOR" + json.dumps(validators).encode()
+            )
+
+    def _handle_request_validators(self, data: bytes, node: Connection):
+        if node.role == "V":
+            threading.Thread(
+                target=self.request_validator_stats,
+                args=(node.node_id,),
+                daemon=True,
+            ).start()
+
+    def _handle_validator_aggregation_response(self, data: bytes, node: Connection):
+        if (
+            node.node_id in self.requests.keys()
+            and b"ALL-STATS-VALIDATOR" in self.requests[node.node_id]
+        ):
+            self.requests[node.node_id].remove(b"ALL-STATS-VALIDATOR")
+            for validator, stats in json.loads(data[20:]).items():
+                self.all_validators[validator] = stats
+
     def run(self):
         try:
             super().run()
@@ -997,10 +1046,11 @@ class ValidatorThread(Torchnode):
             while not self.terminate_flag.is_set():
                 if counter % 300 == 0:
                     self.keeper.write_state()
-                if counter % 120 == 0:
+                if counter % 180 == 0:
                     self.keeper.clean_node()
                     self.clean_port_mappings()
                     self.get_workers()
+                    self.get_validators()
                 if counter % 180 == 0:
                     self.print_ui_status()
 
@@ -1028,7 +1078,7 @@ class ValidatorThread(Torchnode):
         summary = self.keeper.get_network_summary()["current"]
 
         return {
-            "validators": summary["validators"] + 1,
+            "validators": summary["validators"],
             "workers": summary["workers"],
             "users": summary["users"],
             "jobs": summary["jobs"],
