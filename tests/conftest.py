@@ -92,7 +92,7 @@ def uwv_nodes(print_level):
     user.cleanup()
     worker.cleanup()
     validator.cleanup()
-    time.sleep(3)
+    time.sleep(30)
 
 
 @pytest.fixture(scope="module")
@@ -150,7 +150,7 @@ def wwv_nodes(print_level):
     worker.cleanup()
     worker2.cleanup()
     validator.cleanup()
-    time.sleep(3)
+    time.sleep(30)
 
 
 @pytest.fixture(scope="module")
