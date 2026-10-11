@@ -1,3 +1,5 @@
+import traceback
+
 from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, OffloadedModule
@@ -785,7 +787,7 @@ class DistributedValidator(DistributedWorker):
             )
 
         except Exception as e:
-            error_msg = f"Generation failed: {str(e)}"
+            error_msg = "Generation failed: %s\n%s", e, traceback.format_exc()
             request.output = error_msg
             request.formatted_response = ResponseFormatter.format_error_response(
                 error_message=error_msg,
