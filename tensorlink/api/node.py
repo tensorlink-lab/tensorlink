@@ -1,123 +1,22 @@
 from tensorlink.ml.utils.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
-    GenerationRequest,
+    ChatCompletionRequest,
+    AnyResponseRequest,
     ModelStatusResponse,
     ModelStatusDistributionResponse,
     ModelDistributionEntry,
-    ChatCompletionRequest,
-    AnyResponseRequest,
-    TextResponseRequest,
-    ImageResponseRequest,
-    EmbeddingResponseRequest,
 )
-from tensorlink.ml.utils.formatter import ResponseFormatter
-from fastapi.responses import StreamingResponse
+from tensorlink.api.functions import build_hf_job_data, build_generation_request
+from tensorlink.api.generation import GenerationMixin
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
-from collections import defaultdict
 from threading import Thread
 import logging
 import uvicorn
 import asyncio
-import random
-import time
 
 
-def build_hf_job_data(
-    *,
-    model_name: str,
-    author: str,
-    model_type: str = "hf",
-    payment: int = 0,
-    duration: int = 0,
-    hosted: bool = True,
-    training: bool = False,
-    seed_validators=None,
-):
-    if seed_validators is None:
-        seed_validators = [author]
-
-    return {
-        "author": author,
-        "api": True,
-        "active": True,
-        "hosted": hosted,
-        "training": training,
-        "payment": payment,
-        "time": duration,
-        "capacity": 0,
-        "n_pipelines": 1,
-        "dp_factor": 1,
-        "distribution": {"model_name": model_name},
-        "n_workers": 0,
-        "model_name": model_name,
-        "seed_validators": seed_validators,
-        "model_type": model_type,
-    }
-
-
-def _parse_chat_messages(messages):
-    """
-    Parse chat messages into system messages, history, and last user message.
-    Returns: (system_messages, history, last_user_message)
-    """
-    system_messages = []
-    conversation = []
-
-    for msg in messages:
-        if msg.role not in ("system", "user", "assistant"):
-            continue
-
-        if msg.role == "system":
-            system_messages.append(msg.content)
-        else:
-            conversation.append({"role": msg.role, "content": msg.content})
-
-    # Find last user message
-    last_user_message = None
-    last_user_idx = None
-
-    for idx in range(len(conversation) - 1, -1, -1):
-        if conversation[idx]["role"] == "user":
-            last_user_message = conversation[idx]["content"]
-            last_user_idx = idx
-            break
-
-    if last_user_message is None:
-        raise HTTPException(status_code=400, detail="No user message found")
-
-    # Build history (everything before the last user message)
-    history = conversation[:last_user_idx]
-
-    # Prepend system message to history if present
-    if system_messages:
-        combined_system = "\n".join(system_messages)
-        history.insert(0, {"role": "system", "content": combined_system})
-
-    return system_messages, history, last_user_message
-
-
-def _build_generation_request(request) -> GenerationRequest:
-    """Shared factory: ChatCompletionRequest or TextResponseRequest → GenerationRequest."""
-    if not request.messages:
-        raise HTTPException(status_code=400, detail="messages cannot be empty")
-    _, history, last_user_message = _parse_chat_messages(request.messages)
-    return GenerationRequest(
-        hf_name=request.model,
-        message=last_user_message,
-        history=history,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        max_new_tokens=request.max_tokens,
-        stream=request.stream,
-        input_format="chat",
-        output_format="openai",
-        do_sample=(request.temperature or 0) > 0,
-        is_chat_completion=True,
-    )
-
-
-class TensorlinkAPI:
+class TensorlinkAPI(GenerationMixin):
     """
     Supports API requests to request and interact with models, along with
     probing node & job information.
@@ -129,18 +28,9 @@ class TensorlinkAPI:
         self.port = port
         self.app = FastAPI()
         self.router = APIRouter()
-
-        self.model_name_to_request = {}
-        self.model_request_timestamps = defaultdict(list)
-
-        # Track models requested via API for prioritization
-        self.api_requested_models = set()
-        self.streaming_responses = {}
-        self.pending_requests: dict[int, asyncio.Future] = {}
-        self.api_loop: asyncio.AbstractEventLoop = None
-        self._cancelled_requests: set = set()
         self.server_loop = None
 
+        self._init_generation_state()
         self._define_routes()
         self._start_server()
 
@@ -156,7 +46,7 @@ class TensorlinkAPI:
         @self.router.post("/v1/chat/completions")
         async def chat_completions(request: ChatCompletionRequest):
             try:
-                return await self._dispatch_text(_build_generation_request(request))
+                return await self._dispatch_text(build_generation_request(request))
             except HTTPException:
                 raise
             except Exception as e:
@@ -206,7 +96,7 @@ class TensorlinkAPI:
                 _job_id, job_data = self._find_job_for_model(model_name)
 
                 if job_data is not None:
-                    # Job exists — derive status from distribution
+                    # Job exists, get status from distribution
                     status_info = self._derive_status_from_job(job_data)
                     return ModelStatusResponse(
                         model=model_name,
@@ -214,7 +104,7 @@ class TensorlinkAPI:
                         message=status_info["message"],
                     )
 
-                # No existing job — attempt to create one
+                # No existing job, create one
                 job_data_req = build_hf_job_data(
                     model_name=model_name,
                     author=self.smart_node.rsa_key_hash,
@@ -234,7 +124,7 @@ class TensorlinkAPI:
                         message=f"Model {model_name} request was rejected.",
                     )
 
-                # Request accepted — model is now initializing
+                # model initializing
                 return ModelStatusResponse(
                     model=model_name,
                     status="initializing",
@@ -429,13 +319,10 @@ class TensorlinkAPI:
             memory = int(module_info.get("memory", 0))
 
             if "offloaded" in module_type:
-                # Offloaded module — hosted by a remote worker
                 assigned_workers = module_info.get("assigned_workers", [])
                 worker_id = assigned_workers[-1] if assigned_workers else None
 
                 # Check the node thread's module tracker for the loaded flag.
-                # This flag is set by ValidatorThread._handle_module_loaded when
-                # the worker sends back a LOADED confirmation.
                 module_state = self.smart_node.modules.get(module_id, {})
                 loaded = bool(module_state.get("status", "inactive") == "loaded")
 
@@ -446,7 +333,7 @@ class TensorlinkAPI:
                     memory=memory,
                 )
             else:
-                # Validator-hosted module — always loaded while the job is active
+                # Validator-hosted module
                 distribution[module_id] = ModelDistributionEntry(
                     worker_id=None,
                     loaded=True,
@@ -460,8 +347,8 @@ class TensorlinkAPI:
         """
         Derive model status from the built distribution map.
 
-        active       — all offloaded modules have loaded=True
-        initializing — at least one offloaded module has loaded=False
+        active       : all offloaded modules have loaded=True
+        initializing : at least one offloaded module has loaded=False
         """
         offloaded = [
             entry for entry in distribution.values() if "offloaded" in entry.type
@@ -482,7 +369,7 @@ class TensorlinkAPI:
         else:
             return {
                 "status": "initializing",
-                "message": "Model is initializing — workers are loading their assigned modules.",
+                "message": "Model is initializing, workers are loading their assigned modules.",
             }
 
     def _derive_status_from_job(self, job_data: dict) -> dict:
@@ -533,149 +420,6 @@ class TensorlinkAPI:
 
         except Exception as e:
             logging.error(f"Error triggering model load: {e}")
-
-    async def _dispatch_text(self, gen_request: GenerationRequest):
-        start_time = time.time()
-        self._log_model_request(gen_request.hf_name)
-        gen_request.output = None
-        gen_request.id = hash(f"req_{random.random()}")
-
-        model_status = self._check_model_status(gen_request.hf_name)
-        if model_status["status"] == "not_loaded":
-            self._trigger_model_load(gen_request.hf_name)
-            raise HTTPException(
-                status_code=503,
-                detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
-            )
-        if model_status["status"] == "loading":
-            raise HTTPException(
-                status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
-            )
-
-        if gen_request.stream:
-            return StreamingResponse(
-                self._generate_stream(gen_request, str(gen_request.id), start_time),
-                media_type="text/event-stream",
-            )
-        gen_request = await self._wait_for_result(gen_request)
-        if getattr(gen_request, "formatted_response", None):
-            return gen_request.formatted_response
-        return {"text": gen_request.output}
-
-    async def _handle_text_response(self, request: TextResponseRequest):
-        return await self._dispatch_text(_build_generation_request(request))
-
-    async def _handle_image_response(self, request: ImageResponseRequest):
-        raise HTTPException(
-            status_code=501, detail="Image generation is not yet implemented."
-        )
-
-    async def _handle_embedding_response(self, request: EmbeddingResponseRequest):
-        raise HTTPException(
-            status_code=501, detail="Embeddings are not yet implemented."
-        )
-
-    def _log_model_request(self, model_name: str):
-        """Log and track model requests for prioritization"""
-        current_time = time.time()
-        self.model_request_timestamps[model_name].append(current_time)
-
-        # Keep only requests from last 5 minutes
-        cutoff = current_time - 300
-        self.model_request_timestamps[model_name] = [
-            ts for ts in self.model_request_timestamps[model_name] if ts > cutoff
-        ]
-
-        if model_name not in self.model_name_to_request:
-            self.model_name_to_request[model_name] = 1
-        self.model_name_to_request[model_name] += 1
-
-    async def _generate_stream(self, request, request_id, start_time):
-        """Generator function for streaming tokens"""
-        loop = asyncio.get_running_loop()
-        self.api_loop = loop
-
-        token_queue = asyncio.Queue()
-        self.streaming_responses[request.id] = token_queue
-
-        request.stream = True
-        request.start_time = start_time
-        self.smart_node.endpoint_requests["incoming"].append(request)
-
-        try:
-            while True:
-                try:
-                    token_data = await asyncio.wait_for(token_queue.get(), timeout=30.0)
-
-                    if token_data.get("done"):
-                        sse_chunk = token_data.get("token", "data: [DONE]\n\n")
-                        yield sse_chunk
-                        break
-
-                    sse_chunk = token_data.get("token")
-                    if sse_chunk:
-                        yield sse_chunk
-
-                except asyncio.TimeoutError:
-                    yield ResponseFormatter.format_stream_error(
-                        error_message="Generation timed out", error_type="timeout_error"
-                    )
-                    break
-
-        except asyncio.CancelledError:
-            # Client disconnected
-            request.cancelled = True
-            raise
-
-        except Exception as e:
-            yield ResponseFormatter.format_stream_error(
-                error_message=str(e), error_type="internal_error"
-            )
-
-        finally:
-            self.streaming_responses.pop(request.id, None)
-
-    def send_token_to_stream(self, request_id, token=None, done=False, **kwargs):
-        """Push pre-formatted streaming chunks to the SSE queue"""
-        # Drop tokens for cancelled/disconnected requests
-        if getattr(self, '_cancelled_requests', set()).__contains__(request_id):
-            return
-
-        if not self.server_loop:
-            return
-
-        queue = self.streaming_responses.get(request_id)
-        if not queue:
-            return
-
-        data = {"token": token, "done": done, **kwargs}
-        asyncio.run_coroutine_threadsafe(queue.put(data), self.server_loop)
-
-    def resolve_pending_request(self, response):
-        """Resolve a non-streaming Future from the ML thread"""
-        if not self.api_loop:
-            return
-
-        fut = self.pending_requests.get(response.id)
-        if fut and not fut.done():
-            self.api_loop.call_soon_threadsafe(fut.set_result, response)
-
-    async def _wait_for_result(self, request: GenerationRequest, timeout: int = 300):
-        """Wait for the generation result using a Future instead of polling outgoing list"""
-        loop = asyncio.get_running_loop()
-        self.api_loop = loop
-
-        fut = loop.create_future()
-        self.pending_requests[request.id] = fut
-        self.smart_node.endpoint_requests["incoming"].append(request)
-
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            request.cancelled = True
-            raise HTTPException(status_code=504, detail="Request timed out")
-        finally:
-            self.pending_requests.pop(request.id, None)
 
     def _start_server(self):
         """Start the FastAPI server in a separate thread"""
