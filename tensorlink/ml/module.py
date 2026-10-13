@@ -1003,16 +1003,6 @@ class DistributedModel(nn.Module):
         Resolve a tied module by pointing its weight parameter directly
         at the already-loaded source module's weight.
         """
-
-        def _dbg(tag, m):
-            w = getattr(m, "weight", None)
-            print(
-                f"[{tag}] pid={os.getpid()} thread={threading.current_thread().name} "
-                f"register_parameter={nn.Module.register_parameter.__name__} "
-                f"weight={w.device if w is not None else None}",
-                flush=True,
-            )
-
         module_path = module_info.get("module_path")
         tied_to_path = module_info.get("tied_to")
 
@@ -1026,7 +1016,6 @@ class DistributedModel(nn.Module):
 
         # Resolve the source (anchor) module
         source_module = get_nested_module(self.model, tied_to_path)
-        _dbg("tie-before", source_module)
         if source_module is None:
             raise RuntimeError(
                 f"Cannot resolve tied_to path '{tied_to_path}', "
@@ -1044,16 +1033,23 @@ class DistributedModel(nn.Module):
                 f"Source module at '{tied_to_path}' has no 'weight' attribute to tie."
             )
 
-        # Move source weight to correct device first if needed
-        source_weight = source_module.weight.to(device=self.device, dtype=self.dtype)
-        source_module.weight = nn.Parameter(
-            source_weight, requires_grad=source_module.weight.requires_grad
+        # Fail if the source was already corrupted before the tie.
+        if source_module.weight.device.type == "meta":
+            raise RuntimeError(
+                f"{tied_to_path}.weight is on meta before tying; "
+                f"it was not materialized by the host load."
+            )
+
+        # Move/cast the existing parameter in place
+        source_module.weight.data = source_module.weight.data.to(
+            device=self.device, dtype=self.dtype
         )
 
-        # Tie: assign the same Parameter object
-        target_module.weight = source_module.weight
+        # Tie: assign the same Parameter object, bypassing register_parameter.
+        target_module._parameters["weight"] = source_module.weight
 
-        _dbg("tie-after", source_module)
+        if source_module.weight.device.type == "meta":
+            raise RuntimeError(f"{tied_to_path}.weight is on meta after tying")
 
         logging.info(
             f"Successfully tied {module_path}.weight -> {tied_to_path}.weight "
