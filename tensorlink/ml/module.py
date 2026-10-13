@@ -741,12 +741,6 @@ class DistributedModel(nn.Module):
         if host_modules:
             self._load_host_modules(host_modules)
 
-        if hasattr(self.model.model, "embed_tokens"):
-            w = self.model.model.embed_tokens.weight
-            print(
-                f"embed weight device: {w.device} (lm_head tied: {self.model.lm_head.weight is w})"
-            )
-
         assert isinstance(self.model, nn.Module), "Model Distribution Failed!"
 
         self._patch_skeleton_device(self.device)
@@ -780,12 +774,6 @@ class DistributedModel(nn.Module):
 
     def generate(self, *args, **kwargs):
         # Attach all input tensors to the model's device
-        if hasattr(self.model.model, "embed_tokens"):
-            w = self.model.model.embed_tokens.weight
-            print(
-                f"embed weight device: {w.device} (lm_head tied: {self.model.lm_head.weight is w})"
-            )
-
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
@@ -1015,6 +1003,16 @@ class DistributedModel(nn.Module):
         Resolve a tied module by pointing its weight parameter directly
         at the already-loaded source module's weight.
         """
+
+        def _dbg(tag, m):
+            w = getattr(m, "weight", None)
+            print(
+                f"[{tag}] pid={os.getpid()} thread={threading.current_thread().name} "
+                f"register_parameter={nn.Module.register_parameter.__name__} "
+                f"weight={w.device if w is not None else None}",
+                flush=True,
+            )
+
         module_path = module_info.get("module_path")
         tied_to_path = module_info.get("tied_to")
 
@@ -1028,6 +1026,7 @@ class DistributedModel(nn.Module):
 
         # Resolve the source (anchor) module
         source_module = get_nested_module(self.model, tied_to_path)
+        _dbg("tie-before", source_module)
         if source_module is None:
             raise RuntimeError(
                 f"Cannot resolve tied_to path '{tied_to_path}', "
@@ -1053,6 +1052,8 @@ class DistributedModel(nn.Module):
 
         # Tie: assign the same Parameter object
         target_module.weight = source_module.weight
+
+        _dbg("tie-after", source_module)
 
         logging.info(
             f"Successfully tied {module_path}.weight -> {tied_to_path}.weight "
