@@ -741,6 +741,12 @@ class DistributedModel(nn.Module):
         if host_modules:
             self._load_host_modules(host_modules)
 
+        if hasattr(self.model.model, "embed_tokens"):
+            w = self.model.model.embed_tokens.weight
+            print(
+                f"embed weight device: {w.device} (lm_head tied: {self.model.lm_head.weight is w})"
+            )
+
         assert isinstance(self.model, nn.Module), "Model Distribution Failed!"
 
         self._patch_skeleton_device(self.device)
@@ -774,6 +780,12 @@ class DistributedModel(nn.Module):
 
     def generate(self, *args, **kwargs):
         # Attach all input tensors to the model's device
+        if hasattr(self.model.model, "embed_tokens"):
+            w = self.model.model.embed_tokens.weight
+            print(
+                f"embed weight device: {w.device} (lm_head tied: {self.model.lm_head.weight is w})"
+            )
+
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
