@@ -14,10 +14,6 @@ class JobRequest(BaseModel):
     payment: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Internal generation request, used by the ML pipeline only.
-# Not exposed directly as an API request body.
-# ---------------------------------------------------------------------------
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -56,9 +52,6 @@ class GenerationRequest(BaseModel):
     is_chat_completion: bool = False
 
 
-# ---------------------------------------------------------------------------
-# v1/chat/completions, OpenAI-compatible chat completion request
-# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
     content: str

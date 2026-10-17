@@ -94,7 +94,7 @@ def estimate_memory(
     training: bool = True,
     batch_size: int = 256,
     seq_length: int = 2048,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = None,
     optimizer_type: str = "adam",
     include_kv_cache: bool = True,
     recursive: bool = True,
