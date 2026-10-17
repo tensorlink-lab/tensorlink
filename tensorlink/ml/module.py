@@ -25,6 +25,7 @@ from tensorlink.ml.utils.loading import (
     ModelCacheManager,
     load_module_weights,
     get_nested_module,
+    load_full_model,
     # find_meta_tensors,
 )
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
@@ -984,6 +985,15 @@ class DistributedModel(nn.Module):
 
         host_module = get_nested_module(self.model, module_path)
         model_path = self.cache_manager.load_model_path(self.model_name)
+
+        if not module_path or module_path == "model":
+            model_name = module_info.get("name")
+            model_type = module_info.get('model_type', 'chat')
+            dtype = resolve_dtype(model_name, self.device)
+            self.model = load_full_model(
+                model_name, model_type, self.device, torch_dtype=dtype
+            )
+            return
 
         load_module_weights(
             model_path=model_path,
