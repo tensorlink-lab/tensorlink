@@ -69,6 +69,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     max_tokens: Optional[int] = 1024
+    reasoning: Optional[bool] = False
 
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -101,6 +102,7 @@ class TextResponseRequest(_BaseResponseRequest):
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = 1024
     stop: Optional[Union[str, List[str]]] = None
+    reasoning: Optional[bool] = False
 
 
 class ImageResponseRequest(_BaseResponseRequest):

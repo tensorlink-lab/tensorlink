@@ -6,9 +6,15 @@ from tensorlink.ml.module import DistributedModel, OffloadedModule
 from tensorlink.ml.utils.formatter import (
     ResponseFormatter,
     normalize_generate_args,
-    format_chat_prompt,
-    extract_reasoning_and_answer,
-    post_process_output_ids,
+)
+from tensorlink.ml.utils.reasoning import (
+    ThinkStreamSplitter,
+    build_chat_prompt,
+    get_decode_policy,
+    get_reasoning_control,
+    infer_finish_reason,
+    split_reasoning,
+    think_tags_visible,
 )
 from tensorlink.ml.utils.utils import (
     load_models_cache,
@@ -76,52 +82,30 @@ class RemoteStreamer:
             return token
 
 
-def _supports_reasoning(tokenizer):
-    """
-    Check if a tokenizer supports reasoning mode (enable_thinking parameter).
+class _CountingStreamer(TextIteratorStreamer):
+    """TextIteratorStreamer that also counts generated tokens (not the prompt)
+    and remembers the last one, so finish_reason/usage are exact when streaming."""
 
-    Args:
-        tokenizer: HuggingFace tokenizer instance
+    def __init__(self, *args, stats: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stats = stats
 
-    Returns:
-        bool: True if tokenizer supports enable_thinking parameter
-    """
-    if not hasattr(tokenizer, 'apply_chat_template'):
-        return False
-
-    try:
-        # Get the signature of apply_chat_template
-        sig = inspect.signature(tokenizer.apply_chat_template)
-
-        # Check if 'enable_thinking' is a parameter
-        return 'enable_thinking' in sig.parameters
-
-    except Exception:
-        return False
+    def put(self, value):
+        if not self.next_tokens_are_prompt:  # skip_prompt: first put() is the prompt
+            flat = torch.as_tensor(value).reshape(-1)
+            if flat.numel():
+                self._stats["n"] += int(flat.numel())
+                self._stats["last"] = int(flat[-1])
+        super().put(value)
 
 
-def _post_process_output(request, tokenizer, formatted_prompt, text):
-    # Remove prompt echo
-    if text.startswith(formatted_prompt):
-        text = text[len(formatted_prompt) :].strip()
-    else:
-        text = text.strip()
-
-    reasoning_text = None
-
-    # Only extract reasoning if chat format AND reasoning is supported/enabled
-    if request.input_format == "chat":
-        reasoning_supported = getattr(request, '_reasoning_supported', False)
-
-        # Extract reasoning blocks if the model/tokenizer supports it
-        if reasoning_supported:
-            reasoning_text, text = extract_reasoning_and_answer(text)
-
-            # Only include reasoning in response if explicitly requested
-            if not request.reasoning:
-                reasoning_text = None
-
-    return reasoning_text, text
+def _finish_reason(num_new_tokens, args, tokenizer, last_token=None) -> str:
+    return infer_finish_reason(
+        num_new_tokens,
+        args.get("max_new_tokens"),
+        last_token,
+        (args.get("eos_token_id"), getattr(tokenizer, "eos_token_id", None)),
+    )
 
 
 class DistributedValidator(DistributedWorker):
@@ -646,29 +630,6 @@ class DistributedValidator(DistributedWorker):
         distributed_model = self.models[job_id]
         tokenizer = self.tokenizers[request.hf_name]
 
-        # Format Prompt
-        if request.input_format == "chat":
-            formatted_prompt, reasoning_supported = format_chat_prompt(
-                request.message,
-                request.history,
-                enable_thinking=request.reasoning,
-                tokenizer=tokenizer,
-            )
-
-            # Track whether reasoning is actually supported
-            request._reasoning_supported = reasoning_supported
-
-            # Log if reasoning was requested but not supported
-            if request.reasoning and not reasoning_supported:
-                print(
-                    f"Note: Reasoning requested for {request.hf_name} but tokenizer "
-                    f"doesn't support enable_thinking. Using manual prompt formatting."
-                )
-        else:
-            formatted_prompt = request.message
-            request._reasoning_supported = False
-
-        # Tokenize
         model_max_length = getattr(tokenizer, "model_max_length", 2048)
         if model_max_length > 100000:
             model_max_length = 2048
@@ -676,12 +637,52 @@ class DistributedValidator(DistributedWorker):
         max_length = getattr(request, "max_length", 512) or 512
         max_length = min(max_length, model_max_length - 10)
 
-        inputs = tokenizer(
-            formatted_prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-        )
+        starts_in_reasoning = False
+        reasoning_supported = False
+
+        if request.input_format == "chat":
+            messages = list(request.history or [])
+            messages.append({"role": "user", "content": request.message})
+
+            # Probes the template (cached), toggles thinking if possible, falls
+            # back to ChatML if the template is missing/broken, and trims the
+            # *oldest* turns to fit instead of cutting the generation prompt.
+            build = build_chat_prompt(
+                tokenizer,
+                messages,
+                reasoning=bool(request.reasoning),
+                max_tokens=max_length,
+            )
+            formatted_prompt = build.prompt
+            starts_in_reasoning = build.starts_in_reasoning
+            reasoning_supported = build.control.supported
+
+            if request.reasoning and not reasoning_supported:
+                logging.info(
+                    f"Reasoning requested for {request.hf_name} but its chat "
+                    f"template has no thinking mode; returning answer only."
+                )
+
+            # The template already contains BOS etc., and we must not truncate
+            # the tail (that is where the generation prompt lives).
+            inputs = tokenizer(
+                formatted_prompt, return_tensors="pt", add_special_tokens=False
+            )
+            if inputs.input_ids.shape[1] > max_length:
+                raise ValueError(
+                    f"Prompt is too long ({inputs.input_ids.shape[1]} tokens, "
+                    f"limit {max_length})."
+                )
+        else:
+            formatted_prompt = request.message
+            inputs = tokenizer(
+                formatted_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )
+
+        request._reasoning_supported = reasoning_supported
 
         input_ids = inputs.input_ids.to(self.device)
         prompt_tokens = input_ids.shape[1]
@@ -700,7 +701,9 @@ class DistributedValidator(DistributedWorker):
             "formatted_prompt": formatted_prompt,
             "input_ids": input_ids,
             "prompt_tokens": prompt_tokens,
-            "reasoning_supported": getattr(request, '_reasoning_supported', False),
+            "reasoning_supported": reasoning_supported,
+            "starts_in_reasoning": starts_in_reasoning,
+            "decode": get_decode_policy(tokenizer, chat=request.input_format == "chat"),
             "args": args,
         }
 
@@ -768,18 +771,43 @@ class DistributedValidator(DistributedWorker):
                 outputs = distributed_model.generate(input_ids, **args)
 
             new_token_ids = outputs[0][prompt_tokens:].tolist()
-            reasoning_text, text = post_process_output_ids(
-                new_token_ids, tokenizer, enable_thinking=ctx["reasoning_supported"]
+            decode = ctx["decode"]
+            raw_text = decode.clean(
+                tokenizer.decode(
+                    new_token_ids, skip_special_tokens=decode.skip_special_tokens
+                )
+            )
+            finish_reason = _finish_reason(
+                len(new_token_ids),
+                args,
+                tokenizer,
+                new_token_ids[-1] if new_token_ids else None,
             )
 
+            reasoning_text, reasoning_tokens = None, 0
+            if request.input_format == "chat":
+                reasoning_text, text = split_reasoning(
+                    raw_text, start_in_reasoning=ctx["starts_in_reasoning"]
+                )
+                if reasoning_text and request.reasoning:
+                    reasoning_tokens = len(
+                        tokenizer.encode(reasoning_text, add_special_tokens=False)
+                    )
+                else:
+                    reasoning_text = None  # stripped from content either way
+            else:
+                text = raw_text.strip()
+
             request.output = text
-            completion_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+            completion_tokens = len(new_token_ids)
 
             request.formatted_response = (
                 ResponseFormatter.format_non_streaming_response(
                     request=request,
                     output_text=text,
                     reasoning_text=reasoning_text,
+                    reasoning_tokens=reasoning_tokens,
+                    finish_reason=finish_reason,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     start_time=request.start_time,
@@ -832,6 +860,7 @@ class DistributedValidator(DistributedWorker):
             }
 
             gen_errors: list = []
+            gen_stats = {"n": 0, "last": None}  # exact generated-token count
 
             def _run_generate(**gen_kwargs):
                 try:
@@ -845,7 +874,9 @@ class DistributedValidator(DistributedWorker):
 
                 module_id = distributed_model.model.module_id
                 streamer = RemoteStreamer(
-                    poll_fn=lambda: self._poll_remote_token(module_id, tokenizer)
+                    poll_fn=lambda: self._poll_remote_token(
+                        module_id, tokenizer, ctx["decode"], gen_stats
+                    )
                 )
 
                 generation_thread = Thread(
@@ -856,8 +887,11 @@ class DistributedValidator(DistributedWorker):
                 generation_thread.start()
 
             else:
-                streamer = TextIteratorStreamer(
-                    tokenizer, skip_prompt=True, skip_special_tokens=True
+                streamer = _CountingStreamer(
+                    tokenizer,
+                    skip_prompt=True,
+                    skip_special_tokens=ctx["decode"].skip_special_tokens,
+                    stats=gen_stats,
                 )
 
                 generation_kwargs["streamer"] = streamer
@@ -869,53 +903,54 @@ class DistributedValidator(DistributedWorker):
                 )
                 generation_thread.start()
 
-            # Stream tokens
-            full_text = ""
-            token_count = 0
-            in_reasoning_block = False
-            reasoning_buffer = ""
+            # Stream tokens. The splitter handles tags split across tokens,
+            # answer text arriving in the same token as </think>, and prompts
+            # that already opened <think>. Chat requests only.
+            use_splitter = request.input_format == "chat"
+            want_reasoning = bool(request.reasoning)
+            splitter = ThinkStreamSplitter(ctx["starts_in_reasoning"])
+            content_parts: list = []
+            reasoning_parts: list = []
+            chunk_index = 0
 
-            # Try and identify think sections via regex
-            start_re = re.compile(
-                r"<\s*(think|reflection|thought|internal|analysis)\s*>",
-                re.IGNORECASE,
-            )
-            end_re = re.compile(
-                r"<\s*/\s*(think|reflection|thought|internal|analysis)\s*>",
-                re.IGNORECASE,
-            )
-
-            for token_text in streamer:
-                full_text += token_text
-
-                if request.input_format == "chat" and not request.reasoning:
-
-                    if not in_reasoning_block:
-                        if start_re.search(token_text):
-                            in_reasoning_block = True
-                            reasoning_buffer = token_text
-                            continue
+            def _emit(segments):
+                nonlocal chunk_index
+                for kind, text in segments:
+                    if kind == "reasoning":
+                        reasoning_parts.append(text)
+                        if not want_reasoning:
+                            continue  # thinking is dropped unless requested
                     else:
-                        reasoning_buffer += token_text
-                        if end_re.search(reasoning_buffer):
-                            in_reasoning_block = False
-                            reasoning_buffer = ""
-                        continue
-
-                if not in_reasoning_block:
-                    token_count += 1
-
-                    formatted_chunk = ResponseFormatter.format_stream_chunk(
-                        request=request,
-                        token_text=token_text,
-                        index=token_count,
-                        start_time=start_time,
-                    )
-
+                        content_parts.append(text)
+                    chunk_index += 1
                     self.send_request(
                         "update_stream",
-                        (request.id, {"chunk": formatted_chunk, "done": False}),
+                        (
+                            request.id,
+                            {
+                                "chunk": ResponseFormatter.format_stream_chunk(
+                                    request=request,
+                                    token_text=text,
+                                    index=chunk_index,
+                                    start_time=start_time,
+                                    kind=kind,
+                                ),
+                                "done": False,
+                            },
+                        ),
                     )
+
+            for token_text in streamer:
+                token_text = ctx["decode"].clean(token_text)
+                if not token_text:
+                    continue
+                _emit(
+                    splitter.feed(token_text)
+                    if use_splitter
+                    else [("content", token_text)]
+                )
+            if use_splitter:
+                _emit(splitter.flush())
 
             if generation_thread.is_alive():
                 generation_thread.join(timeout=1)
@@ -942,21 +977,32 @@ class DistributedValidator(DistributedWorker):
                 raise exc
 
             # Finalize output
-            reasoning_text = None
-            cleaned_text = full_text
-            if request.input_format == "chat":
-                reasoning_text, cleaned_text = extract_reasoning_and_answer(full_text)
-                if not request.reasoning:
-                    reasoning_text = None
+            cleaned_text = "".join(content_parts).strip()
+            reasoning_text = "".join(reasoning_parts).strip()
+            reasoning_tokens = (
+                len(tokenizer.encode(reasoning_text, add_special_tokens=False))
+                if reasoning_text and want_reasoning
+                else 0
+            )
+            completion_tokens = gen_stats["n"] or len(
+                tokenizer.encode(
+                    "".join(content_parts) + "".join(reasoning_parts),
+                    add_special_tokens=False,
+                )
+            )
 
             request.output = cleaned_text
             final_chunk = ResponseFormatter.format_stream_final(
                 request=request,
                 start_time=start_time,
                 prompt_tokens=prompt_tokens,
-                completion_tokens=token_count,
+                completion_tokens=completion_tokens,
                 full_text=cleaned_text,
-                reasoning_text=reasoning_text,
+                reasoning_text=reasoning_text if want_reasoning else None,
+                reasoning_tokens=reasoning_tokens,
+                finish_reason=_finish_reason(
+                    completion_tokens, args, tokenizer, gen_stats["last"]
+                ),
             )
 
             self.send_request(
@@ -986,7 +1032,7 @@ class DistributedValidator(DistributedWorker):
 
             request.output = f"Error during generation: {str(e)}"
 
-    def _poll_remote_token(self, module_id: str, tokenizer):
+    def _poll_remote_token(self, module_id: str, tokenizer, decode=None, stats=None):
         item = self.send_request("check_token", (module_id,))
 
         if item is None:
@@ -997,15 +1043,18 @@ class DistributedValidator(DistributedWorker):
 
         if item["type"] == "token":
             token_id = item["token"]
+            if stats is not None:
+                stats["n"] += 1
+                stats["last"] = token_id
 
             # Decode exactly one token
             text = tokenizer.decode(
                 [token_id],
-                skip_special_tokens=True,
+                skip_special_tokens=decode.skip_special_tokens if decode else True,
                 clean_up_tokenization_spaces=False,
             )
 
-            return text
+            return decode.clean(text) if decode else text
 
         return None
 
@@ -1145,7 +1194,15 @@ class DistributedValidator(DistributedWorker):
             # Load tokenizer
             if model_name not in self.tokenizers:
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
-                setattr(tokenizer, "supports_reasoning", _supports_reasoning(tokenizer))
+                ctl = get_reasoning_control(
+                    tokenizer
+                )  # probes + caches on the tokenizer
+                setattr(tokenizer, "supports_reasoning", ctl.supported)
+                if ctl.supported and not think_tags_visible(tokenizer):
+                    logging.info(
+                        f"{model_name}: think tags are special tokens; using raw "
+                        f"decode with manual special-token stripping."
+                    )
                 self.tokenizers[model_name] = tokenizer
 
             setattr(distributed_model, 'tokenizer', self.tokenizers[model_name])

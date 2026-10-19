@@ -3,6 +3,8 @@ import json
 import time
 import re
 
+from tensorlink.ml.utils.reasoning import REASONING_FIELD
+
 
 def normalize_generate_args(
     request,
@@ -16,7 +18,7 @@ def normalize_generate_args(
     Only user-provided, non-None values are included.
     """
 
-    #  Token IDs
+    # Token IDs
     pad_token_id = tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id
     vocab_size = len(tokenizer)
@@ -291,6 +293,8 @@ class ResponseFormatter:
         completion_tokens: int,
         start_time: float,
         reasoning_text: Optional[str] = None,
+        reasoning_tokens: int = 0,
+        finish_reason: str = "stop",
     ) -> Dict[str, Any]:
         """Format a complete non-streaming response."""
         processing_time = time.time() - start_time
@@ -298,7 +302,17 @@ class ResponseFormatter:
         if request.output_format == "openai":
             message = {"role": "assistant", "content": output_text}
             if reasoning_text:
-                message["reasoning"] = reasoning_text
+                message[REASONING_FIELD] = reasoning_text
+
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+            if reasoning_text:
+                usage["completion_tokens_details"] = {
+                    "reasoning_tokens": reasoning_tokens
+                }
 
             return {
                 "id": str(request.id),
@@ -309,28 +323,34 @@ class ResponseFormatter:
                     {
                         "index": 0,
                         "message": message,
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }
                 ],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                },
+                "usage": usage,
                 "processing_time": processing_time,
             }
 
         # "raw" - minimal plain-text response
         response: Dict[str, Any] = {"text": output_text}
+        if finish_reason != "stop":
+            response["finish_reason"] = finish_reason
         if reasoning_text:
-            response["reasoning"] = reasoning_text
+            response[REASONING_FIELD] = reasoning_text
         return response
 
     @staticmethod
     def format_stream_chunk(
-        request, token_text: str, index: int, start_time: float
+        request,
+        token_text: str,
+        index: int,
+        start_time: float,
+        kind: str = "content",
     ) -> str:
-        """Format a single streaming token chunk as an SSE event string."""
+        """Format a single streaming chunk as an SSE event string.
+
+        kind: "content" or "reasoning". Each chunk carries exactly one of
+        delta.content / delta.<REASONING_FIELD>, never both.
+        """
         token_text = str(token_text)
 
         if request.output_format == "openai":
@@ -342,7 +362,11 @@ class ResponseFormatter:
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": token_text},
+                        "delta": {
+                            (
+                                REASONING_FIELD if kind == "reasoning" else "content"
+                            ): token_text
+                        },
                         "finish_reason": None,
                     }
                 ],
@@ -352,6 +376,7 @@ class ResponseFormatter:
             chunk_data = {
                 "id": str(request.id),
                 "token": token_text,
+                "kind": kind,
                 "index": index,
                 "done": False,
             }
@@ -366,6 +391,8 @@ class ResponseFormatter:
         completion_tokens: int,
         full_text: Optional[str] = None,
         reasoning_text: Optional[str] = None,
+        reasoning_tokens: int = 0,
+        finish_reason: str = "stop",
     ) -> str:
         """Format the final streaming chunk with usage statistics."""
         if request.output_format == "openai":
@@ -374,21 +401,25 @@ class ResponseFormatter:
                 "object": "chat.completion.chunk",
                 "created": int(start_time),
                 "model": request.hf_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
             }
-            if reasoning_text:
-                final_data["reasoning"] = reasoning_text
+            # Reasoning was already streamed as deltas; only report its cost.
+            if reasoning_tokens:
+                final_data["usage"]["completion_tokens_details"] = {
+                    "reasoning_tokens": reasoning_tokens
+                }
 
         else:
             # "raw" final chunk
             final_data = {
                 "id": str(request.id),
                 "done": True,
+                "finish_reason": finish_reason,
                 "usage": {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
@@ -398,7 +429,7 @@ class ResponseFormatter:
             if full_text is not None:
                 final_data["text"] = full_text
             if reasoning_text:
-                final_data["reasoning"] = reasoning_text
+                final_data[REASONING_FIELD] = reasoning_text
 
         return f"data: {json.dumps(final_data)}\n\ndata: [DONE]\n\n"
 

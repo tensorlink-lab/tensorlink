@@ -44,6 +44,7 @@ class GenerationMixin:
                 status_code=503,
                 detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
             )
+
         if model_status["status"] == "loading":
             raise HTTPException(
                 status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
