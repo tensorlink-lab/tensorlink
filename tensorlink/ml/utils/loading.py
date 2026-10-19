@@ -633,24 +633,30 @@ def load_full_model(
 def load_model_skeleton(
     model_name: str, model_type: str = "chat", torch_dtype: Optional[torch.dtype] = None
 ):
-    model_config = AutoConfig.from_pretrained(model_name)
+    cfg = AutoConfig.from_pretrained(model_name)
+    if torch_dtype is None:
+        d = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+        if isinstance(d, str):
+            d = getattr(torch, d, None)
+        torch_dtype = d if isinstance(d, torch.dtype) else torch.bfloat16
+
     with init_empty_weights():
         if model_type in ("causal", "chat"):
             skeleton_model = AutoModelForCausalLM.from_config(
-                model_config, torch_dtype=torch_dtype
+                cfg, torch_dtype=torch_dtype
             )
         elif model_type == "seq2seq":
             skeleton_model = AutoModelForSeq2SeqLM.from_config(
-                model_config, torch_dtype=torch_dtype
+                cfg, torch_dtype=torch_dtype
             )
         elif model_type == "audio2text":
             skeleton_model = AutoModelForSpeechSeq2Seq.from_config(
-                model_config, torch_dtype=torch_dtype
+                cfg, torch_dtype=torch_dtype
             )
         else:
-            skeleton_model = AutoModel.from_config(
-                model_config, torch_dtype=torch_dtype
-            )
+            skeleton_model = AutoModel.from_config(cfg, torch_dtype=torch_dtype)
+
+        skeleton_model.to(torch_dtype)
 
     skeleton_model.eval()
 

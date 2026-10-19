@@ -6,7 +6,7 @@ import re
 import torch
 import torch.nn as nn
 
-from tensorlink.ml.utils.gpu_benchmark import estimate_memory
+from tensorlink.ml.utils.gpu_benchmark import estimate_memory, OVERHEAD
 from tensorlink.ml.utils.injector import find_loop_in_module_hierarchy
 from tensorlink.ml.utils.loading import load_model_skeleton
 from tensorlink.ml.utils import resolve_module_from_path  # noqa: F401
@@ -200,7 +200,14 @@ def _log_assignment_summary(config: dict, workers_state: dict):
 
 
 def _estimate_module_memory(
-    module, training, max_seq_len, optimizer_type, batch_size, depth, count_activations
+    module,
+    training,
+    max_seq_len,
+    optimizer_type,
+    batch_size,
+    depth,
+    count_activations,
+    dtype=None,
 ) -> float:
     """Estimate this module's memory footprint, dropping activation memory
     for non-root modules when the caller doesn't want it counted twice.
@@ -211,12 +218,13 @@ def _estimate_module_memory(
         seq_length=max_seq_len,
         optimizer_type=optimizer_type,
         batch_size=batch_size,
+        dtype=dtype,
         recursive=True,
         count_activations=True,
         include_kv_cache=(depth == 0),
     )
     if not count_activations:
-        memory -= breakdown.get("activations", 0)
+        memory -= breakdown.get("activations", 0) * OVERHEAD
     return memory
 
 
@@ -302,6 +310,7 @@ class ModelParser:
         """
         self.model_name = ""
         self.assigned_workers = defaultdict(list)
+        self.dtype = None
         self.assigned_memory = 0
         self.verbose = verbose
         self.module_paths = {}  # Track all module paths
@@ -323,7 +332,7 @@ class ModelParser:
         workers: dict,
         training: bool,
         trusted: bool,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = None,
         input_obfuscation: bool = False,
         optimizer_type: str = "adam",
         optimizer_spec: Optional[dict] = None,
@@ -492,6 +501,7 @@ class ModelParser:
                 )
                 self._log("", f"Loaded model skeleton for '{self.model_name}'.")
 
+            self.dtype = dtype or next(model.parameters()).dtype
             workers_state = self._build_workers_state(workers or {})
 
             self._host_max_module_bytes = host_max_module_bytes or 1e15
@@ -508,6 +518,7 @@ class ModelParser:
                 training=training,
                 seq_length=max_seq_len,
                 optimizer_type=optimizer_type,
+                dtype=self.dtype,
                 batch_size=batch_size,
                 recursive=True,
                 count_activations=True,
@@ -581,10 +592,6 @@ class ModelParser:
             "host_memory_used": self.assigned_memory,
             "error": error,
         }
-
-    # ------------------------------------------------------------------
-    # create_distributed_config helpers
-    # ------------------------------------------------------------------
 
     def _reset_run_state(self) -> None:
         """Reset the per-run bookkeeping used to track tied-weight placement."""
@@ -686,6 +693,7 @@ class ModelParser:
             batch_size,
             depth,
             count_activations,
+            self.dtype,
         )
         self._log(indent, f"  Memory required: {memory / 1e6:.2f}MB")
 

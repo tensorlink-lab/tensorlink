@@ -8,7 +8,7 @@ import json
 import os
 from typing import Optional, Tuple, Dict
 
-
+OVERHEAD = 1.20
 DEVICE_PROFILE_PATH = "logs/device_profile.json"
 PROFILE_VERSION = 1
 
@@ -94,7 +94,7 @@ def estimate_memory(
     training: bool = True,
     batch_size: int = 256,
     seq_length: int = 2048,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = None,
     optimizer_type: str = "adam",
     include_kv_cache: bool = True,
     recursive: bool = True,
@@ -102,6 +102,11 @@ def estimate_memory(
 ) -> tuple[float, dict]:
     """Estimate GPU memory required for a model."""
 
+    if dtype is None:
+        first = next(module.parameters(), None)
+        if first is None:
+            first = next(module.buffers(), None)
+        dtype = first.dtype if first is not None else torch.float32
     dtype_size = torch.tensor([], dtype=dtype).element_size()
 
     breakdown = {
@@ -173,8 +178,6 @@ def estimate_memory(
                 * dtype_size
             )
 
-    # ---- overhead ----
-    OVERHEAD = 1.20
     total = sum(breakdown.values()) * OVERHEAD
 
     return total, breakdown

@@ -25,6 +25,7 @@ from tensorlink.ml.utils.loading import (
     ModelCacheManager,
     load_module_weights,
     get_nested_module,
+    load_full_model,
     # find_meta_tensors,
 )
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
@@ -985,6 +986,15 @@ class DistributedModel(nn.Module):
         host_module = get_nested_module(self.model, module_path)
         model_path = self.cache_manager.load_model_path(self.model_name)
 
+        if not module_path or module_path == "model":
+            model_name = module_info.get("name")
+            model_type = module_info.get('model_type', 'chat')
+            dtype = resolve_dtype(model_name, self.device)
+            self.model = load_full_model(
+                model_name, model_type, self.device, torch_dtype=dtype
+            )
+            return
+
         load_module_weights(
             model_path=model_path,
             module_path=module_path,
@@ -1033,14 +1043,23 @@ class DistributedModel(nn.Module):
                 f"Source module at '{tied_to_path}' has no 'weight' attribute to tie."
             )
 
-        # Move source weight to correct device first if needed
-        source_weight = source_module.weight.to(device=self.device, dtype=self.dtype)
-        source_module.weight = nn.Parameter(
-            source_weight, requires_grad=source_module.weight.requires_grad
+        # Fail if the source was already corrupted before the tie.
+        if source_module.weight.device.type == "meta":
+            raise RuntimeError(
+                f"{tied_to_path}.weight is on meta before tying; "
+                f"it was not materialized by the host load."
+            )
+
+        # Move/cast the existing parameter in place
+        source_module.weight.data = source_module.weight.data.to(
+            device=self.device, dtype=self.dtype
         )
 
-        # Tie: assign the same Parameter object
-        target_module.weight = source_module.weight
+        # Tie: assign the same Parameter object, bypassing register_parameter.
+        target_module._parameters["weight"] = source_module.weight
+
+        if source_module.weight.device.type == "meta":
+            raise RuntimeError(f"{tied_to_path}.weight is on meta after tying")
 
         logging.info(
             f"Successfully tied {module_path}.weight -> {tied_to_path}.weight "

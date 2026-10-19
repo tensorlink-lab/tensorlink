@@ -14,10 +14,6 @@ class JobRequest(BaseModel):
     payment: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Internal generation request, used by the ML pipeline only.
-# Not exposed directly as an API request body.
-# ---------------------------------------------------------------------------
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -56,9 +52,6 @@ class GenerationRequest(BaseModel):
     is_chat_completion: bool = False
 
 
-# ---------------------------------------------------------------------------
-# v1/chat/completions, OpenAI-compatible chat completion request
-# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -76,6 +69,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     max_tokens: Optional[int] = 1024
+    reasoning: Optional[bool] = False
 
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -108,6 +102,7 @@ class TextResponseRequest(_BaseResponseRequest):
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = 1024
     stop: Optional[Union[str, List[str]]] = None
+    reasoning: Optional[bool] = False
 
 
 class ImageResponseRequest(_BaseResponseRequest):

@@ -19,9 +19,9 @@ LOCAL = True
 UPNP = False
 ENABLE_HOSTED_MODULES = True
 
-# These two values were hand-picked to illict
-MAX_MEMORY_GB = 0.35
-MAX_MODULE_GB = 0.05
+# These values were picked for default models found in `test_model_api.py`
+DEFAULT_MAX_MEMORY_GB = 0.35
+DEFAULT_MAX_MODULE_GB = 0.05
 
 
 def pytest_addoption(parser):
@@ -32,6 +32,20 @@ def pytest_addoption(parser):
         type=int,
         help="Tensorlink node print level",
     )
+    parser.addoption(
+        "--max-memory-gb",
+        action="store",
+        default=DEFAULT_MAX_MEMORY_GB,
+        type=float,
+        help=f"Per-node memory cap in GB (default {DEFAULT_MAX_MEMORY_GB})",
+    )
+    parser.addoption(
+        "--max-module-gb",
+        action="store",
+        default=DEFAULT_MAX_MODULE_GB,
+        type=float,
+        help=f"Validator max module size in GB (default {DEFAULT_MAX_MODULE_GB})",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -39,8 +53,18 @@ def print_level(pytestconfig):
     return pytestconfig.getoption("--print-level")
 
 
+@pytest.fixture(scope="session")
+def max_memory_gb(pytestconfig):
+    return pytestconfig.getoption("--max-memory-gb")
+
+
+@pytest.fixture(scope="session")
+def max_module_gb(pytestconfig):
+    return pytestconfig.getoption("--max-module-gb")
+
+
 @pytest.fixture(scope="module")
-def uwv_nodes(print_level):
+def uwv_nodes(print_level, max_memory_gb, max_module_gb):
     """
     Create User-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -51,7 +75,7 @@ def uwv_nodes(print_level):
             on_chain=ON_CHAIN,
             local_test=LOCAL,
             print_level=print_level,
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         benchmark=False,
     )
@@ -65,10 +89,10 @@ def uwv_nodes(print_level):
             endpoint=False,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         enable_hosting=ENABLE_HOSTED_MODULES,
-        max_module_gb=MAX_MODULE_GB,
+        max_module_gb=max_module_gb,
         benchmark=False,
     )
 
@@ -79,7 +103,7 @@ def uwv_nodes(print_level):
             local_test=LOCAL,
             print_level=print_level,
             load_previous_state=False,
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         benchmark=False,
     )
@@ -92,11 +116,11 @@ def uwv_nodes(print_level):
     user.cleanup()
     worker.cleanup()
     validator.cleanup()
-    time.sleep(3)
+    time.sleep(30)
 
 
 @pytest.fixture(scope="module")
-def wwv_nodes(print_level):
+def wwv_nodes(print_level, max_memory_gb, max_module_gb):
     """
     Create Worker-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -110,10 +134,10 @@ def wwv_nodes(print_level):
             endpoint=True,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         enable_hosting=ENABLE_HOSTED_MODULES,
-        max_module_gb=MAX_MODULE_GB,
+        max_module_gb=max_module_gb,
         benchmark=False,
     )
 
@@ -124,7 +148,7 @@ def wwv_nodes(print_level):
             local_test=LOCAL,
             print_level=print_level,
             load_previous_state=False,
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         benchmark=False,
     )
@@ -137,7 +161,7 @@ def wwv_nodes(print_level):
             print_level=print_level,
             load_previous_state=False,
             duplicate="1",
-            max_memory_gb=MAX_MEMORY_GB,
+            max_memory_gb=max_memory_gb,
         ),
         benchmark=False,
     )
@@ -150,7 +174,7 @@ def wwv_nodes(print_level):
     worker.cleanup()
     worker2.cleanup()
     validator.cleanup()
-    time.sleep(3)
+    time.sleep(30)
 
 
 @pytest.fixture(scope="module")
