@@ -1,7 +1,7 @@
 from transformers import (
     AutoModelForCausalLM,
 )
-from typing import Generator, List, Optional, Type, Dict, Any, Union
+from typing import Generator, List, Optional, Sequence, Type, Dict, Any, Union
 from contextlib import contextmanager
 import torch.optim as optim
 import torch.nn as nn
@@ -29,6 +29,13 @@ from tensorlink.ml.utils.loading import (
     # find_meta_tensors,
 )
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
+from tensorlink.ml.embedding import (
+    EmbeddingResult,
+    EmbeddingUnavailable,
+    finalize_vectors,
+    validate_inputs,
+)
+from tensorlink.ml.embedding_module import load_embedding_module, pack_texts
 from tensorlink.ml.utils import (
     get_batch_size,
     combine_micro_batches,
@@ -1500,3 +1507,158 @@ class OffloadedModule(nn.Module):
     def __repr__(self):
         # Custom representation to prevent recursion when printing or debugging.
         return f"OffloadedModule(name={self.module_name}, worker_id={self.worker_id})"
+
+
+class DistributedEmbedding(DistributedModel):
+    """
+    An embedding model that lives entirely on ONE machine: either the host
+    (validator / user) or a single worker. It reuses DistributedModel's job,
+    recruitment, module-loading and OffloadedModule RPC machinery unchanged; the
+    only differences are that the model is never split, never trained, and the
+    unit of work is ``encode(texts)`` instead of ``generate``/``forward``.
+
+    When the model is offloaded, ``self.model`` is an ``OffloadedModule`` with
+    ``entire_model=True`` and each ``encode`` is one forward RPC whose input is
+    the packed texts and whose output is the (N, dim) vectors. When it is
+    hosted locally, ``self.model`` is an ``EmbeddingModule`` and the same call
+    runs in-process, so callers can't tell the difference.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        node: Optional[Any] = None,
+        device: Optional[str] = None,
+        dtype: torch.dtype = None,
+        config: dict = None,
+        verbose: bool = False,
+    ):
+        if not isinstance(model, str):
+            raise TypeError("DistributedEmbedding takes a Hugging Face model name")
+
+        self.model_type = "embedding"
+        super().__init__(
+            model,
+            n_pipelines=1,
+            device=device,
+            dtype=dtype,
+            node=node,
+            training=False,
+            verbose=False,
+            tokenizer=None,
+            config=config,
+        )
+        self.name = model.split("/")[-1]
+        self._encode_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Job / distribution
+    # ------------------------------------------------------------------
+    def _initialize_distribution(self):
+        """User-node path: same request_job flow, flagged as an embedding job."""
+        distribution = {
+            "model_name": self.model_name,
+            "training": False,
+            "optimizer": None,
+            "model_type": "embedding",
+        }
+        distributed_config = self.node.send_request(
+            "request_job", (1, 1, distribution, False), timeout=200
+        )
+        if not distributed_config:
+            raise RuntimeError("Could not obtain job from network... Please try again.")
+
+        self.distribute_model(distributed_config)
+
+    def distribute_model(self, config=None, model_type: str = "embedding"):
+        """
+        Same contract as DistributedModel.distribute_model, restricted to a
+        single, unsplit module: loaded on the host, or offloaded to one worker.
+        """
+        config = (config or {}) | self.config
+        self.distributed_graph = config
+
+        if len(config) != 1:
+            raise ValueError(
+                "An embedding model must be placed entirely on the host or on a "
+                f"single worker (got {len(config)} module entries)."
+            )
+
+        module_id, module_info = next(iter(config.items()))
+        module_type = module_info.get("type", "offloaded")
+        if module_info.get("module_path") not in ("model", "", None):
+            raise ValueError("Embedding models cannot be split into submodules.")
+
+        if module_type == "loaded":
+            self.model = load_embedding_module(self.model_name, device=str(self.device))
+        elif module_type == "offloaded":
+            # Entire-model offload: sets self.model = OffloadedModule(entire_model=True)
+            self._wrap_hf_module(module_id, module_info)
+        else:
+            raise ValueError(f"Unsupported embedding placement type: {module_type}")
+
+        assert isinstance(self.model, nn.Module), "Embedding distribution failed!"
+
+        self.model.n_batch = 0
+        self.model.forward_queues = {}
+        self.model.backward_queues = {}
+        self.model.intermediates = {0: []}
+
+        if module_type == "offloaded":
+            self._wait_all_modules_loaded({module_id: module_info})
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def encode(
+        self, texts: Sequence[str], dimensions: Optional[int] = None
+    ) -> EmbeddingResult:
+        """Embed ``texts``. Raises ValueError for bad input / dimensions."""
+        texts = validate_inputs(texts)
+        if self.model is None:
+            raise EmbeddingUnavailable("embedding model is not loaded")
+
+        with self._encode_lock:
+            # The forward key is (n_batch, micro, module_id); keep it unique per call.
+            self.model.n_batch += 1
+            try:
+                with _set_micro(self._thread_local, 0):
+                    out = self.model(pack_texts(texts))
+            finally:
+                # OffloadedModule.forward stashes outputs for a backward pass
+                # that embeddings never run, so don't let them accumulate.
+                intermediates = getattr(self.model, "intermediates", None)
+                if isinstance(intermediates, dict):
+                    intermediates[0] = []
+
+        if not isinstance(out, dict) or "embeddings" not in out:
+            raise RuntimeError("embedding module returned an unexpected output")
+
+        vectors = finalize_vectors(out["embeddings"].detach().cpu().numpy(), dimensions)
+        if vectors.shape[0] != len(texts):
+            raise RuntimeError(
+                f"embedder returned {vectors.shape[0]} vectors for {len(texts)} inputs"
+            )
+
+        return EmbeddingResult(
+            buffer=vectors.tobytes(),
+            count=int(vectors.shape[0]),
+            dim=int(vectors.shape[1]),
+            prompt_tokens=int(out["prompt_tokens"].reshape(-1)[0].item()),
+        )
+
+    def forward(self, texts, dimensions: Optional[int] = None):
+        return self.encode(texts, dimensions)
+
+    def generate(self, *args, **kwargs):
+        raise NotImplementedError("Embedding models do not support generate().")
+
+    # Inference-only: nothing to train, so skip the per-module train-state RPCs.
+    def train(self, mode: bool = True):
+        if mode:
+            raise RuntimeError("DistributedEmbedding is inference-only.")
+        self.training = False
+        return self
+
+    def eval(self):
+        return self.train(False)

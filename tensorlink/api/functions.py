@@ -1,6 +1,7 @@
 """Stateless helpers for the Tensorlink API: job payloads and request translation."""
 
 from tensorlink.api.models import GenerationRequest
+from tensorlink.ml.utils.model_types import ModelType
 from fastapi import HTTPException
 
 
@@ -8,7 +9,7 @@ def build_hf_job_data(
     *,
     model_name: str,
     author: str,
-    model_type: str = "hf",
+    model_type: ModelType = ModelType.CHAT,
     payment: int = 0,
     duration: int = 0,
     hosted: bool = True,
@@ -33,7 +34,7 @@ def build_hf_job_data(
         "n_workers": 0,
         "model_name": model_name,
         "seed_validators": seed_validators,
-        "model_type": model_type,
+        "model_type": ModelType(model_type).value,
     }
 
 

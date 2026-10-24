@@ -333,7 +333,8 @@ class ValidatorThread(Torchnode):
                 "get_jobs": self._handle_get_jobs,
                 "check_job_status": self._handle_check_job,
                 "check_token": self._handle_check_token,
-                "update_job_status": self._handle_update_job,
+                "update_job": self._handle_update_job,
+                "update_job_status": self._handle_update_job,  # legacy alias
                 "update_stream": self._handle_update_stream,
                 "send_job_request": self.create_base_job,
                 "update_api_request": self._handle_update_api,
@@ -476,17 +477,34 @@ class ValidatorThread(Torchnode):
 
         self.response_queue.put({"status": "SUCCESS", "return": return_val})
 
+    # Job fields other processes may change. "status" is additionally checked
+    # against JobStatus; the rest are metadata only the ML process can derive.
+    _JOB_UPDATABLE = {"status", "supports_reasoning"}
+
     def _handle_update_job(self, request):
-        job_id, loading_status = request
+        """
+        Universal job update: request = (job_id, {field: value, ...}).
+        Legacy form (job_id, "active") is treated as {"status": "active"}.
+        All-or-nothing: every field is validated before any is applied.
+        """
+        job_id, updates = request
+        if isinstance(updates, str):
+            updates = {"status": updates}
+
         job_data = self.dht.query(job_id)
 
-        response_status = "FAILURE"
-        if job_data:
-            if loading_status in JobStatus.values():
-                job_data["status"] = loading_status
-                response_status = "SUCCESS"
+        ok = isinstance(job_data, dict) and isinstance(updates, dict) and bool(updates)
+        if ok:
+            ok = set(updates) <= self._JOB_UPDATABLE
+        if ok and "status" in updates:
+            ok = updates["status"] in JobStatus.values()
 
-        self.response_queue.put({"status": response_status, "return": None})
+        if ok:
+            job_data.update(updates)
+
+        self.response_queue.put(
+            {"status": "SUCCESS" if ok else "FAILURE", "return": None}
+        )
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""

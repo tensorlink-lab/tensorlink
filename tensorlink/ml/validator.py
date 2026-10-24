@@ -2,7 +2,8 @@ import traceback
 
 from tensorlink.ml.utils.graphing import ModelParser
 from tensorlink.ml.worker import DistributedWorker
-from tensorlink.ml.module import DistributedModel, OffloadedModule
+from tensorlink.ml.module import DistributedModel, DistributedEmbedding, OffloadedModule
+from tensorlink.ml.embedding import EmbeddingManager, EmbeddingUnavailable
 from tensorlink.ml.utils.formatter import (
     ResponseFormatter,
     normalize_generate_args,
@@ -149,6 +150,14 @@ class DistributedValidator(DistributedWorker):
         self.public_models = defaultdict(list)  # Model name -> list(job_id)
 
         self.tokenizers = {}
+
+        # Hosted embedding models: loaded on first request, unloaded when idle.
+        _device = getattr(self, "device", None)
+        self.embeddings = EmbeddingManager(device=str(_device) if _device else None)
+        self.embedding_jobs = {}  # job_id -> model_name (loaded on this validator)
+        # Embedding models offloaded whole to a single worker
+        self.embedding_models = {}  # job_id -> DistributedEmbedding
+        self.embedding_last_used = {}  # job_id -> time.monotonic()
 
         # Track models that are in the process of being initialized
         self.models_initializing = set()  # job_id
@@ -450,10 +459,14 @@ class DistributedValidator(DistributedWorker):
             )
 
             # Load HF model, create and save distribution
-            distribution = parser.create_distributed_config(
-                model_name,
-                **kwargs,
-            )
+            if job_data.get("model_type") == "embedding":
+                # Never sharded: the whole model goes on one worker
+                distribution = self._embedding_worker_distribution(model_name, workers)
+            else:
+                distribution = parser.create_distributed_config(
+                    model_name,
+                    **kwargs,
+                )
 
         except Exception as e:
             logging.exception(
@@ -565,6 +578,20 @@ class DistributedValidator(DistributedWorker):
                             if not is_active:
                                 self._remove_hosted_job(job_id)
 
+                    for job_id, model_name in list(self.embedding_jobs.items()):
+                        if not self.send_request(
+                            "check_job_status", (model_name, job_id)
+                        ):
+                            self._remove_embedding_job(job_id)
+
+                    for job_id, emb in list(self.embedding_models.items()):
+                        if job_id in self.models_initializing:
+                            continue
+                        if not self.send_request(
+                            "check_job_status", (emb.model_name, job_id)
+                        ):
+                            self._remove_embedding_worker_job(job_id)
+
                 if (
                     self.CHECK_COUNTER % (self.GC_CHECK_INTERVAL * 20) == 0
                 ):  # less frequent than garbage collection
@@ -614,6 +641,34 @@ class DistributedValidator(DistributedWorker):
                     if generate_request:
                         self._handle_generate_request(generate_request, job_id)
 
+            # Check for embedding requests, then retire idle embedding models
+            for job_id, model_name in list(self.embedding_jobs.items()):
+                embedding_request = self.send_request(
+                    "update_api_request", (model_name, job_id)
+                )
+                if embedding_request:
+                    self._handle_embedding_request(embedding_request, job_id)
+            for job_id, _name in self.embeddings.reap():
+                self._remove_embedding_job(job_id)
+
+            # Embedding models offloaded to a worker: serve requests, retire idle ones
+            for job_id, emb in list(self.embedding_models.items()):
+                if job_id in self.models_initializing:
+                    continue
+                embedding_request = self.send_request(
+                    "update_api_request", (emb.model_name, job_id)
+                )
+                if embedding_request:
+                    self._handle_embedding_request(embedding_request, job_id)
+            now = time.monotonic()
+            for job_id in list(self.embedding_models):
+                if (
+                    job_id not in self.models_initializing
+                    and now - self.embedding_last_used.get(job_id, now)
+                    > self.embeddings.idle_ttl
+                ):
+                    self._remove_embedding_worker_job(job_id)
+
         except Exception as e:
             self.send_request(
                 "debug_print",
@@ -625,6 +680,307 @@ class DistributedValidator(DistributedWorker):
             )
 
         self.CHECK_COUNTER += 1
+
+    def _initialize_embedding_job(self, model_name: str, job_data: dict) -> bool:
+        """
+        Embedding models are never sharded: host them on this validator if they
+        fit, otherwise offload the whole model to a single worker.
+        """
+        if self._try_host_embedding_job(model_name, job_data):
+            return True
+        return self._initialize_worker_embedding_job(model_name, job_data)
+
+    def _try_host_embedding_job(self, model_name: str, job_data: dict) -> bool:
+        """
+        Load a small embedding model on this validator (never sharded) and
+        register its job. Blocks while the model loads; the API side waits.
+        """
+        job_id = job_data.get("id")
+        loaded = False
+        try:
+            if not self._hosting_enabled or job_id is None:
+                logging.warning(
+                    f"Cannot host embedding model {model_name} "
+                    f"(hosting enabled={self._hosting_enabled}, job_id={job_id})"
+                )
+                return False
+
+            available = self._get_available_host_memory()
+            memory = self.embeddings.load(job_id, model_name)
+            loaded = True
+
+            if memory > available:
+                self.send_request(
+                    "debug_print",
+                    (
+                        f"Not enough host memory for embedding model {model_name}: "
+                        f"needs {memory / 1e6:.0f}MB, {available / 1e6:.0f}MB free",
+                        "bright_red",
+                        logging.ERROR,
+                    ),
+                )
+                self.embeddings.unload(job_id)
+                return False
+
+            # Held for the job's lifetime; released in _remove_embedding_job.
+            self._reserve_host_memory(job_id, memory)
+
+            # Same single "loaded on host" distribution a hosted chat model gets
+            # when it fits on the validator, so the existing job path accepts it.
+            job_data["distribution"] = {
+                "success": True,
+                "config": {
+                    "model": {
+                        "type": "loaded",
+                        "device": "host",
+                        "name": model_name,
+                        "memory": memory,
+                        "module": "EmbeddingModel",
+                        "module_path": "model",
+                        "training": False,
+                        "optimizer_spec": {},
+                        "batch_size": 1,
+                        "model_type": "embedding",
+                        "input_boundary": False,
+                    }
+                },
+                "model_memory": memory,
+                "host_memory_used": memory,
+                "error": None,
+            }
+            job_data["n_workers"] = 0
+
+            if not self.send_request("send_job_request", job_data):
+                raise RuntimeError("job request was declined")
+
+            self.embedding_jobs[job_id] = model_name
+            self.send_request("update_job_status", (job_id, "active"))
+            self.send_request(
+                "debug_print",
+                (
+                    f"Embedding model {model_name} ready (job {job_id}, "
+                    f"{memory / 1e6:.0f}MB)",
+                    "green",
+                    logging.INFO,
+                ),
+            )
+            return True
+
+        except Exception as e:
+            logging.exception(
+                f"Error initializing embedding job for {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
+            if loaded:
+                self.embeddings.unload(job_id)
+            if job_id is not None:
+                self._release_host_memory(job_id)
+                self.embedding_jobs.pop(job_id, None)
+            return False
+
+    # Reserve this much per byte of weights on disk (ST loads fp32 by default),
+    # plus a fixed allowance for activations / CUDA context.
+    EMBEDDING_MEMORY_FACTOR = 2.0
+    EMBEDDING_MEMORY_FLOOR = 256 * 1024 * 1024
+
+    def _estimate_embedding_bytes(self, model_name: str) -> int:
+        """Rough GPU footprint from the repo's root-level weight files."""
+        weight_bytes = 0
+        try:
+            from huggingface_hub import model_info
+
+            info = model_info(model_name, files_metadata=True)
+            root = [s for s in info.siblings if "/" not in s.rfilename and s.size]
+            for suffix in (".safetensors", ".bin"):
+                weight_bytes = sum(s.size for s in root if s.rfilename.endswith(suffix))
+                if weight_bytes:
+                    break
+        except Exception as e:
+            logging.warning(f"Could not estimate size of {model_name}: {e}")
+        return int(weight_bytes * self.EMBEDDING_MEMORY_FACTOR) + (
+            self.EMBEDDING_MEMORY_FLOOR
+        )
+
+    def _embedding_worker_distribution(self, model_name: str, workers: dict) -> dict:
+        """
+        Single-entry distribution that puts the whole embedding model on the
+        worker with the most free GPU memory. Same shape ModelParser returns, so
+        inspect_model / send_job_request / recruit_worker handle it unchanged.
+        """
+        required = self._estimate_embedding_bytes(model_name)
+        candidates = {
+            wid: w
+            for wid, w in (workers or {}).items()
+            if (w.get("gpu_memory") or 0) >= required
+        }
+        if not candidates:
+            return {
+                "success": False,
+                "config": {},
+                "model_memory": required,
+                "host_memory_used": 0,
+                "error": (
+                    f"No single worker has {required / 1e6:.0f}MB free for "
+                    f"embedding model {model_name}."
+                ),
+            }
+
+        worker_id = max(candidates, key=lambda wid: candidates[wid]["gpu_memory"])
+        return {
+            "success": True,
+            "config": {
+                "model": {
+                    "type": "offloaded",
+                    "name": model_name,
+                    "assigned_workers": [worker_id],
+                    "memory": required,
+                    "module": "EmbeddingModel",
+                    "module_path": "model",
+                    "training": False,
+                    "optimizer_spec": {},
+                    "batch_size": 1,
+                    "model_type": "embedding",
+                }
+            },
+            "model_memory": required,
+            "host_memory_used": 0,
+            "error": None,
+        }
+
+    def _initialize_worker_embedding_job(self, model_name: str, job_data: dict) -> bool:
+        """Recruit one worker for the whole embedding model (normal job path)."""
+        job_id = job_data.get("id")
+        try:
+            job_data = self.inspect_model(model_name, job_data, hosted=True)
+            if not job_data:
+                return False
+
+            job_id = job_data.get("id")
+            self.embedding_models[job_id] = DistributedEmbedding(
+                model_name,
+                node=self.node,
+                config=job_data.get("distribution"),
+            )
+            self.models_initializing.add(job_id)
+            self.send_request("update_job_status", (job_id, "initializing"))
+            return True
+
+        except Exception as e:
+            logging.exception(
+                f"Error initializing worker embedding job for {model_name} "
+                f"(job_id={job_id}): {type(e).__name__}: {e}"
+            )
+            if job_id is not None:
+                self.models_initializing.discard(job_id)
+                self.embedding_models.pop(job_id, None)
+            return False
+
+    def _finalize_embedding_worker_job(self, job_id: str) -> bool:
+        """Send the model to its worker, wait for it to load, then mark it active."""
+        emb = self.embedding_models.get(job_id)
+        if emb is None:
+            return False
+        try:
+            args = self.send_request("check_module", job_id)
+            if not args or not isinstance(args, dict):
+                return False
+
+            distribution = args["distribution"] or emb.config
+            for module_id, module_info in distribution.items():
+                if "offloaded" in module_info.get("type", ""):
+                    module_info["job_id"] = job_id
+                    self.modules[module_id] = module_info
+
+            emb.distribute_model(distribution)
+            emb.job_id = job_id
+
+            self.embedding_last_used[job_id] = time.monotonic()
+            self.models_initializing.discard(job_id)
+            self.send_request("update_job", (job_id, {"status": "active"}))
+            self.send_request(
+                "debug_print",
+                (
+                    f"Embedding model {emb.model_name} ready on worker (job {job_id})",
+                    "green",
+                    logging.INFO,
+                ),
+            )
+            return True
+
+        except Exception as e:
+            logging.exception(
+                f"Error finalizing worker embedding job {job_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            self._remove_embedding_worker_job(job_id)
+            return False
+
+    def _remove_embedding_worker_job(self, job_id: str):
+        """Drop a worker-hosted embedding model and retire its job."""
+        emb = self.embedding_models.pop(job_id, None)
+        self.embedding_last_used.pop(job_id, None)
+        self.models_initializing.discard(job_id)
+
+        for module_id in [
+            mid for mid, m in self.modules.items() if m.get("job_id") == job_id
+        ]:
+            del self.modules[module_id]
+
+        if emb is not None:
+            self.send_request("remove_job", {"model_name": emb.model_name})
+            self.send_request(
+                "debug_print",
+                (
+                    f"Removed worker-hosted embedding model {emb.model_name}",
+                    "yellow",
+                    logging.INFO,
+                ),
+            )
+        gc.collect()
+
+    def _remove_embedding_job(self, job_id: str):
+        """Unload an embedding model, free its memory, and retire its job."""
+        model_name = self.embedding_jobs.pop(job_id, None)
+        unloaded = self.embeddings.unload(job_id)
+        model_name = model_name or unloaded
+        self._release_host_memory(job_id)
+
+        if model_name:
+            self.send_request("remove_job", {"model_name": model_name})
+            self.send_request(
+                "debug_print",
+                (f"Removed embedding model {model_name}", "yellow", logging.INFO),
+            )
+        gc.collect()
+
+    def _handle_embedding_request(self, request, job_id: str):
+        """Run one queued EmbeddingRequest and hand it back with output or error."""
+        try:
+            if job_id in self.embedding_models:
+                result = self.embedding_models[job_id].encode(
+                    request.input, request.dimensions
+                )
+                self.embedding_last_used[job_id] = time.monotonic()
+            else:
+                result = self.embeddings.embed(
+                    job_id, request.input, request.dimensions
+                )
+            request.output = {
+                "buffer": result.buffer,
+                "count": result.count,
+                "dim": result.dim,
+                "prompt_tokens": result.prompt_tokens,
+            }
+        except ValueError as e:  # bad input / dimensions
+            request.error, request.error_status = str(e), 400
+        except (EmbeddingUnavailable, TimeoutError) as e:
+            request.error, request.error_status = str(e) or type(e).__name__, 503
+        except Exception as e:
+            logging.exception(f"Embedding request failed: {type(e).__name__}: {e}")
+            request.error = f"Embedding failed: {type(e).__name__}: {e}"
+            request.error_status = 500
+
+        self.send_request("update_api_request", (request,))
 
     def _prepare_generation(self, request, job_id):
         distributed_model = self.models[job_id]
@@ -1105,6 +1461,9 @@ class DistributedValidator(DistributedWorker):
             for k, v in defaults.items():
                 job_data.setdefault(k, v)
 
+            if job_data.get("model_type") == "embedding":
+                return self._initialize_embedding_job(model_name, job_data)
+
             # Inspect model to determine network requirements
             job_data = self.inspect_model(model_name, job_data, hosted=True)
 
@@ -1149,6 +1508,11 @@ class DistributedValidator(DistributedWorker):
 
     def _finalize_hosted_job(self, job_id: str):
         """Finalize a hosted job by setting up the distributed model with workers."""
+        if job_id in self.embedding_jobs:
+            return True  # embedding jobs are ready as soon as they are loaded
+        if job_id in self.embedding_models:
+            return self._finalize_embedding_worker_job(job_id)
+
         model_name = job_id  # fallback value in case of failure
         try:
             # Check if we have module info ready
@@ -1189,8 +1553,6 @@ class DistributedValidator(DistributedWorker):
             # Update available GPU memory
             self._release_host_memory(job_id)
 
-            self.send_request("update_job_status", (job_id, "active"))
-
             # Load tokenizer
             if model_name not in self.tokenizers:
                 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -1204,6 +1566,20 @@ class DistributedValidator(DistributedWorker):
                         f"decode with manual special-token stripping."
                     )
                 self.tokenizers[model_name] = tokenizer
+
+            # One atomic update: the job becomes active together with its
+            # reasoning capability, so readers never see one without the other.
+            ctl = get_reasoning_control(self.tokenizers[model_name])  # cached
+            self.send_request(
+                "update_job",
+                (
+                    job_id,
+                    {
+                        "status": "active",
+                        "supports_reasoning": ctl.supported,
+                    },
+                ),
+            )
 
             setattr(distributed_model, 'tokenizer', self.tokenizers[model_name])
 
@@ -1382,7 +1758,11 @@ class DistributedValidator(DistributedWorker):
             orphaned_reservations = []
 
             for job_id in list(self.initializing_reservations.keys()):
-                if job_id not in self.models and job_id not in self.models_initializing:
+                if (
+                    job_id not in self.models
+                    and job_id not in self.models_initializing
+                    and job_id not in self.embedding_jobs
+                ):
                     orphaned_reservations.append(job_id)
 
             # Release orphaned reservations

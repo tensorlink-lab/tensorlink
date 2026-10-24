@@ -295,6 +295,7 @@ class UserThread(Torchnode):
                 "distribution": {},
                 "n_workers": 0,
                 "model_name": distribution.get("model_name"),
+                "model_type": distribution.get("model_type", "chat"),
                 "optimizer": distribution.get("optimizer"),
                 "seed_validators": validator_ids,
                 "available_memory": self.get_gpu_memory(),

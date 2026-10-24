@@ -502,7 +502,13 @@ class DistributedWorker:
 
             # Else try Hugging Face for model info
             else:
-                skeleton_module = load_model_skeleton(model_name)
+                # Embedding models are loaded whole by their own wrapper, so
+                # there is no causal-LM skeleton to build (it would also fail
+                # for encoder-only architectures).
+                if module_info.get("model_type") == "embedding":
+                    skeleton_module = None
+                else:
+                    skeleton_module = load_model_skeleton(model_name)
                 module = self._initialize_module_from_config(
                     skeleton_module, model_name, module_name, module_info
                 )
@@ -842,6 +848,10 @@ class DistributedWorker:
         """
         model_type = module_info.get('model_type', 'chat')
         self.cleanup_memory()
+        if model_type == "embedding":
+            from tensorlink.ml.embedding_module import load_embedding_module
+
+            return load_embedding_module(model_name, device=str(self.device))
         dtype = resolve_dtype(model_name, self.device)
         return load_full_model(model_name, model_type, self.device, torch_dtype=dtype)
 

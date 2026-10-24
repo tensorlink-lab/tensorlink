@@ -1,6 +1,8 @@
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Annotated, Optional, List, Literal, Union, Dict, Any
 
+from tensorlink.ml.utils.model_types import ModelType
+
 
 class NodeRequest(BaseModel):
     address: str
@@ -9,7 +11,7 @@ class NodeRequest(BaseModel):
 class JobRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     hf_name: str
-    model_type: Optional[str] = "chat"
+    model_type: ModelType = ModelType.CHAT
     time: int = 1800
     payment: int = 0
 
@@ -125,6 +127,42 @@ class EmbeddingResponseRequest(_BaseResponseRequest):
 
     encoding_format: Optional[Literal["float", "base64"]] = "float"
     dimensions: Optional[int] = None
+
+
+class EmbeddingCreateRequest(BaseModel):
+    """OpenAI-compatible body for POST /v1/embeddings."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    # Optional here (OpenAI requires it): falls back to the network default.
+    model: Optional[str] = None
+    input: Union[str, List[str]]
+    encoding_format: Optional[Literal["float", "base64"]] = "float"
+    dimensions: Optional[int] = Field(default=None, ge=1)
+    user: Optional[str] = None
+
+
+class EmbeddingRequest(BaseModel):
+    """Internal request queued from the API process to the ML process.
+    Not part of the public API. ``output`` / ``error`` are filled in by the
+    ML process before it is returned."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    hf_name: str
+    input: List[str]
+    dimensions: Optional[int] = None
+    encoding_format: Literal["float", "base64"] = "float"
+
+    cancelled: bool = False
+    processing: bool = False
+    stream: bool = False  # always False; the shared request plumbing reads it
+    id: int = None
+    start_time: float = 0
+
+    output: Optional[Dict[str, Any]] = None  # {buffer, count, dim, prompt_tokens}
+    error: Optional[str] = None
+    error_status: Optional[int] = None
 
 
 AnyResponseRequest = Annotated[

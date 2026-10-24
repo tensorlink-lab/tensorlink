@@ -70,7 +70,8 @@ class GenerationMixin:
 
     async def _handle_embedding_response(self, request: EmbeddingResponseRequest):
         raise HTTPException(
-            status_code=501, detail="Embeddings are not yet implemented."
+            status_code=501,
+            detail="Embeddings via /v1/responses are not implemented; use POST /v1/embeddings.",
         )
 
     def _log_model_request(self, model_name: str):

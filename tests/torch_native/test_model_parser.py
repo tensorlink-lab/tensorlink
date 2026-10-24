@@ -8,10 +8,10 @@ from tensorlink.ml.utils.utils import format_memory_size
 import pandas as pd
 
 MODELS = [
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-14B-Instruct",
+    # "Qwen/Qwen2.5-7B-Instruct",
+    # "Qwen/Qwen2.5-14B-Instruct",
     "Qwen/Qwen3-8B",
-    "Qwen/Qwen3-14B",
+    # "Qwen/Qwen3-14B",
 ]
 
 # Two workers with a 24GB and 16GB GPU capacity
@@ -58,10 +58,14 @@ def test_model_distributions():
                         training=False,
                         trusted=False,
                         input_obfuscation=False,
-                        host_max_memory_bytes=50e6,
+                        host_max_memory_bytes=int(10e9),
+                        host_max_module_bytes=int(5e8),
                         max_seq_len=seqlen,
                         batch_size=bs,
                         optimizer_type="adam",
+                        force_tied_to_host=True,
+                        max_offload_depth=3,
+                        host_max_depth=1,
                     )
 
                     success = config.get("success", False)

@@ -1247,10 +1247,6 @@ class ModelParser:
 
         return None
 
-    # ------------------------------------------------------------------
-    # Introspection utilities
-    # ------------------------------------------------------------------
-
     def get_module_path_info(self, module_path: str) -> dict:
         """
         Get information about a specific module path.
