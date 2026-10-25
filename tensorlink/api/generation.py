@@ -3,6 +3,8 @@ Generation machinery for TensorlinkAPI: request dispatch, SSE streaming, and the
 bridge between the FastAPI event loop and the ML thread.
 """
 
+import logging
+
 from tensorlink.api.models import (
     GenerationRequest,
     TextResponseRequest,
@@ -44,11 +46,17 @@ class GenerationMixin:
                 status_code=503,
                 detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
             )
-
         if model_status["status"] == "loading":
             raise HTTPException(
                 status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
             )
+
+        self.smart_node.debug_print(
+            f"Dispatching request: {gen_request}",
+            colour="bright_red",
+            level=logging.DEBUG,
+            tag="API",
+        )
 
         if gen_request.stream:
             return StreamingResponse(

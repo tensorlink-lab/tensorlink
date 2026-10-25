@@ -1,3 +1,5 @@
+import traceback
+
 from tensorlink.ml.utils.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
@@ -56,14 +58,24 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
         for path, endpoint, name in routes:
             self.router.add_api_route(path, endpoint, methods=["POST"], name=name)
 
-    @staticmethod
-    async def _guarded(call):
-        """Await `call()`; let HTTPExceptions through, map anything else to a 500."""
+    async def _guarded(self, call):
         try:
             return await call()
-        except HTTPException:
+        except HTTPException as e:
+            self.smart_node.debug_print(
+                f"HTTP {e.status_code}: {e.detail}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="API",
+            )
             raise
         except Exception as e:
+            self.smart_node.debug_print(
+                f"unhandled {type(e).__name__}: {e}\n{traceback.format_exc()}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="API",
+            )
             raise HTTPException(status_code=500, detail=str(e))
 
     async def _route_chat_completions(self, request: ChatCompletionRequest):

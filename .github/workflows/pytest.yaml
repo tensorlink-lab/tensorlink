@@ -41,10 +41,10 @@ jobs:
       - name: Run Tests Sequentially
         run: |
           poetry run pytest tests/test_node.py -s
-          poetry run pytest tests/torch_api/test_model_api.py -s
-          poetry run pytest tests/torch_api/test_embeddings_api.py -s
-          poetry run pytest tests/torch_native/test_distributed_model.py -s
-          poetry run pytest tests/torch_native/test_distributed_embeddings.py -s
+          poetry run pytest tests/api/test_model_api.py -s
+          poetry run pytest tests/api/test_embeddings_api.py -s
+          poetry run pytest tests/torch/test_distributed_model.py -s
+          poetry run pytest tests/torch/test_distributed_embeddings.py -s
 
       - name: Dump runtime.log on failure
         if: failure()
