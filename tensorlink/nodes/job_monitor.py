@@ -164,11 +164,11 @@ class JobMonitor:
 
     def _check_job_health(self, job_data: Dict) -> str:
         """Comprehensive health check of the job and its components."""
-        # Check if job is expired
-        if job_data.get("last_seen", 15) - job_data.get("timestamp", 0) > job_data.get(
-            "time", 0
-        ):
-            return JobStatus.COMPLETED
+        # Check if the job has outlived its allocated time.
+        started, allowed = job_data.get("timestamp"), job_data.get("time")
+        if started is not None and allowed is not None:
+            if time.time() - started > allowed:
+                return JobStatus.COMPLETED
 
         # Check user connection
         user_status = self._check_user_status(job_data)
@@ -408,30 +408,40 @@ class JobMonitor:
         pass
 
     def _cleanup_job(self, job_data: Dict, final_status: JobStatus):
-        """Perform comprehensive job cleanup."""
+        """Perform comprehensive job cleanup"""
         try:
             # Update job status
             job_data["status"] = JobStatus.PENDING_OFFLINE
+            job_data["active"] = False
             job_data["end_time"] = time.time()
             job_data["final_status"] = final_status
 
-            # Clean up worker resources
-            self._cleanup_workers(job_data)
-
-            self.node.debug_print(
-                f"Job {job_data['id']} cleaned up successfully with status: {final_status}",
-                colour="green",
-                level=logging.INFO,
-                tag="JobMonitor",
+            steps = (
+                ("shut down workers", self._cleanup_workers),
+                ("hand job to contract manager", self._complete_job),
+                ("remove node modules", self._remove_job_modules),
             )
+            failed = [
+                name
+                for name, step in steps
+                if not self._run_cleanup_step(name, step, job_data)
+            ]
 
-            # Pass over job to contract manager
-            if self.node.contract_manager:
-                self.node.contract_manager.add_job_to_complete(job_data)
-
-            # Remove module from node
-            for module_id in job_data["distribution"]:
-                del self.node.modules[module_id]
+            if failed:
+                self.node.debug_print(
+                    f"Job {job_data['id']} cleanup finished with errors in: {failed}",
+                    colour="bright_red",
+                    level=logging.ERROR,
+                    tag="JobMonitor",
+                )
+            else:
+                self.node.debug_print(
+                    f"Job {job_data['id']} cleaned up successfully with status: "
+                    f"{final_status}",
+                    colour="green",
+                    level=logging.INFO,
+                    tag="JobMonitor",
+                )
 
         except Exception as e:
             self.node.debug_print(
@@ -440,6 +450,32 @@ class JobMonitor:
                 level=logging.ERROR,
                 tag="JobMonitor",
             )
+
+    def _run_cleanup_step(self, name: str, step, job_data: Dict) -> bool:
+        """Run one cleanup step, log its failure and report whether it succeeded."""
+        try:
+            step(job_data)
+            return True
+        except Exception as e:
+            self.node.debug_print(
+                f"Error during job cleanup ({name}) for {job_data.get('id')}: "
+                f"{type(e).__name__}: {e}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="JobMonitor",
+            )
+            return False
+
+    def _complete_job(self, job_data: Dict):
+        """Pass the finished job over to the contract manager."""
+        if self.node.contract_manager:
+            self.node.contract_manager.add_job_to_complete(job_data)
+
+    def _remove_job_modules(self, job_data: Dict):
+        """Forget the job's modules. Modules hosted on the validator itself were
+        never registered on the node, so a missing id is not an error."""
+        for module_id in job_data.get("distribution", {}):
+            self.node.modules.pop(module_id, None)
 
     def _cleanup_workers(self, job_data: Dict):
         """Clean up worker resources and send shutdown signals."""
