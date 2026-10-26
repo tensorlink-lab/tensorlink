@@ -413,13 +413,13 @@ class JobMonitor:
             # Update job status
             job_data["status"] = JobStatus.PENDING_OFFLINE
             job_data["end_time"] = time.time()
-            job_data["final_status"] = final_status.value
+            job_data["final_status"] = final_status
 
             # Clean up worker resources
             self._cleanup_workers(job_data)
 
             self.node.debug_print(
-                f"Job {job_data['id']} cleaned up successfully with status: {final_status.value}",
+                f"Job {job_data['id']} cleaned up successfully with status: {final_status}",
                 colour="green",
                 level=logging.INFO,
                 tag="JobMonitor",

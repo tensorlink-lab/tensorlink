@@ -648,6 +648,7 @@ class DistributedValidator(DistributedWorker):
                 )
                 if embedding_request:
                     self._handle_embedding_request(embedding_request, job_id)
+
             for job_id, _name in self.embeddings.reap():
                 self._remove_embedding_job(job_id)
 
