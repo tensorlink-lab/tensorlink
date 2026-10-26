@@ -5,6 +5,7 @@ on: [pull_request, push]
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # a hung node process shouldn't burn 6 hours
 
     strategy:
       fail-fast: false
@@ -33,21 +34,44 @@ jobs:
           poetry install --no-interaction --no-ansi
 
       - name: Install CPU-only PyTorch & tensorlink
+        id: setup  # test steps below only run if setup succeeded
         run: |
           pip cache purge || true
           pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir .
 
-      - name: Run Tests Sequentially
-        run: |
-          poetry run pytest tests/test_node.py -s
-          poetry run pytest tests/api/test_model_api.py -s
-          poetry run pytest tests/api/test_embeddings_api.py -s
-          poetry run pytest tests/torch/test_distributed_model.py -s
-          poetry run pytest tests/torch/test_distributed_embeddings.py -s
+      # One step per test file
+      - name: "Test: node"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/test_node.py -s
+
+      - name: "Test: model API"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/torch_api/test_model_api.py -s
+
+      - name: "Test: embeddings API"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/torch_api/test_embeddings_api.py -s
+
+      - name: "Test: distributed model"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/torch_native/test_distributed_model.py -s
+
+      - name: "Test: distributed embeddings"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/torch_native/test_distributed_embeddings.py -s
 
       - name: Dump runtime.log on failure
         if: failure()
         run: |
           echo "=== runtime.log (chronological) ==="
           sort -k1,2 logs/runtime.log || echo "logs/runtime.log not found"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-py${{ matrix.python-version }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
