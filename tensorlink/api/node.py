@@ -244,7 +244,7 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
                 )
 
             distribution = self._build_distribution_info(job_data)
-            status_info = self._derive_status_from_distribution(distribution)
+            status_info = self._derive_status_from_job(job_data, distribution)
 
             return ModelStatusDistributionResponse(
                 model_name=model,
@@ -489,10 +489,26 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
                 "message": "Model is initializing, workers are loading their assigned modules.",
             }
 
-    def _derive_status_from_job(self, job_data: dict) -> dict:
-        """Convenience wrapper: build distribution then derive status."""
-        distribution = self._build_distribution_info(job_data)
-        return self._derive_status_from_distribution(distribution)
+    def _derive_status_from_job(
+        self, job_data: dict, distribution: dict = None
+    ) -> dict:
+        """
+        Convenience wrapper: build distribution then derive status.
+
+        Status shown to clients. "active" requires both:
+          * all offloaded modules loaded on their workers, and
+          * the ML process having marked the job ready (_is_job_ready).
+        """
+        if distribution is None:
+            distribution = self._build_distribution_info(job_data)
+
+        status_info = self._derive_status_from_distribution(distribution)
+        if status_info["status"] == "active" and not self._is_job_ready(job_data):
+            return {
+                "status": "initializing",
+                "message": "Model is initializing, the validator is finishing setup.",
+            }
+        return status_info
 
     def _check_model_status(self, model_name: str) -> dict:
         """
