@@ -1,5 +1,3 @@
-import traceback
-
 from tensorlink.ml.utils.utils import get_popular_model_stats
 from tensorlink.api.models import (
     JobRequest,
@@ -10,12 +8,13 @@ from tensorlink.api.models import (
     ModelDistributionEntry,
     EmbeddingCreateRequest,
 )
-from tensorlink.api.functions import build_hf_job_data, build_generation_request
+from tensorlink.api.functions import build_hf_job_data, build_text_request
 from tensorlink.ml.utils.model_types import ModelType
 from tensorlink.api.generation import GenerationMixin
 from tensorlink.api.embeddings import EmbeddingMixin
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from threading import Thread
+import traceback
 import logging
 import uvicorn
 import asyncio
@@ -80,7 +79,7 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
 
     async def _route_chat_completions(self, request: ChatCompletionRequest):
         return await self._guarded(
-            lambda: self._dispatch_text(build_generation_request(request))
+            lambda: self._dispatch_text(build_text_request(request))
         )
 
     async def _route_embeddings(self, request: EmbeddingCreateRequest):
@@ -258,8 +257,8 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
             logging.error(f"Error in /v1/models/status: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @staticmethod
     async def _route_model_demand(
-        self,
         days: int = Query(30, ge=1, le=90),
         limit: int = Query(10, ge=1, le=50),
     ):
@@ -278,11 +277,13 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     def _collect_available_models(self) -> dict:
-        """Map model name -> {name, type, supports_reasoning} (public, active jobs)."""
+        """Map model name -> {name, type, supports_reasoning} (public, ready jobs)."""
         models = {}
-        for job_id in self.smart_node.jobs:
+        for job_id in list(self.smart_node.jobs):
             job = self.smart_node.dht.query(job_id)
-            if not self._is_public_active_job(job):
+            if not (
+                isinstance(job, dict) and job.get("public") and self._is_job_ready(job)
+            ):
                 continue
             name = job.get("model_name")
             entry = models.setdefault(
@@ -290,6 +291,15 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
             )
             self._apply_job_capabilities(entry, job)
         return models
+
+    @staticmethod
+    def _is_job_ready(job) -> bool:
+        """Not terminated, and the ML process has finished loading the model."""
+        return bool(
+            isinstance(job, dict)
+            and job.get("active")
+            and job.get("status") == "active"  # JobStatus.ACTIVE
+        )
 
     @staticmethod
     def _is_public_active_job(job) -> bool:
@@ -372,19 +382,29 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
         """
         Search for an active, API-hosted job matching model_name.
 
+        Prefers a ready job over one that is still loading, so a second job for the
+        same model can't mask one that is already serving.
+
         Returns (job_id, job_data) if found, else (None, None).
         """
         try:
-            for job_id in self.smart_node.jobs:
+            first_match = (None, None)
+            for job_id in list(self.smart_node.jobs):
                 job_data = self.smart_node.dht.query(job_id)
-                if (
+                if not (
                     isinstance(job_data, dict)
                     and job_data.get("model_name", "") == model_name
                     and job_data.get("hosted")
                     and job_data.get("api")
                     and job_data.get("active")
+                    and not job_data.get("end_time")  # only _cleanup_job sets this
                 ):
+                    continue
+                if self._is_job_ready(job_data):
                     return job_id, job_data
+                if first_match[0] is None:
+                    first_match = (job_id, job_data)
+            return first_match
         except Exception as e:
             logging.error(f"Error finding job for model '{model_name}': {e}")
         return None, None
@@ -439,7 +459,8 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
 
         return distribution
 
-    def _derive_status_from_distribution(self, distribution: dict) -> dict:
+    @staticmethod
+    def _derive_status_from_distribution(distribution: dict) -> dict:
         """
         Derive model status from the built distribution map.
 
@@ -475,33 +496,39 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
 
     def _check_model_status(self, model_name: str) -> dict:
         """
-        [Legacy] Check if a model is loaded, loading, or not loaded.
-        Returns a dict with 'status' and 'message'.
-        """
-        status = "not_loaded"
-        message = "Model is not currently loaded"
+        Status used by the generation endpoints.
 
+          not_loaded : no live job for this model
+          loading    : a job exists but the ML process has not marked it ready
+          loaded     : job is ready to serve requests
+          error      : the check itself failed
+        """
         try:
-            # Check if there is a public job with this module
-            for job_id in self.smart_node.jobs:
-                job_data = self.smart_node.dht.query(job_id)
-                if (
-                    isinstance(job_data, dict)
-                    and job_data.get("model_name", "") == model_name
-                    and job_data.get("hosted")
-                    and job_data.get("api")
-                    and job_data.get("active")
-                ):
-                    status = "loaded"
-                    message = f"Model {model_name} is loaded and ready"
-                    break
+            _job_id, job_data = self._find_job_for_model(model_name)
+
+            if job_data is None:
+                return {
+                    "status": "not_loaded",
+                    "message": "Model is not currently loaded",
+                }
+
+            if self._is_job_ready(job_data):
+                return {
+                    "status": "loaded",
+                    "message": f"Model {model_name} is loaded and ready",
+                }
+
+            return {
+                "status": "loading",
+                "message": f"Model {model_name} is still loading.",
+            }
 
         except Exception as e:
             logging.error(f"Error checking model status: {e}")
-            status = "error"
-            message = f"Error checking model status: {str(e)}"
-
-        return {"status": status, "message": message}
+            return {
+                "status": "error",
+                "message": f"Error checking model status: {str(e)}",
+            }
 
     def _trigger_model_load(self, model_name: str):
         """Trigger the ML validator to load a specific model"""

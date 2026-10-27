@@ -8,6 +8,14 @@ from tensorlink.ml.utils.formatter import (
     ResponseFormatter,
     normalize_generate_args,
 )
+from tensorlink.ml.utils.limits import (
+    ContextLengthError,
+    InvalidGenerationParameter,
+    config_context_limit,
+    operator_cap_from_env,
+    request_error_fields,
+    resolve_context_window,
+)
 from tensorlink.ml.utils.reasoning import (
     ThinkStreamSplitter,
     build_chat_prompt,
@@ -31,11 +39,9 @@ from collections import defaultdict
 from threading import Thread, Lock
 import torch
 import logging
-import inspect
 import hashlib
 import json
 import time
-import re
 import gc
 import os
 
@@ -569,7 +575,7 @@ class DistributedValidator(DistributedWorker):
                     self._audit_memory_reservations()
 
                     # Check if jobs are still active
-                    for job_id, model in self.models.items():
+                    for job_id, model in list(self.models.items()):
                         model_name = model.model_name
                         if self._is_model_ready(job_id):
                             is_active = self.send_request(
@@ -630,9 +636,9 @@ class DistributedValidator(DistributedWorker):
                         self.inspect_model(model_name, job_data, hosted=False)
 
             # Check for inference generate calls
-            for job_id, distributed_model in self.models.items():
+            for job_id, model in list(self.models.items()):
                 if self._is_model_ready(job_id):
-                    model_name = distributed_model.model_name
+                    model_name = model.model_name
                     # TODO Distinguish private generate requests from public ones so we dont use the same model
 
                     generate_request = self.send_request(
@@ -661,6 +667,7 @@ class DistributedValidator(DistributedWorker):
                 )
                 if embedding_request:
                     self._handle_embedding_request(embedding_request, job_id)
+
             now = time.monotonic()
             for job_id in list(self.embedding_models):
                 if (
@@ -983,16 +990,35 @@ class DistributedValidator(DistributedWorker):
 
         self.send_request("update_api_request", (request,))
 
+    def _context_window(self, model_name: str, tokenizer):
+        """
+        Context window for a model, resolved once per model and cached.
+        """
+        cache = self.__dict__.setdefault("_context_windows", {})
+        window = cache.get(model_name)
+        if window is None:
+            window = resolve_context_window(
+                tokenizer,
+                config_limit=config_context_limit(model_name),
+                operator_cap=operator_cap_from_env(),
+            )
+            cache[model_name] = window
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedValidator -> Context window for {model_name}: "
+                    f"{window.describe()}",
+                    "cyan",
+                    logging.INFO,
+                ),
+            )
+        return window
+
     def _prepare_generation(self, request, job_id):
         distributed_model = self.models[job_id]
         tokenizer = self.tokenizers[request.hf_name]
 
-        model_max_length = getattr(tokenizer, "model_max_length", 2048)
-        if model_max_length > 100000:
-            model_max_length = 2048
-
-        max_length = getattr(request, "max_length", 512) or 512
-        max_length = min(max_length, model_max_length - 10)
+        window = self._context_window(request.hf_name, tokenizer)
 
         starts_in_reasoning = False
         reasoning_supported = False
@@ -1001,14 +1027,14 @@ class DistributedValidator(DistributedWorker):
             messages = list(request.history or [])
             messages.append({"role": "user", "content": request.message})
 
-            # Probes the template (cached), toggles thinking if possible, falls
-            # back to ChatML if the template is missing/broken, and trims the
-            # *oldest* turns to fit instead of cutting the generation prompt.
+            # Probes the template (cached), toggles thinking if possible and falls
+            # back to ChatML if the template is missing/broken. The whole
+            # conversation is rendered: history is never trimmed. If it does not
+            # fit the context window, normalize_generate_args rejects the request.
             build = build_chat_prompt(
                 tokenizer,
                 messages,
                 reasoning=bool(request.reasoning),
-                max_tokens=max_length,
             )
             formatted_prompt = build.prompt
             starts_in_reasoning = build.starts_in_reasoning
@@ -1020,24 +1046,15 @@ class DistributedValidator(DistributedWorker):
                     f"template has no thinking mode; returning answer only."
                 )
 
-            # The template already contains BOS etc., and we must not truncate
-            # the tail (that is where the generation prompt lives).
+            # The template already contains BOS etc.
             inputs = tokenizer(
                 formatted_prompt, return_tensors="pt", add_special_tokens=False
             )
-            if inputs.input_ids.shape[1] > max_length:
-                raise ValueError(
-                    f"Prompt is too long ({inputs.input_ids.shape[1]} tokens, "
-                    f"limit {max_length})."
-                )
         else:
+            # Raw prompts are not truncated either (cutting the end off a prompt
+            # silently changes what the model is asked); too long is an error.
             formatted_prompt = request.message
-            inputs = tokenizer(
-                formatted_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-            )
+            inputs = tokenizer(formatted_prompt, return_tensors="pt")
 
         request._reasoning_supported = reasoning_supported
 
@@ -1049,7 +1066,7 @@ class DistributedValidator(DistributedWorker):
             request,
             tokenizer,
             prompt_tokens=prompt_tokens,
-            model_max_length=model_max_length,
+            model_max_length=window.tokens,
         )
 
         return {
@@ -1099,11 +1116,12 @@ class DistributedValidator(DistributedWorker):
         try:
             ctx = self._prepare_generation(request, job_id)
         except ValueError as e:
+            error_type, status_code = request_error_fields(e)
             request.output = f"Error: {str(e)}"
             request.formatted_response = ResponseFormatter.format_error_response(
                 error_message=str(e),
-                error_type="prompt_too_long",
-                status_code=400,
+                error_type=error_type,
+                status_code=status_code,
                 request_id=str(request.id),
             )
             self.send_request(
@@ -1367,6 +1385,27 @@ class DistributedValidator(DistributedWorker):
                 (request.id, {"done": True, "final_chunk": final_chunk}),
             )
 
+        except (ContextLengthError, InvalidGenerationParameter) as e:
+            # The request itself was rejected: say so plainly, no traceback.
+            error_type, _status = request_error_fields(e)
+            self.send_request(
+                "debug_print",
+                (f"DistributedValidator -> {e}", "bright_red", logging.ERROR),
+            )
+            self.send_request(
+                "update_stream",
+                (
+                    request.id,
+                    {
+                        "done": True,
+                        "final_chunk": ResponseFormatter.format_stream_error(
+                            error_message=str(e), error_type=error_type
+                        ),
+                    },
+                ),
+            )
+            request.output = f"Error: {str(e)}"
+
         except Exception as e:
             # distributed_model.generate() itself also runs inside a background
             # Thread further up (for the streaming case) whose exceptions
@@ -1619,41 +1658,43 @@ class DistributedValidator(DistributedWorker):
             # Remove from initializing set if present
             self.models_initializing.discard(job_id)
 
-            distributed_model = self.models[job_id]
-            model_name = distributed_model.model_name
+            distributed_model = self.models.get(job_id)
+            if distributed_model is None:
+                self.model_state.pop(job_id, None)
+                logging.info(f"_remove_hosted_job: {job_id} is not hosted, skipping")
+                return
 
+            model_name = distributed_model.model_name
             # Clean up tokenizer if no other models require it
             if (
                 model_name in self.tokenizers
-                and len(self.public_models[model_name]) <= 1
+                and len(self.public_models.get(model_name, [])) <= 1
             ):
-                del self.tokenizers[model_name]
+                self.tokenizers.pop(model_name, None)
                 self.send_request(
                     "debug_print",
                     (f"Removed tokenizer for {model_name}", "yellow", logging.INFO),
                 )
 
-            if model_name in self.public_models:
-                if job_id in self.public_models[model_name]:
-                    self.public_models[model_name].remove(job_id)
+            if job_id in self.public_models.get(model_name, []):
+                self.public_models[model_name].remove(job_id)
 
             # Clean up state tracking
-            if job_id in self.model_state:
-                del self.model_state[job_id]
+            self.model_state.pop(job_id, None)
 
             # Clean up model reference
-            del self.models[job_id]
+            self.models.pop(job_id, None)
 
             # Find and remove any module entries that reference this model
-            modules_to_remove = []
-            for module_id, module_data in self.modules.items():
-                # Check if this module belongs to the model we're removing
-                if module_data.get("name") == model_name:
-                    if module_data.get("job_id") == job_id:
-                        modules_to_remove.append(module_id)
+            modules_to_remove = [
+                module_id
+                for module_id, module_data in list(self.modules.items())
+                if module_data.get("name") == model_name
+                and module_data.get("job_id") == job_id
+            ]
 
             for module_id in modules_to_remove:
-                del self.modules[module_id]
+                self.modules.pop(module_id, None)
                 self.send_request(
                     "debug_print",
                     (
@@ -1669,7 +1710,6 @@ class DistributedValidator(DistributedWorker):
                 and self.model_cache[model_name].get("distribution") is not None
                 and self._get_recent_request_count(model_name, days=1) == 0
             ):
-
                 # Keep demand metrics but clear distribution if no recent activity
                 self.model_cache[model_name]["distribution"] = None
                 save_models_cache(self.model_cache)

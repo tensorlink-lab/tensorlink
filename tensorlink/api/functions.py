@@ -97,3 +97,26 @@ def build_generation_request(request) -> GenerationRequest:
         do_sample=(request.temperature or 0) > 0,
         is_chat_completion=True,
     )
+
+
+def build_text_request(request) -> GenerationRequest:
+    """
+    Turn an OpenAI-style text body (chat completions or /v1/responses) into the
+    internal GenerationRequest.
+    """
+    gen_request = build_generation_request(request)
+
+    # An explicit max_completion_tokens is the client's intent: it wins over
+    # max_tokens even when the builder already mapped max_tokens.
+    completion_tokens = getattr(request, "max_completion_tokens", None)
+    if completion_tokens is not None:
+        gen_request.max_new_tokens = completion_tokens
+
+    for field, sent in (
+        ("max_new_tokens", getattr(request, "max_tokens", None)),
+        ("temperature", getattr(request, "temperature", None)),
+        ("top_p", getattr(request, "top_p", None)),
+    ):
+        if sent is not None and getattr(gen_request, field, None) is None:
+            setattr(gen_request, field, sent)
+    return gen_request

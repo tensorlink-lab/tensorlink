@@ -25,7 +25,6 @@ class GenerationRequest(BaseModel):
 
     # Generation params (all optional)
     max_new_tokens: Optional[int] = None
-    max_length: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     do_sample: Optional[bool] = None
@@ -70,7 +69,9 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = 1
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = 1024
+    max_tokens: Optional[int] = Field(default=1024, ge=1)
+    # Newer OpenAI SDKs send this instead of max_tokens; it wins when both are set.
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     reasoning: Optional[bool] = False
 
     presence_penalty: Optional[float] = 0.0
@@ -102,7 +103,8 @@ class TextResponseRequest(_BaseResponseRequest):
 
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
-    max_tokens: Optional[int] = 1024
+    max_tokens: Optional[int] = Field(default=1024, ge=1)
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     stop: Optional[Union[str, List[str]]] = None
     reasoning: Optional[bool] = False
 

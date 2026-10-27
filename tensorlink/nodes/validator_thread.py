@@ -467,13 +467,27 @@ class ValidatorThread(Torchnode):
             self.response_queue.put({"status": "FAILURE", "error": str(e)})
 
     def _handle_check_job(self, request):
-        # Check if a job is still active
-        model_name, job_id = request
-
-        job_data = self.dht.query(job_id)
-        return_val = (
-            job_data.get("status", JobStatus.PENDING_OFFLINE) == JobStatus.ACTIVE
-        )
+        """Report whether a job is still active. Always puts exactly one response."""
+        return_val = False
+        try:
+            _model_name, job_id = request
+            job_data = self.dht.query(job_id)
+            # A missing DHT entry means the job is gone, so it is not active.
+            if isinstance(job_data, dict):
+                return_val = (
+                    job_data.get("status", JobStatus.PENDING_OFFLINE)
+                    == JobStatus.ACTIVE
+                )
+        except Exception as e:
+            # Fail open: an unexpected error here must not tear down a healthy
+            # model. The ML process will ask again on its next GC pass.
+            self.debug_print(
+                f"Error checking job status: {type(e).__name__}: {e}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="Validator",
+            )
+            return_val = True
 
         self.response_queue.put({"status": "SUCCESS", "return": return_val})
 
@@ -715,14 +729,17 @@ class ValidatorThread(Torchnode):
 
         if user_id and user_id != self.rsa_key_hash:
             # Check that user doesn't have an active job already
-            for job_id in self.jobs:
-                if job_id != job_data.get("id"):
-                    job_info = self.dht.query(job_id)
-                    if job_info.get("author") == user_id and job_info.get("status") in [
-                        JobStatus.INITIALIZING,
-                        JobStatus.ACTIVE,
-                    ]:
-                        return False
+            for job_id in list(self.jobs):
+                if job_id == job_data.get("id"):
+                    continue
+                job_info = self.dht.query(job_id)
+                if not isinstance(job_info, dict):
+                    continue
+                if job_info.get("author") == user_id and job_info.get("status") in [
+                    JobStatus.INITIALIZING,
+                    JobStatus.ACTIVE,
+                ]:
+                    return False
 
         return True
 

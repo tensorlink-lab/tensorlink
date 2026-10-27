@@ -47,19 +47,19 @@ jobs:
 
       - name: "Test: model API"
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
-        run: poetry run pytest tests/torch_api/test_model_api.py -s
+        run: poetry run pytest tests/api/test_model_api.py -s
 
       - name: "Test: embeddings API"
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
-        run: poetry run pytest tests/torch_api/test_embeddings_api.py -s
+        run: poetry run pytest tests/api/test_embeddings_api.py -s
 
       - name: "Test: distributed model"
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
-        run: poetry run pytest tests/torch_native/test_distributed_model.py -s
+        run: poetry run pytest tests/torch/test_distributed_model.py -s
 
       - name: "Test: distributed embeddings"
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
-        run: poetry run pytest tests/torch_native/test_distributed_embeddings.py -s
+        run: poetry run pytest tests/torch/test_distributed_embeddings.py -s
 
       - name: Dump runtime.log on failure
         if: failure()
