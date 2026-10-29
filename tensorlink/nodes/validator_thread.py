@@ -4,6 +4,10 @@ from tensorlink.eth.contract_manager import ContractManager
 from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
+from tensorlink.ml.utils.model_info import (
+    sanitize_context_length,
+    sanitize_generation_defaults,
+)
 
 from dotenv import get_key
 from typing import Dict
@@ -493,7 +497,28 @@ class ValidatorThread(Torchnode):
 
     # Job fields other processes may change. "status" is additionally checked
     # against JobStatus; the rest are metadata only the ML process can derive.
-    _JOB_UPDATABLE = {"status", "supports_reasoning"}
+    _JOB_UPDATABLE = {
+        "status",
+        "supports_reasoning",
+        "context_length",
+        "generation_defaults",
+    }
+
+    @staticmethod
+    def _clean_job_metadata(updates: dict) -> dict:
+        """
+        Sanitize the published model metadata. Unlike "status" (which rejects the
+        whole update if invalid), a malformed metadata value is dropped: a bad
+        number must never stop a model from going active.
+        """
+        clean = dict(updates)
+        if "context_length" in clean:
+            clean["context_length"] = sanitize_context_length(clean["context_length"])
+        if "generation_defaults" in clean:
+            clean["generation_defaults"] = sanitize_generation_defaults(
+                clean["generation_defaults"]
+            )
+        return {k: v for k, v in clean.items() if v is not None}
 
     def _handle_update_job(self, request):
         """
@@ -514,7 +539,7 @@ class ValidatorThread(Torchnode):
             ok = updates["status"] in JobStatus.values()
 
         if ok:
-            job_data.update(updates)
+            job_data.update(self._clean_job_metadata(updates))
 
         self.response_queue.put(
             {"status": "SUCCESS" if ok else "FAILURE", "return": None}

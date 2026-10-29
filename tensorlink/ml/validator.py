@@ -8,6 +8,7 @@ from tensorlink.ml.utils.formatter import (
     ResponseFormatter,
     normalize_generate_args,
 )
+from tensorlink.ml.utils.model_info import generation_defaults
 from tensorlink.ml.utils.limits import (
     ContextLengthError,
     InvalidGenerationParameter,
@@ -990,6 +991,28 @@ class DistributedValidator(DistributedWorker):
 
         self.send_request("update_api_request", (request,))
 
+    def _job_metadata(self, model_name: str, supports_reasoning: bool) -> dict:
+        """
+        Everything published on a chat job when it goes active. ``context_length``
+        is the window this validator enforces (the same cached value that
+        _prepare_generation uses), so clients are never told a limit the server
+        does not apply. The optional fields are best effort: if they cannot be
+        resolved the job still goes active with status and reasoning support.
+        """
+        metadata = {"status": "active", "supports_reasoning": supports_reasoning}
+        try:
+            window = self._context_window(model_name, self.tokenizers[model_name])
+            metadata["context_length"] = window.tokens
+            defaults = generation_defaults(model_name)
+            if defaults:
+                metadata["generation_defaults"] = defaults
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f"Could not resolve metadata for {model_name}: "
+                f"{type(e).__name__}: {e}"
+            )
+        return metadata
+
     def _context_window(self, model_name: str, tokenizer):
         """
         Context window for a model, resolved once per model and cached.
@@ -1608,17 +1631,12 @@ class DistributedValidator(DistributedWorker):
                 self.tokenizers[model_name] = tokenizer
 
             # One atomic update: the job becomes active together with its
-            # reasoning capability, so readers never see one without the other.
+            # reasoning capability and model metadata, so readers never see one
+            # without the other.
             ctl = get_reasoning_control(self.tokenizers[model_name])  # cached
             self.send_request(
                 "update_job",
-                (
-                    job_id,
-                    {
-                        "status": "active",
-                        "supports_reasoning": ctl.supported,
-                    },
-                ),
+                (job_id, self._job_metadata(model_name, ctl.supported)),
             )
 
             setattr(distributed_model, 'tokenizer', self.tokenizers[model_name])

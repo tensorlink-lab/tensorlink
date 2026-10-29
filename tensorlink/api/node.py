@@ -266,7 +266,7 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
         return get_popular_model_stats(days=days, limit=limit)
 
     def _route_available_models(self):
-        """List currently active models and whether each supports reasoning"""
+        """List currently active models with their published metadata"""
         try:
             models = self._collect_available_models()
             return {
@@ -277,7 +277,7 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     def _collect_available_models(self) -> dict:
-        """Map model name -> {name, type, supports_reasoning} (public, ready jobs)."""
+        """Map model name -> model info (public, ready jobs)."""
         models = {}
         for job_id in list(self.smart_node.jobs):
             job = self.smart_node.dht.query(job_id)
@@ -287,7 +287,14 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
                 continue
             name = job.get("model_name")
             entry = models.setdefault(
-                name, {"name": name, "type": "text", "supports_reasoning": None}
+                name,
+                {
+                    "name": name,
+                    "type": "text",
+                    "supports_reasoning": None,
+                    "context_length": None,  # null = unknown (older node / no metadata)
+                    "generation_defaults": None,
+                },
             )
             self._apply_job_capabilities(entry, job)
         return models
@@ -312,6 +319,21 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
             entry["supports_reasoning"] = False
         elif job.get("supports_reasoning") is not None:  # null = unknown
             entry["supports_reasoning"] = job["supports_reasoning"]
+
+        TensorlinkAPI._merge_job_metadata(entry, job)
+
+    @staticmethod
+    def _merge_job_metadata(entry: dict, job: dict):
+        """
+        Several jobs can serve one model. Advertise the smallest context window
+        among them (the only one every request can rely on); defaults: last wins.
+        """
+        length = job.get("context_length")
+        if length is not None:
+            known = entry["context_length"]
+            entry["context_length"] = length if known is None else min(known, length)
+        if job.get("generation_defaults") is not None:
+            entry["generation_defaults"] = job["generation_defaults"]
 
     def _register_stats_routes(self):
         """Register statistics and monitoring endpoints"""
