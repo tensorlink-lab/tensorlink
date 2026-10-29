@@ -145,7 +145,6 @@ class Torchnode(Smartnode):
 
         # Available GPU mpc estimation
         self._max_memory_gb = max_memory_gb
-        self.available_gpu_memory = self.get_gpu_memory()
         self.total_gpu_memory = self.available_gpu_memory
         self.available_ram = psutil.virtual_memory().available
 
@@ -1209,6 +1208,10 @@ class Torchnode(Smartnode):
             0, int(available_gpu_memory - reserved_loading_memory)
         )
         return available_gpu_memory
+
+    @property
+    def available_gpu_memory(self) -> int:
+        return self.get_gpu_memory()
 
     def _run_device_benchmark(self):
         """Populate _device_info/_device_benchmark once. Safe to call again
