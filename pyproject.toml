@@ -44,6 +44,7 @@ graphviz = "^0.20"
 torchviz = "^0.0.2"
 multiprocess = "^0.70"
 pydantic = "^2.9"
+sentence-transformers = "^6.2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
