@@ -3,7 +3,8 @@
     "trusted": false,
     "hosted_modules": true,
     "max_memory_gb": 0,
-    "max_module_gb": 0.5
+    "max_module_gb": 0.5,
+    "benchmark": false
   },
   "node": {
     "type": "worker",
