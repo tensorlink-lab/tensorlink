@@ -1,3 +1,7 @@
+import gc
+
+import torch
+
 from tensorlink.ml.utils.gpu_benchmark import (
     get_gpu_info,
     benchmark_matmul,
@@ -145,7 +149,7 @@ class Torchnode(Smartnode):
 
         # Available GPU mpc estimation
         self._max_memory_gb = max_memory_gb
-        self.total_gpu_memory = self.available_gpu_memory
+        self.total_gpu_memory = self._get_total_gpu_memory()
         self.available_ram = psutil.virtual_memory().available
 
         # Device info
@@ -153,11 +157,12 @@ class Torchnode(Smartnode):
         self._device_benchmark = _device_benchmark
         self._device_benchmarked_at = time.time() if _device_info is not None else None
 
-        threading.Thread(
-            target=self._run_device_benchmark,
-            name="_device_benchmark",
-            daemon=True,
-        ).start()
+        if _device_info is None:
+            threading.Thread(
+                target=self._run_device_benchmark,
+                name="_device_benchmark",
+                daemon=True,
+            ).start()
 
         self._mpc_comms = None
         self.memory_manager = {}
@@ -168,6 +173,18 @@ class Torchnode(Smartnode):
         self.master = False
         self.training = False
         self.mpc_terminate_flag = threading.Event()
+
+    def _get_total_gpu_memory(self) -> int:
+        if torch.cuda.is_available():
+            total = sum(
+                torch.cuda.mem_get_info(d)[1] for d in range(torch.cuda.device_count())
+            )
+        else:
+            total = psutil.virtual_memory().total
+
+        if self._max_memory_gb is not None and self._max_memory_gb > 0:
+            total = min(total, int(self._max_memory_gb * 1e9))
+        return int(total)
 
     def handle_data(self, data: bytes, node: Connection):
         try:
@@ -1224,6 +1241,9 @@ class Torchnode(Smartnode):
                     "compute": benchmark_matmul(),
                     "memory": benchmark_memory_bandwidth(),
                 }
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             self._device_benchmarked_at = time.time()
 
