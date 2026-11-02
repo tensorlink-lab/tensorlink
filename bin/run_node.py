@@ -224,6 +224,7 @@ def main():
 
     max_memory_gb = config.get("ml", {}).get("max_memory_gb")
     max_module_gb = config.get("ml", {}).get("max_module_gb")
+    benchmark = config.get("ml", {}).get("benchmark", True)
     enable_hosting = True
 
     # Parse common config
@@ -256,6 +257,7 @@ def main():
             ),
             trusted=trusted,
             utilization=True,
+            benchmark=benchmark,
         )
         run_worker_loop(worker, config)
 
@@ -277,6 +279,7 @@ def main():
             trusted=trusted,
             enable_hosting=enable_hosting,
             max_module_gb=max_module_gb,
+            benchmark=benchmark,
         )
         run_validator_loop(validator)
 

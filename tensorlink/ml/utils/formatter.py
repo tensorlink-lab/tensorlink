@@ -1,9 +1,57 @@
 from typing import Dict, Any, Optional
 import json
+
+import logging
 import time
 import re
 
+from tensorlink.ml.utils.limits import (
+    DEFAULT_MAX_NEW_TOKENS,
+    MIN_GENERATION_TOKENS,
+    ContextLengthError,
+    InvalidGenerationParameter,
+    resolve_context_window,
+)
 from tensorlink.ml.utils.reasoning import REASONING_FIELD
+
+
+def _fit_generation_budget(
+    requested: Optional[int], prompt_tokens: Optional[int], window: int
+) -> int:
+    """
+    The model response budget (max_new_tokens), always bounded.
+    """
+    wanted = requested if requested is not None else DEFAULT_MAX_NEW_TOKENS
+    if prompt_tokens is None:
+        return wanted
+
+    available = window - prompt_tokens
+    if available < MIN_GENERATION_TOKENS:
+        raise ContextLengthError(
+            f"This model's maximum context length is {window} tokens, but the "
+            f"prompt alone is {prompt_tokens} tokens, leaving {max(available, 0)} "
+            f"for the reply. Please shorten the messages."
+        )
+    if wanted > available:
+        logging.info(
+            f"Reduced max_new_tokens from {wanted} to {available} to fit the "
+            f"{window}-token context window"
+        )
+        return available
+    return wanted
+
+
+def _infer_do_sample(temperature, top_p) -> Optional[bool]:
+    """
+    OpenAI convention: temperature 0 means greedy decoding, a positive temperature
+    (or a top_p below 1) means sample. None means the client expressed no preference,
+    so leave the model's default.
+    """
+    if temperature is not None:
+        return temperature > 0
+    if top_p is not None and top_p < 1.0:
+        return True
+    return None
 
 
 def normalize_generate_args(
@@ -14,10 +62,14 @@ def normalize_generate_args(
     allowed_generate_args: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
-    Normalize and validate generation arguments without injecting defaults.
-    Only user-provided, non-None values are included.
-    """
+    Normalize and validate generation arguments.
 
+    Sampling arguments are passed through only when the client provided them.
+    The reply budget (max_new_tokens) is the exception: it is always present and
+    always bounded by the model's context window (see _fit_generation_budget).
+    ``model_max_length`` should be the resolved context window; if omitted it is
+    derived from the tokenizer.
+    """
     # Token IDs
     pad_token_id = tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id
@@ -36,49 +88,34 @@ def normalize_generate_args(
         eos_token_id = min(eos_token_id, vocab_size - 1)
 
     if model_max_length is None:
-        model_max_length = getattr(tokenizer, "model_max_length", 2048)
-        if model_max_length > 1_000_000:
-            model_max_length = 2048
+        model_max_length = resolve_context_window(tokenizer).tokens
 
     args: Dict[str, Any] = {
         "pad_token_id": pad_token_id,
         "eos_token_id": eos_token_id,
     }
 
-    # max_new_tokens
     max_new_tokens = getattr(request, "max_new_tokens", None)
-    if max_new_tokens is not None:
-        if max_new_tokens < 1:
-            raise ValueError("max_new_tokens must be >= 1")
+    if max_new_tokens is not None and max_new_tokens < 1:
+        raise InvalidGenerationParameter("max_new_tokens must be >= 1")
 
-        if prompt_tokens is not None:
-            available_space = model_max_length - prompt_tokens
-            if available_space < 10:
-                raise ValueError(
-                    f"Prompt is too long ({prompt_tokens} tokens). "
-                    f"Model max length is {model_max_length}, leaving only "
-                    f"{available_space} tokens for generation."
-                )
-            if max_new_tokens > available_space:
-                original = max_new_tokens
-                max_new_tokens = available_space
-                print(
-                    f"Reduced max_new_tokens from {original} to {max_new_tokens} "
-                    f"to fit model limit ({model_max_length})"
-                )
+    args["max_new_tokens"] = _fit_generation_budget(
+        max_new_tokens, prompt_tokens, model_max_length
+    )
 
-        args["max_new_tokens"] = max_new_tokens
+    # temp
+    temperature = getattr(request, "temperature", None)
+    top_p = getattr(request, "top_p", None)
 
-    # do_sample
+    # do sample
     do_sample = getattr(request, "do_sample", None)
+    if do_sample is None:
+        do_sample = _infer_do_sample(temperature, top_p)
     if do_sample is not None:
         do_sample = bool(do_sample)
         args["do_sample"] = do_sample
-    else:
-        do_sample = None
 
     # temperature
-    temperature = getattr(request, "temperature", None)
     if temperature is not None and do_sample:
         temperature = max(0.01, min(float(temperature), 2.0))
         args["temperature"] = temperature
@@ -87,9 +124,8 @@ def normalize_generate_args(
     num_beams = getattr(request, "num_beams", None)
     if num_beams is not None:
         if num_beams < 1:
-            raise ValueError("num_beams must be >= 1")
+            raise InvalidGenerationParameter("num_beams must be >= 1")
         args["num_beams"] = num_beams
-
     if do_sample and num_beams and num_beams > 1:
         print(
             f"do_sample=True incompatible with num_beams={num_beams}, "
@@ -98,7 +134,6 @@ def normalize_generate_args(
         args["num_beams"] = 1
 
     # top_p
-    top_p = getattr(request, "top_p", None)
     if top_p is not None and do_sample:
         top_p = max(0.0, min(float(top_p), 1.0))
         if top_p < 1.0:

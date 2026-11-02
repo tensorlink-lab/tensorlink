@@ -149,9 +149,6 @@ class WorkerThread(Torchnode):
 
                     self.modules[module_id] = module_info
 
-                    # Update available memory
-                    self.available_gpu_memory -= module_size
-
                 else:
                     data = b"DECLINE-JOB"
 

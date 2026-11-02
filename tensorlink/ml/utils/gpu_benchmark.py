@@ -1,3 +1,4 @@
+import gc
 import time
 import psutil
 import torch
@@ -60,7 +61,7 @@ def _profile_matches_current_hardware(cached: Dict, current_info: Dict) -> bool:
     )
 
 
-def run_device_benchmark(force: bool = False) -> Tuple[Dict, Optional[Dict]]:
+def run_device_benchmark(force: bool = True) -> Tuple[Dict, Optional[Dict]]:
     """
     Run device detection + compute/bandwidth benchmark once, in the main
     process, caching the result to disk so subsequent startups on the
@@ -80,10 +81,15 @@ def run_device_benchmark(force: bool = False) -> Tuple[Dict, Optional[Dict]]:
 
     device_benchmark = None
     if current_info.get("available"):
+        compute = benchmark_matmul()
+        memory = benchmark_memory_bandwidth()
         device_benchmark = {
-            "compute": benchmark_matmul(),
-            "memory": benchmark_memory_bandwidth(),
+            "compute": compute,
+            "memory": memory,
         }
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     _save_profile(current_info, device_benchmark)
     return current_info, device_benchmark

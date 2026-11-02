@@ -11,8 +11,10 @@ from huggingface_hub import snapshot_download, model_info
 from safetensors import safe_open
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from filelock import FileLock
+from functools import lru_cache
 import torch.nn as nn
 import torch
+import json
 import logging
 import shutil
 import threading
@@ -158,19 +160,43 @@ class ModelCacheManager:
                 break
 
 
-def _iter_safetensor_keys(model_path: str):
-    """Yield all weight keys from safetensors shards (or .bin as fallback)."""
-    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+@lru_cache(maxsize=4)
+def _weight_keys(model_path: str) -> tuple:
+    """
+    Return every weight key in the checkpoint at *model_path*, across all shards.
+
+    Prefers the HF shard index (a single small JSON file). Otherwise reads the
+    header of every shard (safe_open does not load tensor data).
+    """
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(model_path, index_name)
+        if os.path.exists(index_path):
+            with open(index_path, "r") as f:
+                return tuple(json.load(f)["weight_map"].keys())
+
+    keys: List[str] = []
+    safetensor_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
     if safetensor_files:
         for shard_path in safetensor_files:
             with safe_open(shard_path, framework="pt", device="cpu") as f:
-                yield from f.keys()
-            return
-    else:
-        bin_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
-        if bin_files:
-            shard = torch.load(bin_files[0], map_location="cpu")
-            yield from shard.keys()
+                keys.extend(f.keys())
+        return tuple(keys)
+
+    for bin_path in sorted(glob.glob(os.path.join(model_path, "pytorch_model*.bin"))):
+        try:
+            shard = torch.load(
+                bin_path, map_location="cpu", mmap=True, weights_only=True
+            )
+        except Exception:
+            shard = torch.load(bin_path, map_location="cpu")
+        keys.extend(shard.keys())
+        del shard
+    return tuple(keys)
+
+
+def _iter_safetensor_keys(model_path: str):
+    """Yield all weight keys from every shard (kept for backwards compatibility)."""
+    yield from _weight_keys(model_path)
 
 
 def resolve_weight_prefix(model_path: str, module_path: str) -> Optional[str]:
@@ -191,21 +217,13 @@ def resolve_weight_prefix(model_path: str, module_path: str) -> Optional[str]:
       - "" only when *module_path* itself denotes the whole model (i.e. an
         explicit root-load request: module_path in ("", "model")).
       - the matched prefix string on a normal match.
-      - None when nothing matched at all, or the shard scan failed. This is
-        NOT the same as "", it means "this module has no entries of its
-        own in the weight files" (e.g. RotaryEmbedding, whose buffers are
-        computed at init time rather than loaded), and callers must treat
-        it as "skip loading weights for this module", never as "load
-        everything".
+      - None when nothing matched at all, or the shard scan failed.
     """
     if module_path in ("", "model"):
         return ""
 
-    sampled: List[str] = []
     try:
-        for key in _iter_safetensor_keys(model_path):
-            sampled.append(key)
-
+        sampled = _weight_keys(model_path)
     except Exception:
         return None
 
@@ -407,12 +425,9 @@ def load_module_weights(
     prefix = resolve_weight_prefix(model_path, module_path)
 
     if prefix is None:
-        warn_fn(
-            f"Could not resolve weight prefix for '{module_path}' - "
-            f"falling back to full scan. Module may load with missing keys."
-        )
-        # Last resort: load everything and let load_state_dict filter
-        state_dict = _fallback_full_scan(model_path, module_path, log_fn, warn_fn)
+        # No entries of its own in the weight files. Skip weight loading.
+        log_fn(f"No weight-file entries for '{module_path}', skipping weight load")
+        state_dict = {}
     else:
         log_fn(f"Resolved prefix '{prefix}' for module '{module_path}'")
         state_dict = _load_tensors_from_shards(model_path, prefix, log_fn)
@@ -480,13 +495,23 @@ def load_grouped_module_weights(
             warn_fn(f"Could not resolve prefix for layer '{lp}', will skip")
         resolved.append(prefix)
 
-    safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    unresolved = [lp for lp, p in zip(layer_paths, resolved) if p is None]
+    if unresolved:
+        # A skipped layer would be left with uninitialized weights. Fail loudly.
+        raise RuntimeError(
+            f"Could not resolve weights for {len(unresolved)}/{len(layer_paths)} "
+            f"layers (e.g. {unresolved[:3]}) in {model_path}"
+        )
+
+    safetensor_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
     if not safetensor_files:
         raise RuntimeError(
             f"No safetensors found in {model_path} for grouped layer loading"
         )
 
-    target_module = target_module.to_empty(device="cpu")
+    # Materialise straight on the target device; each shard's tensors are copied
+    # in by load_state_dict, so there is no full-model CPU staging copy.
+    target_module = target_module.to_empty(device=device)
 
     loaded_keys: List[str] = []
     missing_keys_set = set(target_module.state_dict().keys())
@@ -516,8 +541,16 @@ def load_grouped_module_weights(
             del shard_state_dict
             gc.collect()
 
+    missing_layer_keys = sorted(k for k in missing_keys_set if k.startswith("layers."))
+    if missing_layer_keys:
+        raise RuntimeError(
+            f"{len(missing_layer_keys)} layer weights were not loaded "
+            f"(e.g. {missing_layer_keys[:3]})"
+        )
     if missing_keys_set:
-        warn_fn(f"Missing keys after grouped load: {missing_keys_set}")
+        warn_fn(
+            f"Missing non-layer keys after grouped load: {sorted(missing_keys_set)}"
+        )
 
     log_fn(
         f"Loaded {len(loaded_keys)} tensors across "
@@ -543,14 +576,10 @@ def _fallback_full_scan(
     warn_fn(f"Full scan fallback for '{module_path}'")
 
     # Reuse the same candidate logic as resolve_weight_prefix
-    sampled: List[str] = []
     try:
-        for key in _iter_safetensor_keys(model_path):
-            sampled.append(key)
-            if len(sampled) >= 256:
-                break
+        sampled = _weight_keys(model_path)
     except Exception:
-        pass
+        sampled = ()
 
     matched_prefix = ""
     parts = module_path.split(".")
@@ -559,6 +588,12 @@ def _fallback_full_scan(
         if any(key.startswith(candidate + ".") for key in sampled):
             matched_prefix = candidate
             break
+
+    if not matched_prefix:
+        raise ValueError(
+            f"No weight-file prefix matches '{module_path}'; refusing to load the "
+            f"entire checkpoint into host memory."
+        )
 
     state_dict: Dict[str, torch.Tensor] = {}
     safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))

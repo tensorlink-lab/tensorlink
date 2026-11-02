@@ -4,6 +4,10 @@ from tensorlink.eth.contract_manager import ContractManager
 from tensorlink.nodes.job_monitor import JobMonitor, JobStatus
 from tensorlink.nodes.keeper import Keeper
 from tensorlink.api.node import TensorlinkAPI
+from tensorlink.ml.utils.model_info import (
+    sanitize_context_length,
+    sanitize_generation_defaults,
+)
 
 from dotenv import get_key
 from typing import Dict
@@ -333,7 +337,8 @@ class ValidatorThread(Torchnode):
                 "get_jobs": self._handle_get_jobs,
                 "check_job_status": self._handle_check_job,
                 "check_token": self._handle_check_token,
-                "update_job_status": self._handle_update_job,
+                "update_job": self._handle_update_job,
+                "update_job_status": self._handle_update_job,  # legacy alias
                 "update_stream": self._handle_update_stream,
                 "send_job_request": self.create_base_job,
                 "update_api_request": self._handle_update_api,
@@ -466,27 +471,79 @@ class ValidatorThread(Torchnode):
             self.response_queue.put({"status": "FAILURE", "error": str(e)})
 
     def _handle_check_job(self, request):
-        # Check if a job is still active
-        model_name, job_id = request
-
-        job_data = self.dht.query(job_id)
-        return_val = (
-            job_data.get("status", JobStatus.PENDING_OFFLINE) == JobStatus.ACTIVE
-        )
+        """Report whether a job is still active. Always puts exactly one response."""
+        return_val = False
+        try:
+            _model_name, job_id = request
+            job_data = self.dht.query(job_id)
+            # A missing DHT entry means the job is gone, so it is not active.
+            if isinstance(job_data, dict):
+                return_val = (
+                    job_data.get("status", JobStatus.PENDING_OFFLINE)
+                    == JobStatus.ACTIVE
+                )
+        except Exception as e:
+            # Fail open: an unexpected error here must not tear down a healthy
+            # model. The ML process will ask again on its next GC pass.
+            self.debug_print(
+                f"Error checking job status: {type(e).__name__}: {e}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="Validator",
+            )
+            return_val = True
 
         self.response_queue.put({"status": "SUCCESS", "return": return_val})
 
+    # Job fields other processes may change. "status" is additionally checked
+    # against JobStatus; the rest are metadata only the ML process can derive.
+    _JOB_UPDATABLE = {
+        "status",
+        "supports_reasoning",
+        "context_length",
+        "generation_defaults",
+    }
+
+    @staticmethod
+    def _clean_job_metadata(updates: dict) -> dict:
+        """
+        Sanitize the published model metadata. Unlike "status" (which rejects the
+        whole update if invalid), a malformed metadata value is dropped: a bad
+        number must never stop a model from going active.
+        """
+        clean = dict(updates)
+        if "context_length" in clean:
+            clean["context_length"] = sanitize_context_length(clean["context_length"])
+        if "generation_defaults" in clean:
+            clean["generation_defaults"] = sanitize_generation_defaults(
+                clean["generation_defaults"]
+            )
+        return {k: v for k, v in clean.items() if v is not None}
+
     def _handle_update_job(self, request):
-        job_id, loading_status = request
+        """
+        Universal job update: request = (job_id, {field: value, ...}).
+        Legacy form (job_id, "active") is treated as {"status": "active"}.
+        All-or-nothing: every field is validated before any is applied.
+        """
+        job_id, updates = request
+        if isinstance(updates, str):
+            updates = {"status": updates}
+
         job_data = self.dht.query(job_id)
 
-        response_status = "FAILURE"
-        if job_data:
-            if loading_status in JobStatus.values():
-                job_data["status"] = loading_status
-                response_status = "SUCCESS"
+        ok = isinstance(job_data, dict) and isinstance(updates, dict) and bool(updates)
+        if ok:
+            ok = set(updates) <= self._JOB_UPDATABLE
+        if ok and "status" in updates:
+            ok = updates["status"] in JobStatus.values()
 
-        self.response_queue.put({"status": response_status, "return": None})
+        if ok:
+            job_data.update(self._clean_job_metadata(updates))
+
+        self.response_queue.put(
+            {"status": "SUCCESS" if ok else "FAILURE", "return": None}
+        )
 
     def _handle_update_api(self, request: tuple):
         """Checks for and handles any API requests received"""
@@ -697,14 +754,17 @@ class ValidatorThread(Torchnode):
 
         if user_id and user_id != self.rsa_key_hash:
             # Check that user doesn't have an active job already
-            for job_id in self.jobs:
-                if job_id != job_data.get("id"):
-                    job_info = self.dht.query(job_id)
-                    if job_info.get("author") == user_id and job_info.get("status") in [
-                        JobStatus.INITIALIZING,
-                        JobStatus.ACTIVE,
-                    ]:
-                        return False
+            for job_id in list(self.jobs):
+                if job_id == job_data.get("id"):
+                    continue
+                job_info = self.dht.query(job_id)
+                if not isinstance(job_info, dict):
+                    continue
+                if job_info.get("author") == user_id and job_info.get("status") in [
+                    JobStatus.INITIALIZING,
+                    JobStatus.ACTIVE,
+                ]:
+                    return False
 
         return True
 

@@ -3,13 +3,15 @@ Generation machinery for TensorlinkAPI: request dispatch, SSE streaming, and the
 bridge between the FastAPI event loop and the ML thread.
 """
 
+import logging
+
 from tensorlink.api.models import (
     GenerationRequest,
     TextResponseRequest,
     ImageResponseRequest,
     EmbeddingResponseRequest,
 )
-from tensorlink.api.functions import build_generation_request
+from tensorlink.api.functions import build_text_request
 from tensorlink.ml.utils.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import HTTPException
@@ -38,17 +40,28 @@ class GenerationMixin:
         gen_request.id = hash(f"req_{random.random()}")
 
         model_status = self._check_model_status(gen_request.hf_name)
-        if model_status["status"] == "not_loaded":
+        status = model_status["status"]
+
+        if status == "not_loaded":
             self._trigger_model_load(gen_request.hf_name)
             raise HTTPException(
                 status_code=503,
                 detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
             )
-
-        if model_status["status"] == "loading":
+        if status != "loaded":
+            # "loading" or "error": never dispatch to a model that isn't ready
             raise HTTPException(
-                status_code=503, detail=f"Model {gen_request.hf_name} is still loading."
+                status_code=503,
+                detail=model_status.get("message")
+                or f"Model {gen_request.hf_name} is still loading.",
             )
+
+        self.smart_node.debug_print(
+            f"Dispatching request: {gen_request}",
+            colour="bright_red",
+            level=logging.DEBUG,
+            tag="API",
+        )
 
         if gen_request.stream:
             return StreamingResponse(
@@ -61,7 +74,7 @@ class GenerationMixin:
         return {"text": gen_request.output}
 
     async def _handle_text_response(self, request: TextResponseRequest):
-        return await self._dispatch_text(build_generation_request(request))
+        return await self._dispatch_text(build_text_request(request))
 
     async def _handle_image_response(self, request: ImageResponseRequest):
         raise HTTPException(
@@ -70,7 +83,8 @@ class GenerationMixin:
 
     async def _handle_embedding_response(self, request: EmbeddingResponseRequest):
         raise HTTPException(
-            status_code=501, detail="Embeddings are not yet implemented."
+            status_code=501,
+            detail="Embeddings via /v1/responses are not implemented; use POST /v1/embeddings.",
         )
 
     def _log_model_request(self, model_name: str):

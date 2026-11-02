@@ -6,17 +6,21 @@ from tensorlink.api.models import (
     ModelStatusResponse,
     ModelStatusDistributionResponse,
     ModelDistributionEntry,
+    EmbeddingCreateRequest,
 )
-from tensorlink.api.functions import build_hf_job_data, build_generation_request
+from tensorlink.api.functions import build_hf_job_data, build_text_request
+from tensorlink.ml.utils.model_types import ModelType
 from tensorlink.api.generation import GenerationMixin
+from tensorlink.api.embeddings import EmbeddingMixin
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from threading import Thread
+import traceback
 import logging
 import uvicorn
 import asyncio
 
 
-class TensorlinkAPI(GenerationMixin):
+class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
     """
     Supports API requests to request and interact with models, along with
     probing node & job information.
@@ -31,6 +35,7 @@ class TensorlinkAPI(GenerationMixin):
         self.server_loop = None
 
         self._init_generation_state()
+        self._init_embedding_state()
         self._define_routes()
         self._start_server()
 
@@ -43,169 +48,292 @@ class TensorlinkAPI(GenerationMixin):
         self.app.include_router(self.router)
 
     def _register_generate_routes(self):
-        @self.router.post("/v1/chat/completions")
-        async def chat_completions(request: ChatCompletionRequest):
-            try:
-                return await self._dispatch_text(build_generation_request(request))
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+        """Register text, embedding and multi-modal generation endpoints"""
+        routes = (
+            ("/v1/chat/completions", self._route_chat_completions, "chat_completions"),
+            ("/v1/embeddings", self._route_embeddings, "embeddings"),
+            ("/v1/responses", self._route_responses, "responses"),
+        )
+        for path, endpoint, name in routes:
+            self.router.add_api_route(path, endpoint, methods=["POST"], name=name)
 
-        @self.router.post("/v1/responses")
-        async def responses(request: AnyResponseRequest):
-            handlers = {
-                "text": self._handle_text_response,
-                "image": self._handle_image_response,
-                "embedding": self._handle_embedding_response,
-            }
-            handler = handlers.get(request.type)
-            if not handler:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Unsupported response type: '{request.type}'",
-                )
-            try:
-                return await handler(request)
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+    async def _guarded(self, call):
+        try:
+            return await call()
+        except HTTPException as e:
+            self.smart_node.debug_print(
+                f"HTTP {e.status_code}: {e.detail}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="API",
+            )
+            raise
+        except Exception as e:
+            self.smart_node.debug_print(
+                f"unhandled {type(e).__name__}: {e}\n{traceback.format_exc()}",
+                colour="bright_red",
+                level=logging.ERROR,
+                tag="API",
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def _route_chat_completions(self, request: ChatCompletionRequest):
+        return await self._guarded(
+            lambda: self._dispatch_text(build_text_request(request))
+        )
+
+    async def _route_embeddings(self, request: EmbeddingCreateRequest):
+        return await self._guarded(
+            lambda: self._dispatch_embedding(
+                request.model,
+                request.input,
+                request.encoding_format,
+                request.dimensions,
+            )
+        )
+
+    async def _route_responses(self, request: AnyResponseRequest):
+        handlers = {
+            "text": self._handle_text_response,
+            "image": self._handle_image_response,
+            "embedding": self._handle_embedding_response,
+        }
+        handler = handlers.get(request.type)
+        if not handler:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported response type: '{request.type}'",
+            )
+        return await self._guarded(lambda: handler(request))
 
     def _register_model_routes(self):
         """Register model management endpoints"""
+        self.router.add_api_route(
+            "/v1/models/request",
+            self._route_request_model,
+            methods=["POST"],
+            response_model=ModelStatusResponse,
+            name="request_model_v1",
+        )
+        self.router.add_api_route(
+            "/v1/models/status",
+            self._route_model_status,
+            methods=["GET"],
+            response_model=ModelStatusDistributionResponse,
+            name="get_model_status_v1",
+        )
+        self.router.add_api_route(
+            "/v1/models/demand",
+            self._route_model_demand,
+            methods=["GET"],
+            name="get_api_demand_stats_v1",
+        )
+        self.router.add_api_route(
+            "/v1/models/available",
+            self._route_available_models,
+            methods=["GET"],
+            name="list_available_models_v1",
+        )
 
-        @self.router.post("/v1/models/request", response_model=ModelStatusResponse)
-        def request_model_v1(job_request: JobRequest, request: Request):
-            """
-            Request a model to be loaded on the network.
+    def _route_request_model(self, job_request: JobRequest, request: Request):
+        """
+        Request a model to be loaded on the network.
 
-            Status values in response:
-              - active: validator and workers have fully loaded the model
-              - initializing: worker(s) are currently loading their assigned modules
-              - inactive: model not found / request rejected
-            """
-            try:
-                client_ip = request.client.host
-                model_name = job_request.hf_name
+        Status values in response:
+          - active: validator and workers have fully loaded the model
+          - initializing: worker(s) are currently loading their assigned modules
+          - inactive: model not found / request rejected
+        """
+        model_name = job_request.hf_name
+        try:
+            # Mark this model as API-requested for prioritization (also when a job
+            # already exists, so repeat requests keep it prioritized)
+            self.api_requested_models.add(model_name)
 
-                # Mark this model as API-requested for prioritization
-                self.api_requested_models.add(model_name)
-
-                # Check if a job already exists for this model
-                _job_id, job_data = self._find_job_for_model(model_name)
-
-                if job_data is not None:
-                    # Job exists, get status from distribution
-                    status_info = self._derive_status_from_job(job_data)
-                    return ModelStatusResponse(
-                        model=model_name,
-                        status=status_info["status"],
-                        message=status_info["message"],
-                    )
-
-                # No existing job, create one
-                job_data_req = build_hf_job_data(
-                    model_name=model_name,
-                    author=self.smart_node.rsa_key_hash,
-                    payment=job_request.payment,
-                    duration=job_request.time,
-                    model_type=job_request.model_type,
-                )
-
-                result = self.smart_node.create_hf_job(job_data_req, client_ip)
-
-                if result is False:
-                    # Job creation was immediately rejected (e.g. rate-limited)
-                    self.api_requested_models.discard(model_name)
-                    return ModelStatusResponse(
-                        model=model_name,
-                        status="inactive",
-                        message=f"Model {model_name} request was rejected.",
-                    )
-
-                # model initializing
+            # Check if a job already exists for this model
+            _job_id, job_data = self._find_job_for_model(model_name)
+            if job_data is not None:
+                status_info = self._derive_status_from_job(job_data)
                 return ModelStatusResponse(
                     model=model_name,
-                    status="initializing",
-                    message=f"Model {model_name} is initializing.",
-                )
-
-            except Exception as e:
-                logging.error(f"Error in /v1/models/request: {e}")
-                return ModelStatusResponse(
-                    model=job_request.hf_name,
-                    status="inactive",
-                    message=f"Error requesting model: {str(e)}",
-                )
-
-        @self.router.get(
-            "/v1/models/status", response_model=ModelStatusDistributionResponse
-        )
-        def get_model_status_v1(
-            model: str = Query(..., description="HuggingFace model name")
-        ):
-            """
-            Check the loading status of a specific model, including per-module
-            distribution across workers.
-
-            Status values:
-              - active: all offloaded modules are fully loaded
-              - initializing: at least one offloaded module is still loading
-              - inactive: no job found for this model
-            """
-            try:
-                _job_id, job_data = self._find_job_for_model(model)
-
-                if job_data is None:
-                    return ModelStatusDistributionResponse(
-                        model_name=model,
-                        status="inactive",
-                        message="Model not found.",
-                        distribution=None,
-                    )
-
-                distribution = self._build_distribution_info(job_data)
-                status_info = self._derive_status_from_distribution(distribution)
-
-                return ModelStatusDistributionResponse(
-                    model_name=model,
                     status=status_info["status"],
                     message=status_info["message"],
-                    distribution=distribution,
                 )
 
-            except Exception as e:
-                logging.error(f"Error in /v1/models/status: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-
-        @self.router.get("/v1/models/demand")
-        async def get_api_demand_stats_v1(
-            days: int = Query(30, ge=1, le=90),
-            limit: int = Query(10, ge=1, le=50),
-        ):
-            """Return current API demand statistics"""
-            return get_popular_model_stats(days=days, limit=limit)
-
-        @self.router.get("/v1/models/available")
-        def list_available_models_v1():
-            """List all currently active (fully loaded) models"""
-            try:
-                jobs = [self.smart_node.dht.query(a) for a in self.smart_node.jobs]
-                public_models = set(
-                    [
-                        j.get("model_name")
-                        for j in jobs
-                        if isinstance(j, dict) and j.get("public") and j.get("active")
-                    ]
+            # No existing job, create one
+            if not self._submit_model_job(
+                model_name,
+                job_request.model_type,
+                payment=job_request.payment,
+                duration=job_request.time,
+                client_ip=request.client.host,
+            ):
+                # Job creation was immediately rejected (e.g. rate-limited)
+                return ModelStatusResponse(
+                    model=model_name,
+                    status="inactive",
+                    message=f"Model {model_name} request was rejected.",
                 )
 
-                return {
-                    "active_models": list(public_models),
-                }
+            return ModelStatusResponse(
+                model=model_name,
+                status="initializing",
+                message=f"Model {model_name} is initializing.",
+            )
 
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logging.error(f"Error in /v1/models/request: {e}")
+            return ModelStatusResponse(
+                model=model_name,
+                status="inactive",
+                message=f"Error requesting model: {str(e)}",
+            )
+
+    def _submit_model_job(
+        self,
+        model_name: str,
+        model_type: ModelType = ModelType.CHAT,
+        *,
+        payment: int = 0,
+        duration: int = 0,
+        client_ip: str = None,
+    ) -> bool:
+        """
+        The single way the API asks the network to host a model.
+
+        Marks the model as API-requested (for prioritisation), builds the hosted
+        job and submits it. Returns False if the job was rejected outright (e.g.
+        rate-limited), in which case the prioritisation mark is undone. Callers
+        decide how to report that: an HTTP status, a 503, or just a log line.
+        """
+        self.api_requested_models.add(model_name)
+        job_data = build_hf_job_data(
+            model_name=model_name,
+            author=self.smart_node.rsa_key_hash,
+            model_type=model_type,
+            payment=payment,
+            duration=duration,
+        )
+        args = (job_data,) if client_ip is None else (job_data, client_ip)
+        if self.smart_node.create_hf_job(*args) is False:
+            self.api_requested_models.discard(model_name)
+            return False
+        return True
+
+    def _route_model_status(
+        self, model: str = Query(..., description="HuggingFace model name")
+    ):
+        """
+        Check the loading status of a specific model, including per-module
+        distribution across workers.
+
+        Status values:
+          - active: all offloaded modules are fully loaded
+          - initializing: at least one offloaded module is still loading
+          - inactive: no job found for this model
+        """
+        try:
+            _job_id, job_data = self._find_job_for_model(model)
+
+            if job_data is None:
+                return ModelStatusDistributionResponse(
+                    model_name=model,
+                    status="inactive",
+                    message="Model not found.",
+                    distribution=None,
+                )
+
+            distribution = self._build_distribution_info(job_data)
+            status_info = self._derive_status_from_job(job_data, distribution)
+
+            return ModelStatusDistributionResponse(
+                model_name=model,
+                status=status_info["status"],
+                message=status_info["message"],
+                distribution=distribution,
+            )
+
+        except Exception as e:
+            logging.error(f"Error in /v1/models/status: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @staticmethod
+    async def _route_model_demand(
+        days: int = Query(30, ge=1, le=90),
+        limit: int = Query(10, ge=1, le=50),
+    ):
+        """Return current API demand statistics"""
+        return get_popular_model_stats(days=days, limit=limit)
+
+    def _route_available_models(self):
+        """List currently active models with their published metadata"""
+        try:
+            models = self._collect_available_models()
+            return {
+                "active_models": list(models),  # unchanged, for existing clients
+                "models": list(models.values()),
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def _collect_available_models(self) -> dict:
+        """Map model name -> model info (public, ready jobs)."""
+        models = {}
+        for job_id in list(self.smart_node.jobs):
+            job = self.smart_node.dht.query(job_id)
+            if not (
+                isinstance(job, dict) and job.get("public") and self._is_job_ready(job)
+            ):
+                continue
+            name = job.get("model_name")
+            entry = models.setdefault(
+                name,
+                {
+                    "name": name,
+                    "type": "text",
+                    "supports_reasoning": None,
+                    "context_length": None,  # null = unknown (older node / no metadata)
+                    "generation_defaults": None,
+                },
+            )
+            self._apply_job_capabilities(entry, job)
+        return models
+
+    @staticmethod
+    def _is_job_ready(job) -> bool:
+        """Not terminated, and the ML process has finished loading the model."""
+        return bool(
+            isinstance(job, dict)
+            and job.get("active")
+            and job.get("status") == "active"  # JobStatus.ACTIVE
+        )
+
+    @staticmethod
+    def _is_public_active_job(job) -> bool:
+        return bool(isinstance(job, dict) and job.get("public") and job.get("active"))
+
+    @staticmethod
+    def _apply_job_capabilities(entry: dict, job: dict):
+        if job.get("model_type") == "embedding":
+            entry["type"] = "embedding"
+            entry["supports_reasoning"] = False
+        elif job.get("supports_reasoning") is not None:  # null = unknown
+            entry["supports_reasoning"] = job["supports_reasoning"]
+
+        TensorlinkAPI._merge_job_metadata(entry, job)
+
+    @staticmethod
+    def _merge_job_metadata(entry: dict, job: dict):
+        """
+        Several jobs can serve one model. Advertise the smallest context window
+        among them (the only one every request can rely on); defaults: last wins.
+        """
+        length = job.get("context_length")
+        if length is not None:
+            known = entry["context_length"]
+            entry["context_length"] = length if known is None else min(known, length)
+        if job.get("generation_defaults") is not None:
+            entry["generation_defaults"] = job["generation_defaults"]
 
     def _register_stats_routes(self):
         """Register statistics and monitoring endpoints"""
@@ -276,19 +404,29 @@ class TensorlinkAPI(GenerationMixin):
         """
         Search for an active, API-hosted job matching model_name.
 
+        Prefers a ready job over one that is still loading, so a second job for the
+        same model can't mask one that is already serving.
+
         Returns (job_id, job_data) if found, else (None, None).
         """
         try:
-            for job_id in self.smart_node.jobs:
+            first_match = (None, None)
+            for job_id in list(self.smart_node.jobs):
                 job_data = self.smart_node.dht.query(job_id)
-                if (
+                if not (
                     isinstance(job_data, dict)
                     and job_data.get("model_name", "") == model_name
                     and job_data.get("hosted")
                     and job_data.get("api")
                     and job_data.get("active")
+                    and not job_data.get("end_time")  # only _cleanup_job sets this
                 ):
+                    continue
+                if self._is_job_ready(job_data):
                     return job_id, job_data
+                if first_match[0] is None:
+                    first_match = (job_id, job_data)
+            return first_match
         except Exception as e:
             logging.error(f"Error finding job for model '{model_name}': {e}")
         return None, None
@@ -343,7 +481,8 @@ class TensorlinkAPI(GenerationMixin):
 
         return distribution
 
-    def _derive_status_from_distribution(self, distribution: dict) -> dict:
+    @staticmethod
+    def _derive_status_from_distribution(distribution: dict) -> dict:
         """
         Derive model status from the built distribution map.
 
@@ -372,51 +511,67 @@ class TensorlinkAPI(GenerationMixin):
                 "message": "Model is initializing, workers are loading their assigned modules.",
             }
 
-    def _derive_status_from_job(self, job_data: dict) -> dict:
-        """Convenience wrapper: build distribution then derive status."""
-        distribution = self._build_distribution_info(job_data)
-        return self._derive_status_from_distribution(distribution)
+    def _derive_status_from_job(
+        self, job_data: dict, distribution: dict = None
+    ) -> dict:
+        """
+        Convenience wrapper: build distribution then derive status.
+
+        Status shown to clients. "active" requires both:
+          * all offloaded modules loaded on their workers, and
+          * the ML process having marked the job ready (_is_job_ready).
+        """
+        if distribution is None:
+            distribution = self._build_distribution_info(job_data)
+
+        status_info = self._derive_status_from_distribution(distribution)
+        if status_info["status"] == "active" and not self._is_job_ready(job_data):
+            return {
+                "status": "initializing",
+                "message": "Model is initializing, the validator is finishing setup.",
+            }
+        return status_info
 
     def _check_model_status(self, model_name: str) -> dict:
         """
-        [Legacy] Check if a model is loaded, loading, or not loaded.
-        Returns a dict with 'status' and 'message'.
-        """
-        status = "not_loaded"
-        message = "Model is not currently loaded"
+        Status used by the generation endpoints.
 
+          not_loaded : no live job for this model
+          loading    : a job exists but the ML process has not marked it ready
+          loaded     : job is ready to serve requests
+          error      : the check itself failed
+        """
         try:
-            # Check if there is a public job with this module
-            for job_id in self.smart_node.jobs:
-                job_data = self.smart_node.dht.query(job_id)
-                if (
-                    isinstance(job_data, dict)
-                    and job_data.get("model_name", "") == model_name
-                    and job_data.get("hosted")
-                    and job_data.get("api")
-                    and job_data.get("active")
-                ):
-                    status = "loaded"
-                    message = f"Model {model_name} is loaded and ready"
-                    break
+            _job_id, job_data = self._find_job_for_model(model_name)
+
+            if job_data is None:
+                return {
+                    "status": "not_loaded",
+                    "message": "Model is not currently loaded",
+                }
+
+            if self._is_job_ready(job_data):
+                return {
+                    "status": "loaded",
+                    "message": f"Model {model_name} is loaded and ready",
+                }
+
+            return {
+                "status": "loading",
+                "message": f"Model {model_name} is still loading.",
+            }
 
         except Exception as e:
             logging.error(f"Error checking model status: {e}")
-            status = "error"
-            message = f"Error checking model status: {str(e)}"
-
-        return {"status": status, "message": message}
+            return {
+                "status": "error",
+                "message": f"Error checking model status: {str(e)}",
+            }
 
     def _trigger_model_load(self, model_name: str):
         """Trigger the ML validator to load a specific model"""
         try:
-            # Mark as API requested
-            self.api_requested_models.add(model_name)
-            job_data = build_hf_job_data(
-                model_name=model_name,
-                author=self.smart_node.rsa_key_hash,
-            )
-            self.smart_node.create_hf_job(job_data)
+            self._submit_model_job(model_name, ModelType.CHAT)
 
         except Exception as e:
             logging.error(f"Error triggering model load: {e}")

@@ -198,7 +198,9 @@ class LayerGroupModule(torch.nn.Module):
     ):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
-        self.parent_module = parent_module
+        object.__setattr__(
+            self, "parent_module", parent_module
+        )  # Make plain attribute (not registered child)
         self.input_vars = input_vars
         self.output_vars = output_vars
         self.loop_structure = loop_structure

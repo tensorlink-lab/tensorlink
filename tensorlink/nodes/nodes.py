@@ -139,15 +139,15 @@ class BaseNode:
             concurrent network operation. If False, runs synchronously.
 
         benchmark : bool, optional
-            If True, runs a computing benchmark and device info check.
+            If True, ignore any cached device profile and re-run the compute and
+            bandwidth benchmark at startup. If False, reuse the cached profile when
+            the hardware matches (benchmark still runs if no cache exists).
         """
         self.config = config
         self.trusted = trusted
         self.utilization = utilization
 
-        self.device_info, self.device_benchmark = (
-            run_device_benchmark() if benchmark else None
-        ), None
+        self.device_info, self.device_benchmark = run_device_benchmark(force=benchmark)
 
         # IPC primitives for communicating with the role process
         self.node_requests = mp.Queue()

@@ -79,7 +79,7 @@ def uwv_nodes(print_level, max_memory_gb, max_module_gb):
         ),
         benchmark=False,
     )
-
+    time.sleep(1)
     validator = Validator(
         config=ValidatorConfig(
             upnp=UPNP,
@@ -95,7 +95,7 @@ def uwv_nodes(print_level, max_memory_gb, max_module_gb):
         max_module_gb=max_module_gb,
         benchmark=False,
     )
-
+    time.sleep(1)
     worker = Worker(
         config=WorkerConfig(
             upnp=UPNP,
