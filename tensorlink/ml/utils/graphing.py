@@ -630,7 +630,20 @@ class ModelParser:
 
         out = model.get_output_embeddings()
         inp = model.get_input_embeddings()
-        if out is None or inp is None or out.weight.data_ptr() != inp.weight.data_ptr():
+        if out is None or inp is None:
+            return tied_embed_path, tied_lm_head_path
+
+        cfg = getattr(model, "config", None)
+        if getattr(cfg, "tie_word_embeddings", None) is False:
+            return tied_embed_path, tied_lm_head_path
+
+        w_out, w_in = out.weight, inp.weight
+        tied = w_out is w_in or (
+            not w_out.is_meta
+            and not w_in.is_meta
+            and w_out.data_ptr() == w_in.data_ptr()
+        )
+        if not tied:
             return tied_embed_path, tied_lm_head_path
 
         for name, mod in model.named_modules():

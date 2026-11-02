@@ -24,6 +24,7 @@ from tensorlink.utils.shared_memory import (
 
 import gc
 import json
+import traceback
 import logging
 import os
 import pickle
@@ -33,6 +34,16 @@ import torch
 import torch.amp as amp
 from typing import List, Dict, Any, Optional
 from transformers.generation.streamers import BaseStreamer
+
+
+def _clear_exception_frames(exc) -> None:
+    """Drop the frame locals an exception's traceback keeps alive (including
+    chained __cause__/__context__), so a failed load actually frees its GPU memory."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        traceback.clear_frames(exc.__traceback__)
+        exc = exc.__cause__ or exc.__context__
 
 
 def _create_layer_group_wrapper(
@@ -485,6 +496,7 @@ class DistributedWorker:
         training = module_info.get("training", False)
         our_id = module_info.get("assigned_workers")[0]
 
+        load_error = None
         try:
             file_name = module_id + our_id
 
@@ -538,15 +550,19 @@ class DistributedWorker:
             self.send_request("send_module_status", (module_id, "loaded"))
 
         except Exception as e:
+            load_error = str(e)
+            _clear_exception_frames(e)
+
+        if load_error is not None:
+            self.cleanup_memory()
             self.send_request(
                 "debug_print",
                 (
-                    f"DistributedWorker -> Module loading error: {e}",
+                    f"DistributedWorker -> Module loading error: {load_error}",
                     "red",
                     logging.ERROR,
                 ),
             )
-
             self.send_request("send_module_status", (module_id, "error"))
 
     def _initialize_module_from_config(

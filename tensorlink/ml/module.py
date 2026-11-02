@@ -60,6 +60,7 @@ from tensorlink.utils.shared_memory import (
 
 
 MAX_WAIT_TIME = 150
+MAX_REPLACEMENT_ATTEMPTS = 3
 
 
 def contains_offloaded(module: nn.Module):
@@ -1201,6 +1202,7 @@ class DistributedModel(nn.Module):
         If a worker fails to load a module, recruit a replacement from
         available workers and re-send the module.
         """
+        failed_workers: Dict[str, set] = {}  # module_id -> workers that failed it
         for module_id, module_info in offloaded_modules.items():
             waiting = True
             start_time = time.time()
@@ -1222,15 +1224,24 @@ class DistributedModel(nn.Module):
                     all_workers = self.send_request("get_workers", None)
                     current_worker = module_info["assigned_workers"][-1]
 
-                    # Find a candidate that isn't the failed worker
-                    replacement = next(
-                        (
-                            w
-                            for w in (all_workers or {})
-                            if w != current_worker
-                            and w not in module_info.get("assigned_workers", [])
-                        ),
-                        None,
+                    # Remember every worker that failed this module. assigned_workers[-1]
+                    # is overwritten below, so it cannot be used for this (that caused
+                    # A -> B -> A -> B ping-pong forever).
+                    tried = failed_workers.setdefault(module_id, set())
+                    tried.add(current_worker)
+
+                    # Only consider untried workers with enough free memory right now.
+                    required = module_info.get("memory", 0)
+                    candidates = {
+                        w: (stats or {}).get("gpu_memory", 0)
+                        for w, stats in (all_workers or {}).items()
+                        if w not in tried
+                    }
+                    candidates = {w: m for w, m in candidates.items() if m >= required}
+                    replacement = (
+                        max(candidates, key=candidates.get)
+                        if candidates and len(tried) <= MAX_REPLACEMENT_ATTEMPTS
+                        else None
                     )
 
                     if replacement:
@@ -1262,11 +1273,13 @@ class DistributedModel(nn.Module):
                         start_time = time.time()  # reset timeout for new worker
 
                     else:
-                        logging.error(
-                            f"No replacement worker available for module {module_id}. "
-                            f"Giving up."
+                        msg = (
+                            f"No replacement worker with >= {required / 1e9:.1f}GB free "
+                            f"for module {module_id} (already failed on {len(tried)} "
+                            f"worker(s)). Aborting job."
                         )
-                        waiting = False
+                        logging.error(msg)
+                        raise RuntimeError(msg)
 
                 elif time.time() - start_time >= MAX_WAIT_TIME:
                     logging.error(f"Timed out waiting for module {module_id} to load.")
