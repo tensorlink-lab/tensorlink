@@ -67,14 +67,9 @@ def _log_gpu_mem(tag: str) -> None:
         return
     free, total = torch.cuda.mem_get_info()
     print(
-        "[gpu_benchmark] %-22s free=%.2fGB used=%.2fGB total=%.2fGB "
-        "torch_reserved=%.2fGB torch_allocated=%.2fGB",
-        tag,
-        free / 1e9,
-        (total - free) / 1e9,
-        total / 1e9,
-        torch.cuda.memory_reserved() / 1e9,
-        torch.cuda.memory_allocated() / 1e9,
+        f"[gpu_benchmark] {tag} free={free / 1e9} used={(total - free) / 1e9}GB "
+        f"total={total / 1e9}GB torch_reserved={torch.cuda.memory_reserved() / 1e9}GB "
+        f"torch_allocated={torch.cuda.memory_allocated() / 1e9}GB"
     )
 
 
