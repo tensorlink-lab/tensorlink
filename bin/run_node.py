@@ -224,7 +224,7 @@ def main():
 
     max_memory_gb = config.get("ml", {}).get("max_memory_gb")
     max_module_gb = config.get("ml", {}).get("max_module_gb")
-    benchmark = config.get("ml", {}).get("benchmark", False)
+    benchmark = config.get("ml", {}).get("benchmark", True)
     enable_hosting = True
 
     # Parse common config

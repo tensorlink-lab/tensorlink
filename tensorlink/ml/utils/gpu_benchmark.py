@@ -61,6 +61,23 @@ def _profile_matches_current_hardware(cached: Dict, current_info: Dict) -> bool:
     )
 
 
+def _log_gpu_mem(tag: str) -> None:
+    """Log free/total/reserved/allocated VRAM for the current device (debug only)."""
+    if not torch.cuda.is_available():
+        return
+    free, total = torch.cuda.mem_get_info()
+    print(
+        "[gpu_benchmark] %-22s free=%.2fGB used=%.2fGB total=%.2fGB "
+        "torch_reserved=%.2fGB torch_allocated=%.2fGB",
+        tag,
+        free / 1e9,
+        (total - free) / 1e9,
+        total / 1e9,
+        torch.cuda.memory_reserved() / 1e9,
+        torch.cuda.memory_allocated() / 1e9,
+    )
+
+
 def run_device_benchmark(force: bool = True) -> Tuple[Dict, Optional[Dict]]:
     """
     Run device detection + compute/bandwidth benchmark once, in the main
@@ -73,21 +90,28 @@ def run_device_benchmark(force: bool = True) -> Tuple[Dict, Optional[Dict]]:
         If True, ignore any cached result and re-benchmark unconditionally.
     """
     current_info = get_gpu_info()
+    _log_gpu_mem("startup")
 
     if not force:
         cached = _load_cached_profile()
         if cached and _profile_matches_current_hardware(cached, current_info):
+            _log_gpu_mem("after cache hit")
             return cached["device_info"], cached["device_benchmark"]
 
     device_benchmark = None
     if current_info.get("available"):
+        compute = benchmark_matmul()
+        _log_gpu_mem("after matmul")
+        memory = benchmark_memory_bandwidth()
+        _log_gpu_mem("after bandwidth")
         device_benchmark = {
-            "compute": benchmark_matmul(),
-            "memory": benchmark_memory_bandwidth(),
+            "compute": compute,
+            "memory": memory,
         }
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        _log_gpu_mem("after empty_cache")
 
     _save_profile(current_info, device_benchmark)
     return current_info, device_benchmark
