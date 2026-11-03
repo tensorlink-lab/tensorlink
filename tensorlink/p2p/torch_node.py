@@ -598,6 +598,7 @@ class Torchnode(Smartnode):
                 "get_connection": self._handle_get_connection,
                 "info": self._handle_get_info,
                 "optimizer_response": self._handle_optimizer_response_request,
+                "query_dht": self._handle_dht_query,
                 "release_memory": self._handle_release_memory,
                 "reset_module_status": self._handle_reset_module_status,
                 "request_parameters": self._handle_request_parameters,
@@ -623,6 +624,25 @@ class Torchnode(Smartnode):
                 )
         except Exception as e:
             self.response_queue.put({"status": "FAILURE", "error": str(e)})
+
+    def _handle_dht_query(self, request):
+        """
+        Query the DHT and return JSON-safe results. Always puts exactly one response.
+
+        Returns {"results": {key: value}, "missing": [keys]}.
+        """
+        try:
+            key = request.get("args")
+            if not isinstance(key, str):
+                raise ValueError("dht_query args must be str")
+
+            result = self.dht.query(key)
+
+            self.response_queue.put({"status": "SUCCESS", "return": result})
+        except Exception as e:
+            self.response_queue.put(
+                {"status": "FAILURE", "error": str(e), "return": None}
+            )
 
     def _handle_get_connection(self, request):
         # Get connection info from a node id
