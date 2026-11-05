@@ -31,7 +31,7 @@ class TensorlinkAPI(GenerationMixin, EmbeddingMixin, AgentMixin):
     probing node & job information.
     """
 
-    def __init__(self, smart_node, host="0.0.0.0", port=64747):
+    def __init__(self, smart_node, host="127.0.0.1", port=64747):
         self.smart_node = smart_node
         self.host = host
         self.port = port
