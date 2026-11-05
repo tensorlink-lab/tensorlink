@@ -79,6 +79,21 @@ def parse_chat_messages(messages):
     return system_messages, history, last_user_message
 
 
+def normalize_web_search(value) -> str:
+    """Request field -> "off" | "auto" | "always". true means the user flipped
+    the toggle on, so it searches every time; "auto" lets the model decide."""
+    if value is None or value is False or value == "off":
+        return "off"
+    if value is True or value == "always":
+        return "always"
+    if value == "auto":
+        return "auto"
+    raise HTTPException(
+        status_code=400,
+        detail="web_search must be true, false, 'off', 'auto' or 'always'",
+    )
+
+
 def build_generation_request(request) -> GenerationRequest:
     """Shared factory: ChatCompletionRequest or TextResponseRequest → GenerationRequest."""
     if not request.messages:
@@ -96,6 +111,7 @@ def build_generation_request(request) -> GenerationRequest:
         output_format="openai",
         do_sample=(request.temperature or 0) > 0,
         is_chat_completion=True,
+        web_search=normalize_web_search(getattr(request, "web_search", None)),
     )
 
 

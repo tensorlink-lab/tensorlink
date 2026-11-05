@@ -44,7 +44,7 @@ class ValidatorThread(Torchnode):
         on_chain=False,
         local_test=False,
         endpoint=True,
-        endpoint_url="0.0.0.0",
+        endpoint_url="127.0.0.1",
         endpoint_port=64747,
         load_previous_state=False,
         priority_nodes: list = None,
