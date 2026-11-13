@@ -247,38 +247,57 @@ class DistributedWorker:
 
     def _handle_forward(self, module_id, key, size, name):
         """Handle forward pass with proper KV cache structure preservation"""
+
+        class StageTimer:
+            """Records named lap times and formats them for debug output."""
+
+            def __init__(self):
+                self._start = self._last = time.perf_counter()
+                self.laps = {}
+
+            def lap(self, name):
+                now = time.perf_counter()
+                self.laps[name] = now - self._last
+                self._last = now
+
+            @property
+            def total(self):
+                return time.perf_counter() - self._start
+
+            def __str__(self):
+                parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
+                return f"{parts}, total={self.total:.4f}s"
+
         module_path = "-"
+        timer = StageTimer()
         try:
             module = self.modules[module_id]
             module_path = self.module_paths[module_id]
 
-            # Get data from shared memory
             data = get_from_shared_memory(size, name, encoding=None)
             args_len = int.from_bytes(data[:8], "big")
             args_bytes = data[8 : 8 + args_len]
             kwargs_bytes = data[8 + args_len :]
+            timer.lap("shm_read")
+
             args = bytes_to_tensor(args_bytes)
+            timer.lap("args_from_bytes")
+
             kwargs = bytes_to_tensor(kwargs_bytes)
+            timer.lap("kwargs_from_bytes")
+
             inp = attach_tensor(args, self.device)
             kwargs = attach_tensor(kwargs, self.device)
+            timer.lap("attach")
 
             if module.training:
                 inp = enable_grad(inp)
                 kwargs = enable_grad(kwargs)
+                timer.lap("enable_grad")
 
             if not isinstance(inp, (list, tuple)):
                 inp = (inp,)
 
-            # recv_report = debug_structure(
-            #     {"args": inp, "kwargs": kwargs},
-            #     name=f"[RECV] module_id={module_id} path={module_path}",
-            # )
-            # self.send_request(
-            #     "debug_print",
-            #     (f"DistributedWorker -> {recv_report}", "magenta", logging.DEBUG),
-            # )
-
-            # Forward pass
             try:
                 if self.use_amp and module.training:
                     with amp.autocast():
@@ -300,13 +319,9 @@ class DistributedWorker:
                         logging.ERROR,
                     ),
                 )
-                # self.send_request(
-                #     "report_module_error",
-                #     (module_id, "forward", str(fwd_err)),
-                # )
                 return
+            timer.lap("forward")
 
-            # Store intermediate results if training
             if module.training:
                 try:
                     module.intermediates[key] = {
@@ -323,38 +338,35 @@ class DistributedWorker:
                             logging.ERROR,
                         ),
                     )
-                    # self.send_request(
-                    #     "report_module_error",
-                    #     (module_id, "store_intermediate", str(store_err)),
-                    # )
                     return
-
-            # send_report = debug_structure(
-            #     out,
-            #     name=f"[SEND] module_id={module_id} path={module_path}",
-            # )
-            # self.send_request(
-            #     "debug_print",
-            #     (f"DistributedWorker -> {send_report}", "cyan", logging.DEBUG),
-            # )
-
-            # Detach and store output
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                timer.lap("store_intermediate")
 
             detached_out = detach_tensor(out)
+            timer.lap("detach")
+
             output_bytes = tensor_to_bytes(detached_out)
+            timer.lap("out_to_bytes")
+
             out_size, out_name = store_in_shared_memory(output_bytes, encoding=None)
+            timer.lap("shm_store")
+
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [FORWARD] module_id={module_id} "
+                    f"path={module_path} | {timer}",
+                    "cyan",
+                    logging.DEBUG,
+                ),
+            )
 
             self.send_request(
                 "send_forward", (module.host, module_id, out_size, out_name, key)
             )
 
-            # Incremental training counter
             if module.training:
                 module.n_batch += 1
 
-            # Strategic memory management
             if self.device.type == "cuda" and module.n_batch % 20 == 0:
                 torch.cuda.empty_cache()
 
@@ -368,10 +380,6 @@ class DistributedWorker:
                     logging.ERROR,
                 ),
             )
-            # self.send_request(
-            #     "report_module_error",
-            #     (module_id, "unknown_module", "module_id not found on worker"),
-            # )
 
         except Exception as e:
             logging.error(
@@ -388,11 +396,6 @@ class DistributedWorker:
                     logging.ERROR,
                 ),
             )
-            # TODO:
-            # self.send_request(
-            #     "report_module_error",
-            #     (module_id, "unhandled", str(e)),
-            # )
 
     def _handle_generate(self, module_id, size, name, stream):
         """

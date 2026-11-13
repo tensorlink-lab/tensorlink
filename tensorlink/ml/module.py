@@ -52,6 +52,7 @@ from tensorlink.ml.utils import (
     attach_tensor,
     resolve_module_from_path,
     resolve_dtype,
+    debug_structure,
 )
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
@@ -1388,7 +1389,28 @@ class OffloadedModule(nn.Module):
         return output
 
     def forward(self, *args, **kwargs):
-        start_time = time.time()
+        class StageTimer:
+            """Records named lap times and formats them for debug output."""
+
+            def __init__(self):
+                self._start = self._last = time.perf_counter()
+                self.laps = {}
+
+            def lap(self, name):
+                now = time.perf_counter()
+                self.laps[name] = now - self._last
+                self._last = now
+
+            @property
+            def total(self):
+                return time.perf_counter() - self._start
+
+            def __str__(self):
+                parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
+                return f"{parts}, total={self.total:.4f}s"
+
+        timer = StageTimer()
+        path = getattr(self, "module_path", self.module_name)
         try:
             n_batch = self.parent_model.model.n_batch
             n_micro = getattr(self.parent_model._thread_local, "micro", None)
@@ -1399,34 +1421,29 @@ class OffloadedModule(nn.Module):
                 self.parent_model.model.intermediates[n_micro].append(
                     [handle_output(args), self.module_id]
                 )
-
-            # send_report = debug_structure(
-            #     {"args": args, "kwargs": kwargs},
-            #     name=(
-            #         f"[SEND] module_id={self.module_id} "
-            #         f"path={getattr(self, 'module_path', self.module_name)} "
-            #         f"micro={n_micro} batch={n_batch}"
-            #     ),
-            # )
-            # self.parent_model.send_request(
-            #     "debug_print",
-            #     (f"OffloadedModule -> {send_report}", "bright_magenta", logging.DEBUG),
-            # )
+            timer.lap("store_intermediate")
 
             detached_args = detach_tensor(args, clone=True)
+            timer.lap("detach")
+
             args_bytes = tensor_to_bytes(detached_args)
+            timer.lap("args_to_bytes")
+
             kwargs_bytes = tensor_to_bytes(kwargs)
+            timer.lap("kwargs_to_bytes")
+
             forward_bytes = (
                 len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
             )
-
             size, shm_name = store_in_shared_memory(forward_bytes, encoding=None)
+            timer.lap("shm_store")
 
             # Relay forward pass to next roles
             self.parent_model.send_request(
                 "send_forward",
                 (self.worker_id, self.module_id, size, shm_name, tag),
             )
+            timer.lap("send")
 
             # Wait for response
             key = (n_batch, n_micro, self.module_id)
@@ -1434,72 +1451,62 @@ class OffloadedModule(nn.Module):
 
             while output_bytes is None:
                 time.sleep(0.01)
-                response = self.parent_model.send_request(
-                    "check_forward",
-                    key,
-                )
+                response = self.parent_model.send_request("check_forward", key)
 
                 if response is not None:
                     size, name = response
                     output_bytes = get_from_shared_memory(size, name, encoding=None)
                     break
 
-                if time.time() - start_time >= MAX_WAIT_TIME:
+                if timer.total >= MAX_WAIT_TIME:
                     raise TimeoutError(
                         f"Timed out waiting for forward response: "
-                        f"module_id={self.module_id}, "
-                        f"batch={n_batch}, micro={n_micro}, "
-                        f"elapsed={time.time() - start_time:.3f}s"
+                        f"module_id={self.module_id}, batch={n_batch}, "
+                        f"micro={n_micro}, elapsed={timer.total:.3f}s"
                     )
+            timer.lap("wait_response")
 
             output = bytes_to_tensor(output_bytes)
-            output = attach_tensor(output, self.parent_model.device)
+            timer.lap("bytes_to_tensor")
 
-            # recv_report = debug_structure(
-            #     output,
-            #     name=(
-            #         f"[RECV] module_id={self.module_id} "
-            #         f"path={getattr(self, 'module_path', self.module_name)} "
-            #         f"elapsed={time.time() - start_time:.3f}s"
-            #     ),
-            # )
-            # self.parent_model.send_request(
-            #     "debug_print",
-            #     (f"OffloadedModule -> {recv_report}", "bright_cyan", logging.DEBUG),
-            # )
+            output = attach_tensor(output, self.parent_model.device)
+            timer.lap("attach")
 
             if self.training:
                 output = enable_grad(output)
+                timer.lap("enable_grad")
 
             self.parent_model.send_request(
-                "release_memory",
-                ("forward_queue", self.module_id, key),
+                "release_memory", ("forward_queue", self.module_id, key)
             )
-            inter_storage = [
-                self.module_id,
-                output,
-            ]
 
             # Store intermediates and connection for backwards pass
-            self.parent_model.model.intermediates[n_micro].append(inter_storage)
-            return output
-
-        except Exception as e:
-            elapsed = time.time() - start_time
+            self.parent_model.model.intermediates[n_micro].append(
+                [self.module_id, output]
+            )
 
             self.parent_model.send_request(
                 "debug_print",
                 (
+                    f"OffloadedModule -> [FORWARD] module_id={self.module_id} "
+                    f"path={path} micro={n_micro} batch={n_batch} | {timer}",
+                    "bright_magenta",
+                    logging.DEBUG,
+                ),
+            )
+            return output
+
+        except Exception as e:
+            self.parent_model.send_request(
+                "debug_print",
+                (
                     f"OffloadedModule.forward failed: "
-                    f"module_id={getattr(self, 'module_id', None)} "
-                    f"path={getattr(self, 'module_path', self.module_name)} "
-                    f"elapsed={elapsed:.3f}s "
-                    f"error={type(e).__name__}: {e}",
+                    f"module_id={getattr(self, 'module_id', None)} path={path} "
+                    f"elapsed={timer.total:.3f}s error={type(e).__name__}: {e}",
                     "bright_red",
                     logging.ERROR,
                 ),
             )
-
             raise
 
     def add_distributed_parameter(self, name, distributed_param):
