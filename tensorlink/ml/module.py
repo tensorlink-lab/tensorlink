@@ -52,7 +52,6 @@ from tensorlink.ml.utils import (
     attach_tensor,
     resolve_module_from_path,
     resolve_dtype,
-    debug_structure,
 )
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
