@@ -1,10 +1,71 @@
 import types
+from collections import OrderedDict
 from typing import List, Dict, Set
 import textwrap
+import uuid
 import ast
 import inspect
 
 import torch.nn
+from transformers import Cache, DynamicCache
+
+MAX_CACHE_SESSIONS = 8
+
+
+class RemoteKVCache(DynamicCache):
+    """
+    Host-side stand-in for the KV cache during distributed inference.
+
+    The real key/value tensors live on the workers that own the layers. The
+    host only tracks how many tokens have been processed so HF can compute
+    positions and attention masks. Nothing here is ever sent over the wire;
+    only ``{"__cache__": session_id, "len": n}`` is (see swap_remote_cache).
+    """
+
+    def __init__(self, config=None):
+        try:
+            super().__init__(config=config)
+        except TypeError:
+            super().__init__()
+        self.session_id = uuid.uuid4().hex
+        self._seen = 0
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self._seen
+
+    def get_mask_sizes(self, cache_position, layer_idx: int):
+        # (kv_length, kv_offset): full-attention layers only
+        # newer transformers passes q_length (int); older passes a cache_position tensor
+        if hasattr(cache_position, "shape"):
+            q_len = int(cache_position.shape[0])
+        else:
+            q_len = int(cache_position)
+        return self._seen + q_len, 0
+
+    def advance_from_kwargs(self, kwargs: dict) -> None:
+        """Advance by the number of query tokens processed in this step."""
+        hs = kwargs.get("hidden_states")
+        if hasattr(hs, "shape") and len(hs.shape) >= 2:
+            self._seen += int(hs.shape[-2])
+            return
+        cp = kwargs.get("cache_position")
+        if hasattr(cp, "shape"):
+            self._seen += int(cp.shape[0])
+
+
+def swap_remote_cache(kwargs: dict):
+    """
+    Replace any RemoteKVCache in kwargs with a tiny serializable reference.
+    Returns (kwargs_to_send, stub_or_None). Never mutates the input dict.
+    """
+    out, stub = None, None
+    for k, v in kwargs.items():
+        if isinstance(v, RemoteKVCache):
+            if out is None:
+                out = dict(kwargs)
+            out[k] = {"__cache__": v.session_id, "len": v._seen}
+            stub = v
+    return (out if out is not None else kwargs), stub
 
 
 class VariableUsageAnalyzer(ast.NodeVisitor):
@@ -208,6 +269,9 @@ class LayerGroupModule(torch.nn.Module):
         self.layer_offset = layer_offset  # global index of first layer in this group
         self.debug = debug
 
+        # Worker-resident KV caches: session_id -> DynamicCache (LRU)
+        self._caches = OrderedDict()
+
         # Generate the forward function from the loop body
         self.forward_func = self._generate_forward_from_loop(loop_body_source)
 
@@ -354,15 +418,59 @@ class LayerGroupModule(torch.nn.Module):
         exec(forward_source, namespace)
         return namespace['forward']
 
+    def _resolve_remote_cache(self, kwargs: dict) -> dict:
+        """Swap {"__cache__": sid, "len": n} references for the resident cache."""
+        for k, v in list(kwargs.items()):
+            if not (isinstance(v, dict) and "__cache__" in v):
+                continue
+
+            sid, n = v["__cache__"], int(v["len"])
+            cache = self._caches.get(sid)
+
+            if n == 0:
+                # New prefill for this session
+                cfg = getattr(self.parent_module, "config", None)
+                try:
+                    cache = DynamicCache(config=cfg)
+                except TypeError:
+                    cache = DynamicCache()
+                self._caches[sid] = cache
+            else:
+                have = (
+                    None if cache is None else cache.get_seq_length(self.layer_offset)
+                )
+                if have != n:
+                    raise RuntimeError(
+                        f"KV cache out of sync for session {sid[:8]}: host expects "
+                        f"{n} cached tokens, worker has {have} (evicted or restarted?)"
+                    )
+
+            self._caches.move_to_end(sid)
+            while len(self._caches) > MAX_CACHE_SESSIONS:
+                self._caches.popitem(last=False)
+
+            kwargs = {**kwargs, k: cache}
+        return kwargs
+
     def forward(self, **kwargs):
         """
         Execute the generated forward function.
-        This gets replaced by _generate_forward_from_loop.
+        Only variables the loop actually rebinds are returned: unchanged
+        invariants (position ids, masks...) and Cache objects stay local.
         """
+        kwargs = self._resolve_remote_cache(kwargs)
         outputs = self.forward_func(self, **kwargs)
-        if isinstance(outputs, dict):
-            return {k: v for k, v in outputs.items() if k in self.output_vars}
-        return outputs
+        if not isinstance(outputs, dict):
+            return outputs
+
+        result = {}
+        for k, v in outputs.items():
+            if k not in self.output_vars or isinstance(v, Cache):
+                continue
+            if k in kwargs and v is kwargs[k]:
+                continue
+            result[k] = v
+        return result
 
 
 def _determine_loop_variables(
@@ -441,9 +549,9 @@ def _determine_loop_variables(
         passthrough_vars.update(alias_targets)
 
     # Input-only: read but never written
-    input_only_vars = (read_before_write - variables_written) | (
-        function_args - variables_written
-    )
+    # Only variables the loop body actually reads. Shipping every unused
+    # function arg (e.g. inputs_embeds) to every group was pure overhead.
+    input_only_vars = read_before_write - variables_written
 
     # Output-only: created in loop (written first) and never read
     output_only_vars = set()
@@ -651,12 +759,13 @@ def _generate_worker_calls(
         calls.append(call_str)
 
         # Unpack explicitly computed output vars first (also try alias)
+        # Workers only return variables they rebound; keep host values otherwise.
         for var in all_outputs:
-            calls.append(f"{indent}if isinstance(_worker_output_{idx}, dict):")
             calls.append(
-                f"{indent}    _val_{var}_out = _worker_output_{idx}.get('{var}')"
+                f"{indent}if isinstance(_worker_output_{idx}, dict) "
+                f"and '{var}' in _worker_output_{idx}:"
             )
-            calls.append(f"{indent}    {var} = _val_{var}_out")
+            calls.append(f"{indent}    {var} = _worker_output_{idx}['{var}']")
 
         calls.append(f"{indent}")
 

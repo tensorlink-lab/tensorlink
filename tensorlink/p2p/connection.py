@@ -1,5 +1,6 @@
 from datetime import datetime
 from multiprocessing import shared_memory
+import functools
 import threading
 import logging
 import hashlib
@@ -9,6 +10,17 @@ import os
 
 
 CHUNK_SIZE = 2048**2
+
+
+def _serialized(fn):
+    """Serialize writers so PING/other sends can't interleave into a tensor stream."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._send_lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
 
 
 class Connection(threading.Thread):
@@ -76,6 +88,14 @@ class Connection(threading.Thread):
             socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024
         )  # 4MB send buffer
 
+        # Avoid Nagle + delayed-ACK stalls (~40ms) on the small header/trailer writes
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self._send_lock = threading.Lock()
+        self._msg_started = False  # True once the first chunk of a message was seen
+
         # Start connection monitoring
         self.monitor_thread = threading.Thread(target=self.monitor_connection)
         self.monitor_thread.daemon = True
@@ -86,13 +106,15 @@ class Connection(threading.Thread):
         Main connection thread method to handle data streaming and connection lifecycle.
         Manages receiving, buffering, and writing network data chunks.
         """
-        buffer = b""
+        buffer = bytearray()
         prefix = b""
         writing_threads = []
+        rx = bytearray(self.chunk_size)
+        rx_view = memoryview(rx)
 
         while not self.terminate_flag.is_set():
             try:
-                chunk = self.sock.recv(self.chunk_size)
+                n = self.sock.recv_into(rx_view)
             except socket.timeout:
                 continue
             except (ConnectionResetError, ConnectionAbortedError) as e:
@@ -102,10 +124,10 @@ class Connection(threading.Thread):
                 self._handle_unexpected_error(e)
                 break
 
-            if chunk:
+            if n:
                 self.last_seen = datetime.now()
                 (buffer, prefix, is_transmission_complete) = self._process_data_chunk(
-                    chunk, buffer, prefix, writing_threads
+                    rx_view[:n], buffer, prefix, writing_threads
                 )
 
                 # Manage large buffers by writing to file
@@ -120,14 +142,15 @@ class Connection(threading.Thread):
                     )
                     writing_threads.append(writing_thread)
                     writing_thread.start()
-                    buffer = b""
+                    buffer = bytearray()
 
-            elif chunk == b"":
+            else:  # recv_into returned 0: peer closed
                 self._handle_connection_close()
                 break
 
         self._cleanup_socket()
 
+    @_serialized
     def send(self, data: bytes):
         """Send bytes to node"""
         try:
@@ -162,6 +185,7 @@ class Connection(threading.Thread):
             )
             self.stop()
 
+    @_serialized
     def send_from_file(self, file_name: str, tag: bytes):
         """Send bytes from an existing file and delete it"""
         try:
@@ -233,17 +257,29 @@ class Connection(threading.Thread):
         """
         file_name = f"tmp/streamed_data_{self.host}_{self.port}_{self.main_node.host}_{self.main_node.port}"
 
-        if chunk.startswith(b"MODULE"):
-            prefix = chunk[:70]
-            buffer += chunk[70:]
-        elif chunk.startswith(b"PARAMETERS"):
-            prefix = chunk[:74]
-            buffer += chunk[74:]
+        # Only the first chunk of a message can carry a MODULE/PARAMETERS prefix;
+        # checking every chunk could misparse tensor bytes that happen to match.
+        prev_len = len(buffer)
+        if not self._msg_started:
+            head = bytes(chunk[:10])
+            if head.startswith(b"MODULE"):
+                prefix = bytes(chunk[:70])
+                buffer += chunk[70:]
+            elif head.startswith(b"PARAMETERS"):
+                prefix = bytes(chunk[:74])
+                buffer += chunk[74:]
+            else:
+                buffer += chunk
+            self._msg_started = True
+            prev_len = 0
         else:
             buffer += chunk
 
+        # Only rescan the newly arrived bytes (plus a marker-length overlap)
+        scan_from = max(0, prev_len - len(self.EOT_CHAR) + 1)
+
         while True:
-            eot_pos = buffer.find(self.EOT_CHAR)
+            eot_pos = buffer.find(self.EOT_CHAR, scan_from)
             if eot_pos < 0:
                 break
 
@@ -259,8 +295,10 @@ class Connection(threading.Thread):
 
             self.main_node.handle_message(self, b"DONE STREAM" + prefix)
 
-            buffer = buffer[eot_pos + len(self.EOT_CHAR) :]
+            del buffer[: eot_pos + len(self.EOT_CHAR)]
             prefix = b""
+            scan_from = 0
+            self._msg_started = len(buffer) > 0
 
         return buffer, prefix, False
 
@@ -353,6 +391,7 @@ class Connection(threading.Thread):
 
             time.sleep(10)
 
+    @_serialized
     def send_tensor_from_shm(
         self,
         shm_name: str,

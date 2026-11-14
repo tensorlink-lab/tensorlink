@@ -341,7 +341,7 @@ class Torchnode(Smartnode):
 
             # TODO we must check that the forward received corresponds to a sent pass/specific module
             # must also do with backwards
-            tensor = data[eos + 2 : eos + 2 + size]
+            tensor = memoryview(data)[eos + 2 : eos + 2 + size]  # zero-copy
             key = tuple(json.loads(data[eos + 2 + size :]))
 
             # Create shared mpc block and store tensor
@@ -377,7 +377,7 @@ class Torchnode(Smartnode):
 
             # TODO we must check that the forward received corresponds to a sent pass/specific module
             # must also do with backwards
-            tensor = data[eos + 2 : eos + 2 + size]
+            tensor = memoryview(data)[eos + 2 : eos + 2 + size]  # zero-copy
 
             try:
                 payload = json.loads(data[eos + 2 + size :])

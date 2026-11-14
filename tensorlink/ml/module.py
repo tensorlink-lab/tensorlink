@@ -17,6 +17,8 @@ import os
 from tensorlink.ml.utils.injector import (
     generate_new_forward_method,
     get_loop_io_signature,
+    RemoteKVCache,
+    swap_remote_cache,
 )
 from tensorlink.ml.optim import create_distributed_optimizer
 from tensorlink.ml.utils.graphing import ModelParser
@@ -61,6 +63,31 @@ from tensorlink.utils.shared_memory import (
 
 MAX_WAIT_TIME = 150
 MAX_REPLACEMENT_ATTEMPTS = 3
+
+# Per-forward timing lines go through a blocking IPC round-trip to the node.
+# Set TENSORLINK_DEBUG_TIMING=0 to skip them entirely.
+DEBUG_TIMING = os.environ.get("TENSORLINK_DEBUG_TIMING", "1") != "0"
+
+
+class StageTimer:
+    """Records named lap times and formats them for debug output."""
+
+    def __init__(self):
+        self._start = self._last = time.perf_counter()
+        self.laps = {}
+
+    def lap(self, name):
+        now = time.perf_counter()
+        self.laps[name] = now - self._last
+        self._last = now
+
+    @property
+    def total(self):
+        return time.perf_counter() - self._start
+
+    def __str__(self):
+        parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
+        return f"{parts}, total={self.total:.4f}s"
 
 
 def contains_offloaded(module: nn.Module):
@@ -786,6 +813,17 @@ class DistributedModel(nn.Module):
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
+        # Keep the KV cache on the workers: the host only tracks its length.
+        parent = getattr(self.model, "model", self.model)
+        has_groups = any(
+            getattr(m, "is_layer_group", False)
+            for m in getattr(parent, "offloaded_modules", [])
+        )
+        if has_groups and not self.training and "past_key_values" not in kwargs:
+            kwargs["past_key_values"] = RemoteKVCache(
+                config=getattr(self.model, "config", None)
+            )
+
         try:
             with _set_micro(self._thread_local, 0):
                 return self.model.generate(*args, **kwargs)
@@ -886,6 +924,10 @@ class DistributedModel(nn.Module):
 
             offloaded_module.spawn_worker(file_name, module_info)
             offloaded_modules.append(offloaded_module)
+
+        if offloaded_modules:
+            # The last group advances the host-side KV length once per step
+            offloaded_modules[-1].is_last_group = True
 
         self._inject_grouped_layer_forward(offloaded_modules)
 
@@ -1311,6 +1353,7 @@ class OffloadedModule(nn.Module):
         self.n_batch = 0
 
         self.is_layer_group = False
+        self.is_last_group = False
         self.layer_range = None
         self.training = self.parent_model.training
 
@@ -1388,26 +1431,6 @@ class OffloadedModule(nn.Module):
         return output
 
     def forward(self, *args, **kwargs):
-        class StageTimer:
-            """Records named lap times and formats them for debug output."""
-
-            def __init__(self):
-                self._start = self._last = time.perf_counter()
-                self.laps = {}
-
-            def lap(self, name):
-                now = time.perf_counter()
-                self.laps[name] = now - self._last
-                self._last = now
-
-            @property
-            def total(self):
-                return time.perf_counter() - self._start
-
-            def __str__(self):
-                parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
-                return f"{parts}, total={self.total:.4f}s"
-
         timer = StageTimer()
         path = getattr(self, "module_path", self.module_name)
         try:
@@ -1415,8 +1438,8 @@ class OffloadedModule(nn.Module):
             n_micro = getattr(self.parent_model._thread_local, "micro", None)
             tag = [n_batch, n_micro, self.module_id]
 
-            # Store the intermediate tensor for backwards pass
-            if not self.entire_model:
+            # Store the intermediate tensor for backwards pass (training only)
+            if self.training and not self.entire_model:
                 self.parent_model.model.intermediates[n_micro].append(
                     [handle_output(args), self.module_id]
                 )
@@ -1428,7 +1451,11 @@ class OffloadedModule(nn.Module):
             args_bytes = tensor_to_bytes(detached_args)
             timer.lap("args_to_bytes")
 
-            kwargs_bytes = tensor_to_bytes(kwargs)
+            # A RemoteKVCache is replaced by a tiny reference; workers keep the real one
+            send_kwargs, remote_cache = (
+                swap_remote_cache(kwargs) if self.is_layer_group else (kwargs, None)
+            )
+            kwargs_bytes = tensor_to_bytes(send_kwargs)
             timer.lap("kwargs_to_bytes")
 
             forward_bytes = (
@@ -1479,20 +1506,27 @@ class OffloadedModule(nn.Module):
                 "release_memory", ("forward_queue", self.module_id, key)
             )
 
-            # Store intermediates and connection for backwards pass
-            self.parent_model.model.intermediates[n_micro].append(
-                [self.module_id, output]
-            )
+            # Store intermediates and connection for backwards pass (training only)
+            if self.training:
+                self.parent_model.model.intermediates[n_micro].append(
+                    [self.module_id, output]
+                )
 
-            self.parent_model.send_request(
-                "debug_print",
-                (
-                    f"OffloadedModule -> [FORWARD] module_id={self.module_id} "
-                    f"path={path} micro={n_micro} batch={n_batch} | {timer}",
-                    "bright_magenta",
-                    logging.DEBUG,
-                ),
-            )
+            # All groups have now seen this step's tokens
+            if remote_cache is not None and self.is_last_group:
+                remote_cache.advance_from_kwargs(kwargs)
+
+            if DEBUG_TIMING:
+                self.parent_model.send_request(
+                    "debug_print",
+                    (
+                        f"OffloadedModule -> [FORWARD] module_id={self.module_id} "
+                        f"path={path} micro={n_micro} batch={n_batch} "
+                        f"sent={len(forward_bytes) / 1e3:.1f}KB | {timer}",
+                        "bright_magenta",
+                        logging.DEBUG,
+                    ),
+                )
             return output
 
         except Exception as e:
