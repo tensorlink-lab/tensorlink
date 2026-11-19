@@ -25,9 +25,16 @@ from .forward_program import ForwardProgram, ProgramError, build_forward_program
 from .pipeline_plan import PipelinePlan, PlanOptions, WorkerSpec, plan_pipeline
 
 _DTYPE_BYTES = {
-    "float32": 4, "fp32": 4, "float": 4,
-    "float16": 2, "fp16": 2, "half": 2, "bfloat16": 2, "bf16": 2,
-    "int8": 1, "fp8": 1,
+    "float32": 4,
+    "fp32": 4,
+    "float": 4,
+    "float16": 2,
+    "fp16": 2,
+    "half": 2,
+    "bfloat16": 2,
+    "bf16": 2,
+    "int8": 1,
+    "fp8": 1,
 }
 
 
@@ -55,7 +62,10 @@ class ModelPartitioner:
 
     # ------------------------------------------------------------------ sizing
     def module_bytes(
-        self, model, program: ForwardProgram, dtype: str = "float16",
+        self,
+        model,
+        program: ForwardProgram,
+        dtype: str = "float16",
         kv_bytes_per_layer: int = 0,
     ) -> Dict[str, int]:
         dtype_bytes = _DTYPE_BYTES.get(str(dtype).replace("torch.", ""), None)
@@ -77,10 +87,14 @@ class ModelPartitioner:
         cfg = getattr(model, "config", None)
         if cfg is None:
             return 0
-        heads = getattr(cfg, "num_key_value_heads", None) or getattr(cfg, "num_attention_heads", 0)
+        heads = getattr(cfg, "num_key_value_heads", None) or getattr(
+            cfg, "num_attention_heads", 0
+        )
         hidden = getattr(cfg, "hidden_size", 0)
         n_heads = getattr(cfg, "num_attention_heads", 0) or 1
-        head_dim = getattr(cfg, "head_dim", None) or (hidden // n_heads if hidden else 0)
+        head_dim = getattr(cfg, "head_dim", None) or (
+            hidden // n_heads if hidden else 0
+        )
         per = _DTYPE_BYTES.get(str(dtype).replace("torch.", ""), 2)
         return 2 * heads * head_dim * max_seq_len * batch_size * per
 
@@ -145,7 +159,10 @@ class ModelPartitioner:
                 tied_groups=self.tied_groups(model, program),
             )
             plan = plan_pipeline(
-                program, mb, [WorkerSpec(w["id"], int(w["memory"])) for w in workers], opts
+                program,
+                mb,
+                [WorkerSpec(w["id"], int(w["memory"])) for w in workers],
+                opts,
             )
         except ProgramError as e:
             return self._result(False, error=f"pipeline unsupported: {e}")
@@ -164,13 +181,20 @@ class ModelPartitioner:
             "tied_groups": opts.tied_groups,
         }
         return self._result(
-            True, config=plan.to_config(extra), model_memory=plan.total_bytes,
+            True,
+            config=plan.to_config(extra),
+            model_memory=plan.total_bytes,
             host_memory_used=plan.host_bytes,
         )
 
     def create_pipeline_config_for_name(
-        self, model_name: str, workers: dict, *, model_type: str = "chat",
-        dtype: str = "float16", **kw
+        self,
+        model_name: str,
+        workers: dict,
+        *,
+        model_type: str = "chat",
+        dtype: str = "float16",
+        **kw,
     ) -> dict:
         """Validator entry point. ``workers`` is the validator's {id: {"gpu_memory": n}}.
         Never raises: any failure returns success=False so the caller can fall back
@@ -184,7 +208,12 @@ class ModelPartitioner:
                 for wid, w in (workers or {}).items()
             ]
             return self.create_pipeline_config(
-                model, ws, dtype=dtype, model_name=model_name, model_type=model_type, **kw
+                model,
+                ws,
+                dtype=dtype,
+                model_name=model_name,
+                model_type=model_type,
+                **kw,
             )
         except Exception as e:
             return self._result(False, error=f"pipeline skeleton failed: {e!r}")

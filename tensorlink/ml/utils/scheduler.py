@@ -313,7 +313,9 @@ class PublicModelScheduler:
                     else:
                         actions.launch.append(
                             LaunchAction(
-                                model_name, Tier.FREE, "auto-load: popular/default model"
+                                model_name,
+                                Tier.FREE,
+                                "auto-load: popular/default model",
                             )
                         )
                         total_instances += 1
@@ -370,7 +372,9 @@ class PublicModelScheduler:
                 # those, retire the newest duplicate first -- it was the
                 # last one added to cover a burst, so it's the safest to
                 # let go of once that burst has passed.
-                removable.sort(key=lambda inst: (inst.tier != Tier.FREE, -inst.created_at))
+                removable.sort(
+                    key=lambda inst: (inst.tier != Tier.FREE, -inst.created_at)
+                )
 
                 to_remove = len(current) - desired
                 for inst in removable[:to_remove]:

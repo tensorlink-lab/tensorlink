@@ -78,7 +78,11 @@ def loads_vars(data: bytes) -> Any:
             if not (isinstance(cls, type) and issubclass(cls, ModelOutput)):
                 raise WireError(f"{mod}.{o.get('class')} is not a ModelOutput")
             return cls(**restore(o["data"]))
-        if o.get("__dynamic_cache__") or o.get("__dataclass__") or o.get("__custom_object__"):
+        if (
+            o.get("__dynamic_cache__")
+            or o.get("__dataclass__")
+            or o.get("__custom_object__")
+        ):
             raise WireError("object type not permitted on the pipeline wire")
         return {k: restore(v) for k, v in o.items()}
 
@@ -101,7 +105,12 @@ def unpack(data) -> Tuple[Dict[str, Any], Any]:
         raise WireError(f"wire version {meta.get('v')} != {WIRE_VERSION}")
     hops = meta.get("hops")
     at = meta.get("at")
-    if not isinstance(hops, list) or not hops or not isinstance(at, int) or not 0 <= at < len(hops):
+    if (
+        not isinstance(hops, list)
+        or not hops
+        or not isinstance(at, int)
+        or not 0 <= at < len(hops)
+    ):
         raise WireError("bad route")
     return meta, loads_vars(data[8 + n :])
 

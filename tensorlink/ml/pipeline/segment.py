@@ -38,7 +38,9 @@ def attach(obj, device):
     if isinstance(obj, Cache):
         return obj
     if isinstance(obj, ModelOutput):
-        return obj.__class__(**{k: attach(v, device) for k, v in obj.items() if v is not None})
+        return obj.__class__(
+            **{k: attach(v, device) for k, v in obj.items() if v is not None}
+        )
     if isinstance(obj, dict):
         return {k: attach(v, device) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -75,11 +77,17 @@ class SegmentRunner:
         """Activations must match the weights' dtype (HF assumes it); anything floating
         that arrives in another dtype (e.g. fp32 from a peer) is cast down/up to it."""
         if isinstance(obj, torch.Tensor):
-            if self.dtype is not None and obj.is_floating_point() and obj.dtype != self.dtype:
+            if (
+                self.dtype is not None
+                and obj.is_floating_point()
+                and obj.dtype != self.dtype
+            ):
                 return obj.to(self.dtype)
             return obj
         if isinstance(obj, ModelOutput):
-            return obj.__class__(**{k: self._cast(v) for k, v in obj.items() if v is not None})
+            return obj.__class__(
+                **{k: self._cast(v) for k, v in obj.items() if v is not None}
+            )
         if isinstance(obj, dict):
             return {k: self._cast(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
@@ -89,7 +97,9 @@ class SegmentRunner:
     def _describe(self, obj, prefix="", out=None, depth=0):
         out = [] if out is None else out
         if isinstance(obj, torch.Tensor):
-            out.append(f"{prefix}:{str(obj.dtype).replace('torch.', '')}{list(obj.shape)}")
+            out.append(
+                f"{prefix}:{str(obj.dtype).replace('torch.', '')}{list(obj.shape)}"
+            )
         elif isinstance(obj, dict) and depth < 2:
             for k, v in obj.items():
                 self._describe(v, f"{prefix}.{k}" if prefix else str(k), out, depth + 1)
@@ -121,7 +131,9 @@ class SegmentRunner:
                 self._caches.popitem(last=False)
             found.append((entry, dict(obj)))
             return entry[0]
-        if isinstance(obj, ModelOutput):  # ModelOutput is a dict subclass: keep its type
+        if isinstance(
+            obj, ModelOutput
+        ):  # ModelOutput is a dict subclass: keep its type
             return obj.__class__(
                 **{k: self._resolve(v, found) for k, v in obj.items() if v is not None}
             )
@@ -140,7 +152,11 @@ class SegmentRunner:
             return None  # a cache created locally (no session): never serialised
         if isinstance(obj, ModelOutput):
             return obj.__class__(
-                **{k: self._scrub(v, ref, cache) for k, v in obj.items() if v is not None}
+                **{
+                    k: self._scrub(v, ref, cache)
+                    for k, v in obj.items()
+                    if v is not None
+                }
             )
         if isinstance(obj, dict):
             return {k: self._scrub(v, ref, cache) for k, v in obj.items()}
@@ -165,7 +181,7 @@ class SegmentRunner:
                 f"[inputs {self._describe(vin)[:12]}]"
             ) from e
 
-        entry, ref = (found[0] if found else (None, None))
+        entry, ref = found[0] if found else (None, None)
         cache = entry[0] if entry else None
         out = self._scrub(out, ref, cache)
         if entry is not None and self.has_layers:

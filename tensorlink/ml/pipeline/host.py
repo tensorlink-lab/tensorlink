@@ -33,7 +33,10 @@ from tensorlink.ml.pipeline.loader import (
 from tensorlink.ml.pipeline.segment import SegmentRunner, attach, is_cache_ref
 from tensorlink.ml.utils import detach_tensor
 from tensorlink.ml.utils.injector import RemoteKVCache, swap_remote_cache
-from tensorlink.utils.shared_memory import get_from_shared_memory, store_in_shared_memory
+from tensorlink.utils.shared_memory import (
+    get_from_shared_memory,
+    store_in_shared_memory,
+)
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +135,13 @@ class PipelineRunner:
         last_id = self.hops[-1]["module_id"]
         parent.send_request(
             "send_forward",
-            (first["worker"], first["module_id"], size, shm, [step, micro, first["module_id"]]),
+            (
+                first["worker"],
+                first["module_id"],
+                size,
+                shm,
+                [step, micro, first["module_id"]],
+            ),
         )
 
         key = (step, micro, last_id)
@@ -207,6 +216,11 @@ def prepare_pipeline(parent, config: dict, model_name: str, model_type: str):
 def install_forward(model, program, runner: PipelineRunner):
     """Replace model.forward by a stub with the ORIGINAL signature that calls the runner."""
     ns: Dict[str, Any] = {}
-    exec(compile(program.host_forward_source("_tl_pipeline"), "<tensorlink-forward>", "exec"), ns)
+    exec(
+        compile(
+            program.host_forward_source("_tl_pipeline"), "<tensorlink-forward>", "exec"
+        ),
+        ns,
+    )
     model._tl_pipeline = runner
     model.forward = types.MethodType(ns["forward"], model)

@@ -119,7 +119,9 @@ def _fail(msg: str) -> PipelinePlan:
     return PipelinePlan(success=False, error=msg)
 
 
-def _expand_for_ties(n_units: int, unit_of: Dict[str, int], opts: PlanOptions, pre: int, post: int):
+def _expand_for_ties(
+    n_units: int, unit_of: Dict[str, int], opts: PlanOptions, pre: int, post: int
+):
     """Grow the host prefix/suffix until every tied group is entirely on the host or
     entirely off it. Only applies when privacy is on."""
     if not opts.privacy:
@@ -187,7 +189,9 @@ def plan_pipeline(
     # ---- pack the middle across workers (next-fit, largest first) ----
     ws = sorted(workers, key=lambda w: w.free_bytes, reverse=True)
     mid_lo, mid_hi = pre, n - post
-    groups: List[Tuple[WorkerSpec, int, int]] = []  # (worker, first_unit, last_unit_excl)
+    groups: List[Tuple[WorkerSpec, int, int]] = (
+        []
+    )  # (worker, first_unit, last_unit_excl)
     wi, i = 0, mid_lo
     while i < mid_hi:
         if wi >= len(ws):
@@ -260,7 +264,9 @@ def plan_pipeline(
             )
 
     fp = hashlib.sha256(
-        json.dumps([program.fingerprint] + [(s.owner, s.start, s.end, s.sha) for s in segs]).encode()
+        json.dumps(
+            [program.fingerprint] + [(s.owner, s.start, s.end, s.sha) for s in segs]
+        ).encode()
     ).hexdigest()
     return PipelinePlan(
         success=True,

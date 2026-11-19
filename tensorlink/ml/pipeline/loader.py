@@ -45,9 +45,14 @@ from tensorlink.ml.partition.forward_program import build_forward_program
 log = logging.getLogger(__name__)
 
 _DTYPES = {
-    "float32": torch.float32, "fp32": torch.float32, "float": torch.float32,
-    "float16": torch.float16, "fp16": torch.float16, "half": torch.float16,
-    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
 }
 
 
@@ -114,7 +119,11 @@ def _load_bin(path: str) -> Dict[str, torch.Tensor]:
             sd = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
         except Exception:
             sd = torch.load(path, map_location="cpu", weights_only=True)
-        if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        if (
+            isinstance(sd, dict)
+            and "state_dict" in sd
+            and isinstance(sd["state_dict"], dict)
+        ):
             sd = sd["state_dict"]
         _BIN_CACHE[path] = sd
     return _BIN_CACHE[path]
@@ -204,7 +213,9 @@ def _tie_siblings(model, path: str) -> List[str]:
     return out
 
 
-def _assign(module, sd: Dict[str, torch.Tensor], shared: Dict[int, torch.nn.Parameter]) -> int:
+def _assign(
+    module, sd: Dict[str, torch.Tensor], shared: Dict[int, torch.nn.Parameter]
+) -> int:
     """Replace meta parameters with real ones. ``shared`` maps the id of the original
     (meta) Parameter to the real one so tied weights stay a single tensor."""
     n = 0
@@ -241,7 +252,9 @@ def materialize(
     td = to_torch_dtype(dtype)
     shard_map = _shard_map(model_path)
     if not shard_map:
-        raise RuntimeError(f"no .safetensors / pytorch_model*.bin weights in {model_path}")
+        raise RuntimeError(
+            f"no .safetensors / pytorch_model*.bin weights in {model_path}"
+        )
     keys = list(shard_map)
     shared: Dict[int, torch.nn.Parameter] = {}  # id(meta param) -> loaded param
 
@@ -250,7 +263,9 @@ def materialize(
         prefix = _resolve_prefix(keys, path)
         sd: Dict[str, torch.Tensor] = {}
         if prefix is not None:
-            wanted = {k: k[len(prefix) + 1 :] for k in keys if k.startswith(prefix + ".")}
+            wanted = {
+                k: k[len(prefix) + 1 :] for k in keys if k.startswith(prefix + ".")
+            }
             sd = _read(shard_map, wanted)
 
         # parameters the checkpoint does not store under this module (tied weights)
@@ -285,10 +300,16 @@ def materialize(
         res = None
         loaded = {id(v) for v in shared.values()}
         left = [
-            n for n, p in module.named_parameters(remove_duplicate=False) if id(p) not in loaded
+            n
+            for n, p in module.named_parameters(remove_duplicate=False)
+            if id(p) not in loaded
         ]
         if left:
-            hint = [k for k in keys if any(t in k for t in (path.split(".")[-1], "embed", "lm_head"))]
+            hint = [
+                k
+                for k in keys
+                if any(t in k for t in (path.split(".")[-1], "embed", "lm_head"))
+            ]
             raise RuntimeError(
                 f"{path}: parameters not found in checkpoint: {left[:6]} "
                 f"(prefix={prefix!r}, read={sorted(sd)[:6]}, {len(keys)} keys in {model_path}, "
@@ -330,7 +351,11 @@ def load_segment_runner(
     seg = module_info["segment"]
     code = check_segment(program, seg)
     materialize(
-        model, code.modules, model_path, device, module_info["dtype"],
+        model,
+        code.modules,
+        model_path,
+        device,
+        module_info["dtype"],
         tied_groups or module_info.get("tied_groups") or (),
     )
     return SegmentRunner(model, program, code, device)

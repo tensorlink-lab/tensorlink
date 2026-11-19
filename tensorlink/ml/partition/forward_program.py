@@ -67,7 +67,9 @@ def _function_ast(fn) -> ast.FunctionDef:
         src = textwrap.dedent(inspect.getsource(fn))
     except (OSError, TypeError) as e:
         raise ProgramError(f"no source available for {fn!r}: {e}") from e
-    func = next((n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)), None)
+    func = next(
+        (n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)), None
+    )
     if func is None:
         raise ProgramError(f"{fn!r} is not a plain function")
     func.decorator_list = []
@@ -251,7 +253,9 @@ class _Normalize(ast.NodeTransformer):
         self.generic_visit(n)
         if n.value is None:
             return ast.Pass()
-        return ast.Assign(targets=[n.target], value=n.value, lineno=getattr(n, "lineno", 0))
+        return ast.Assign(
+            targets=[n.target], value=n.value, lineno=getattr(n, "lineno", 0)
+        )
 
 
 class _Refs(ast.NodeVisitor):
@@ -284,7 +288,9 @@ class _Ctx:
 
 
 def _simple(st) -> bool:
-    return isinstance(st, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return, ast.AugAssign))
+    return isinstance(
+        st, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return, ast.AugAssign)
+    )
 
 
 def _module_calls(st, owner, ctx: _Ctx):
@@ -309,7 +315,9 @@ def _has_layer_loop(child, ctx: _Ctx, depth: int) -> bool:
         func = _function_ast(cls.forward)
     except ProgramError:
         return False
-    found = any(isinstance(n, ast.For) and _iter_container(n.iter) for n in ast.walk(func))
+    found = any(
+        isinstance(n, ast.For) and _iter_container(n.iter) for n in ast.walk(func)
+    )
     if not found and depth < ctx.max_depth:
         for st in func.body:
             if _simple(st):
@@ -422,7 +430,9 @@ def _inline_call(st, call, attr, child, ctx: _Ctx, depth: int) -> List[ast.stmt]
         elif p in defaults:
             val = ast.unparse(defaults[p])
         else:
-            raise ProgramError(f"missing argument {p!r} for {type(child).__name__}.forward")
+            raise ProgramError(
+                f"missing argument {p!r} for {type(child).__name__}.forward"
+            )
         pro.append(f"{tag}{p} = {val}")
     if a.kwarg:
         entries = ", ".join(f"{k.arg!r}: {ast.unparse(k.value)}" for k in extra)
@@ -507,7 +517,9 @@ def _walk_path(root, parts):
 
 
 class ForwardProgram:
-    def __init__(self, params, sig_src, kwarg, stmts, classes, local_names, flat_source):
+    def __init__(
+        self, params, sig_src, kwarg, stmts, classes, local_names, flat_source
+    ):
         self.params: List[str] = params
         self.sig_src: str = sig_src  # without leading "self, "
         self.kwarg: Optional[str] = kwarg
@@ -559,13 +571,21 @@ class ForwardProgram:
         for i, st in enumerate(self.stmts):
             if st.loop is not None:
                 cont = _walk_path(model, self._container_parts(st))
-                if type(cont).__name__ not in _CONTAINER_TYPES and not isinstance(cont, (list, tuple)):
-                    raise ProgramError(f"layer container {st.loop.container!r} is not a module list")
+                if type(cont).__name__ not in _CONTAINER_TYPES and not isinstance(
+                    cont, (list, tuple)
+                ):
+                    raise ProgramError(
+                        f"layer container {st.loop.container!r} is not a module list"
+                    )
                 st.loop.n = self._loop_len(st, model, cont)
-                st.loop.shared = self._resolve_all(model, st.refs, is_module, allow_container=False)
+                st.loop.shared = self._resolve_all(
+                    model, st.refs, is_module, allow_container=False
+                )
                 st.module_paths = []
             else:
-                st.module_paths = self._resolve_all(model, st.refs, is_module, allow_container=False)
+                st.module_paths = self._resolve_all(
+                    model, st.refs, is_module, allow_container=False
+                )
                 # A module may be called from several statements (e.g. GPT-2's wte is
                 # applied to input_ids and to token_type_ids). The first statement owns
                 # it for planning; every segment that runs a statement loads the modules
@@ -600,7 +620,9 @@ class ForwardProgram:
             if path and path not in out:
                 out.append(path)
         # keep only outermost when a module and its descendant are both referenced
-        return [p for p in out if not any(q != p and p.startswith(q + ".") for q in out)]
+        return [
+            p for p in out if not any(q != p and p.startswith(q + ".") for q in out)
+        ]
 
     @staticmethod
     def _resolve_ref(model, chain, is_module) -> Optional[str]:
@@ -649,8 +671,12 @@ class ForwardProgram:
             elif st.module_paths:
                 new = tuple(p for p in st.module_paths if p not in owned)
                 owned.update(st.module_paths)
-                if new:  # pure repeats add no planning unit; they ride with the next one
-                    units.append(ExecUnit(paths=new, pos=(i, 0), end=(i + 1, 0), stmt=i))
+                if (
+                    new
+                ):  # pure repeats add no planning unit; they ride with the next one
+                    units.append(
+                        ExecUnit(paths=new, pos=(i, 0), end=(i + 1, 0), stmt=i)
+                    )
         return units
 
     @property
@@ -685,7 +711,9 @@ class ForwardProgram:
                 modules += [m for m in st.loop.shared if m not in modules]
             else:
                 if idx == i0 and k0:
-                    raise ProgramError("cannot start mid-statement outside the layer loop")
+                    raise ProgramError(
+                        "cannot start mid-statement outside the layer loop"
+                    )
                 out.append(copy.deepcopy(st.node))
                 modules += [m for m in st.module_paths if m not in modules]
         return out, has_layers, modules
@@ -803,8 +831,20 @@ def build_forward_program(
         raise ProgramError("forward() must end with a top-level return")
     for s in body[:-1]:
         for n in ast.walk(s):
-            if isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom, ast.Await, ast.Global, ast.Nonlocal)):
-                raise ProgramError(f"unsupported construct {type(n).__name__} in forward()")
+            if isinstance(
+                n,
+                (
+                    ast.Return,
+                    ast.Yield,
+                    ast.YieldFrom,
+                    ast.Await,
+                    ast.Global,
+                    ast.Nonlocal,
+                ),
+            ):
+                raise ProgramError(
+                    f"unsupported construct {type(n).__name__} in forward()"
+                )
 
     local_names: Set[str] = set(params)
     for s in body:
