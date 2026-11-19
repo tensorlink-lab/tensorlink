@@ -21,7 +21,8 @@ from tensorlink.ml.utils.injector import (
     swap_remote_cache,
 )
 from tensorlink.ml.optim import create_distributed_optimizer
-from tensorlink.ml.utils.graphing import ModelParser
+from tensorlink.ml.partition.plan import ModelParser
+from tensorlink.ml.pipeline import host as pipeline_host
 from tensorlink.ml.utils.loading import (
     load_model_skeleton,
     ModelCacheManager,
@@ -267,9 +268,16 @@ class DistributedModel(nn.Module):
         verbose: bool = False,
         tokenizer=None,
         config: dict = None,
+        host_pre_units: int = 0,
+        host_post_units: int = 0,
     ):
         """
         Parameters:
+            host_pre_units / host_post_units: optional privacy feature (off by default).
+                Keep this many weight-bearing units (embedding / layers) at the start /
+                end of the model on THIS device so workers never see raw inputs or
+                outputs. If the network cannot honour it the job fails instead of
+                silently running without the privacy guarantee.
             model (nn.Module): The base model to distribute.
             n_pipelines (int): Number of parallel pipelines for computation.
             optimizer (Type[optim.Optimizer]): Optimizer class to use.
@@ -344,6 +352,11 @@ class DistributedModel(nn.Module):
         self.cache_manager = ModelCacheManager("./tmp/snapshots")
 
         self.job_id = None
+
+        # Pipeline strategy (preferred); legacy OffloadedModule path remains as fallback
+        self.host_pre_units = int(host_pre_units)
+        self.host_post_units = int(host_post_units)
+        self._pipeline = None
 
         if verbose:
             print(f"DistributedModel '{self.name}' initialized on {self.device.type}")
@@ -734,6 +747,10 @@ class DistributedModel(nn.Module):
 
         self.distributed_graph = config
 
+        # Preferred strategy: chained pipeline segments (fewer RPCs per forward).
+        if pipeline_host.is_pipeline_config(config):
+            return self._distribute_pipeline(config, model_type)
+
         # For an HF model (self.model_name != None), load the model skeleton
         if self.model_name:
             self.model = load_model_skeleton(self.model_name, model_type)
@@ -815,7 +832,7 @@ class DistributedModel(nn.Module):
 
         # Keep the KV cache on the workers: the host only tracks its length.
         parent = getattr(self.model, "model", self.model)
-        has_groups = any(
+        has_groups = getattr(self, "_pipeline", None) is not None or any(
             getattr(m, "is_layer_group", False)
             for m in getattr(parent, "offloaded_modules", [])
         )
@@ -857,6 +874,51 @@ class DistributedModel(nn.Module):
                 exc_info=True,
             )
             raise
+
+    def _distribute_pipeline(self, config: dict, model_type: str = "chat"):
+        """
+        Preferred strategy: the whole forward pass is cut into contiguous segments that
+        workers run back-to-back, passing activations directly worker -> worker
+        (see tensorlink/ml/pipeline). Raises PipelineFallback if it cannot be used.
+        """
+        if not self.model_name:
+            raise pipeline_host.PipelineFallback("pipeline needs an HF model name")
+        if self.training:
+            raise pipeline_host.PipelineFallback("pipeline is inference-only")
+        try:
+            model, program, entries, pre, post = pipeline_host.prepare_pipeline(
+                self, config, self.model_name, model_type
+            )
+        except Exception as e:
+            raise pipeline_host.PipelineFallback(f"{type(e).__name__}: {e}") from e
+
+        hops, offloaded = [], {}
+        for module_id, info in entries:
+            if info.get("type") != "offloaded_segment":
+                continue
+            worker_id = info["assigned_workers"][0]
+            file_name = f"{module_id}_{worker_id}.pt"
+            with open(file_name, "wb"):
+                pass
+            self.send_request("send_model", (file_name, worker_id, module_id, info))
+            hops.append({"worker": worker_id, "module_id": module_id})
+            offloaded[module_id] = info
+        if not hops:
+            raise pipeline_host.PipelineFallback("plan has no worker segments")
+
+        self.model = model
+        self._patch_skeleton_device(self.device)
+        self.model.n_batch = 0
+        self.model.forward_queues = {}
+        self.model.backward_queues = {}
+        self.model.intermediates = [[]]
+
+        # Workers load their segment (and link to the next worker) before replying
+        self._wait_all_modules_loaded(offloaded)
+
+        runner = pipeline_host.PipelineRunner(self, hops, pre, post, MAX_WAIT_TIME)
+        pipeline_host.install_forward(self.model, program, runner)
+        self._pipeline = runner
 
     def _wrap_hf_module(self, module_id: str, module_info: dict):
         """Handle single module offloading"""
@@ -969,18 +1031,38 @@ class DistributedModel(nn.Module):
             "optimizer": optimizer_spec,
         }
 
-        # Request job from network
-        distributed_config = self.node.send_request(
-            "request_job",
-            (self.n_pipelines, 1, distribution, self.training),
-            timeout=200,
-        )
+        distribution["strategy"] = os.environ.get("TENSORLINK_STRATEGY", "auto")
+        if self.host_pre_units or self.host_post_units:
+            distribution["host_pre_units"] = self.host_pre_units
+            distribution["host_post_units"] = self.host_post_units
+        privacy = bool(self.host_pre_units or self.host_post_units)
 
-        if not distributed_config:
-            raise RuntimeError("Could not obtain job from network... Please try again.")
+        for attempt in range(2):
+            # Request job from network
+            distributed_config = self.node.send_request(
+                "request_job",
+                (self.n_pipelines, 1, distribution, self.training),
+                timeout=200,
+            )
 
-        # Distribute the model according to the configuration
-        self.distribute_model(distributed_config)
+            if not distributed_config:
+                raise RuntimeError(
+                    "Could not obtain job from network... Please try again."
+                )
+
+            # Distribute the model according to the configuration
+            try:
+                self.distribute_model(distributed_config)
+                break
+            except pipeline_host.PipelineFallback as e:
+                # Never silently drop the privacy guarantee or an explicit request
+                if attempt or privacy or distribution["strategy"] == "pipeline":
+                    raise RuntimeError(f"Pipeline distribution failed: {e}") from e
+                logging.warning(f"Pipeline strategy unavailable ({e}); using legacy.")
+                distribution["strategy"] = "legacy"
+                if self.model_name:
+                    self.model = None
+                self._pipeline = None
 
         optimizer_type = get_optimizer_from_spec(optimizer_spec)
 
@@ -1257,6 +1339,11 @@ class DistributedModel(nn.Module):
                     waiting = False
 
                 elif status == "error":
+                    if module_info.get("strategy") == "pipeline":
+                        # Segments are linked to fixed neighbours: no single-worker swap
+                        raise pipeline_host.PipelineFallback(
+                            f"worker failed to load pipeline segment {module_id}"
+                        )
                     logging.warning(
                         f"Worker failed to load module {module_id}. "
                         f"Attempting to recruit a replacement worker..."

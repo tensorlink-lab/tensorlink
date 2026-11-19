@@ -311,7 +311,7 @@ class Connection(threading.Thread):
             level=logging.ERROR,
             tag="Connection",
         )
-        self.main_node.disconnect_node(self.node_id)
+        self.main_node.disconnect_node(self.node_id, self)
 
     def _handle_unexpected_error(self, error):
         """Handle unexpected connection errors."""
@@ -322,7 +322,7 @@ class Connection(threading.Thread):
             level=logging.ERROR,
             tag="Connection",
         )
-        self.main_node.disconnect_node(self.node_id)
+        self.main_node.disconnect_node(self.node_id, self)
 
     def _handle_connection_close(self, reason=None):
         """Handle graceful connection closure."""
@@ -334,7 +334,7 @@ class Connection(threading.Thread):
         self.main_node.debug_print(
             message, colour="bright_red", level=logging.INFO, tag="Connection"
         )
-        self.main_node.disconnect_node(self.node_id)
+        self.main_node.disconnect_node(self.node_id, self)
 
     def _write_to_file(self, file_name, buffer):
         try:

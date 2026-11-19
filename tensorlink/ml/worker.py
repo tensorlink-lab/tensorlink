@@ -17,6 +17,9 @@ from tensorlink.ml.utils.loading import (
     get_nested_module,
 )
 from tensorlink.ml.utils.injector import LayerGroupModule
+from tensorlink.ml.pipeline import wire as pipeline_wire
+from tensorlink.ml.pipeline.loader import load_segment_runner
+from tensorlink.ml.pipeline.segment import SegmentRunner
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
@@ -274,6 +277,9 @@ class DistributedWorker:
             module = self.modules[module_id]
             module_path = self.module_paths[module_id]
 
+            if isinstance(module, SegmentRunner):
+                return self._handle_pipeline_forward(module, module_id, key, size, name)
+
             data = get_from_shared_memory(size, name, encoding=None)
             args_len = int.from_bytes(data[:8], "big")
             args_bytes = data[8 : 8 + args_len]
@@ -397,6 +403,88 @@ class DistributedWorker:
                 ),
             )
 
+    def _load_pipeline_segment(self, module_info: dict):
+        model_path = self.cache_manager.load_model_path(module_info["name"])
+        runner = load_segment_runner(module_info, model_path, self.device)
+        runner.training = False
+        return runner
+
+    def _ensure_pipeline_links(self, module_info: dict):
+        """The upstream worker initiates the worker-worker connection (one direction
+        only, so two workers never dial each other simultaneously)."""
+        nxt = (module_info.get("peers") or {}).get("next")
+        if not nxt:
+            return
+        ok = self.send_request(
+            "connect_peer", (nxt["id"], nxt["host"], nxt["port"]), timeout=60
+        )
+        if not ok:
+            raise RuntimeError(f"could not link to next worker {nxt['id'][:12]}")
+
+    def _handle_pipeline_forward(self, module, module_id, key, size, name):
+        """Run our segment, then pass the result straight to the next worker, or reply
+        to the host if we are the last hop. One message in, one message out."""
+        meta = None
+        try:
+            data = get_from_shared_memory(size, name, encoding=None)
+            meta, variables = pipeline_wire.unpack(data)
+            hops, at = meta["hops"], meta["at"]
+            if hops[at]["module_id"] != module_id:
+                raise ValueError("route does not match this module")
+
+            out = module.run(variables, int(meta.get("new_tokens", 0)))
+
+            nxt = pipeline_wire.next_hop(meta)
+            if nxt is not None:
+                out_meta = {**meta, "at": at + 1}
+                target, target_module = nxt["worker"], nxt["module_id"]
+            else:
+                out_meta = dict(meta)
+                target, target_module = module.host, hops[-1]["module_id"]
+
+            payload = out["__vars__"] if nxt is not None else out
+            blob = pipeline_wire.pack(out_meta, payload)
+            osize, oname = store_in_shared_memory(blob, encoding=None)
+            self.send_request(
+                "send_forward",
+                (
+                    target,
+                    target_module,
+                    osize,
+                    oname,
+                    [meta["step"], meta["micro"], target_module],
+                ),
+            )
+        except Exception as e:
+            logging.error(
+                f"pipeline forward failed for {module_id}: {e}", exc_info=True
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [PIPELINE FAILED] {module_id}: {e}",
+                    "red",
+                    logging.ERROR,
+                ),
+            )
+            if meta is not None:  # tell the host now instead of letting it time out
+                try:
+                    last = meta["hops"][-1]["module_id"]
+                    blob = pipeline_wire.pack({**meta, "error": str(e)[:500]}, None)
+                    osize, oname = store_in_shared_memory(blob, encoding=None)
+                    self.send_request(
+                        "send_forward",
+                        (
+                            module.host,
+                            last,
+                            osize,
+                            oname,
+                            [meta["step"], meta["micro"], last],
+                        ),
+                    )
+                except Exception:
+                    pass
+
     def _handle_generate(self, module_id, size, name, stream):
         """
         Optimized text generation with optional stream generation. Called upon only
@@ -509,8 +597,13 @@ class DistributedWorker:
             # Clear memory before loading
             self.cleanup_memory()
 
+            # Pipeline segments: source is re-derived from our own HF install and
+            # checked against the plan hash (nothing is exec()'d from the network)
+            if module_info.get("strategy") == "pipeline":
+                module = self._load_pipeline_segment(module_info)
+
             # Try to load the module based on trusted status
-            if self.trusted:
+            elif self.trusted:
                 with open(file_name, "rb") as f:
                     module = pickle.load(f)
                     module = module.to(self.device)
@@ -545,6 +638,10 @@ class DistributedWorker:
 
             self.modules[module_id] = module
             self.module_paths[module_id] = module_info.get("module_path", "")
+
+            if module_info.get("strategy") == "pipeline":
+                # Upstream worker dials the next one now, so the first forward is direct
+                self._ensure_pipeline_links(module_info)
 
             if training:
                 optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
@@ -1066,10 +1163,6 @@ class DistributedWorker:
         """
         Return the already-loaded module resident on this worker whose
         module_path matches, or None if it isn't loaded here yet.
-
-        Paths are written by the same graphing.py logic on both sides
-        (tied_embed_path/tied_lm_head_path are built as f"model.{name}"),
-        so exact string equality is sufficient, no prefix fuzzing needed here.
         """
         for module_id, path in self.module_paths.items():
             if path == module_path:

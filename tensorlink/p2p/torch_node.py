@@ -398,6 +398,20 @@ class Torchnode(Smartnode):
 
             if not isinstance(key, str):
                 key = tuple(key)
+                if len(key) != 3 or key[2] not in self.modules:
+                    node.ghosts += 1
+                    return False
+
+                # Worker -> worker traffic is only accepted from the upstream neighbour
+                # the validator assigned for this module.
+                if self.role.startswith("W") and node.role.startswith("W"):
+                    prev = (
+                        (self.modules[key[2]].get("peers") or {}).get("prev") or {}
+                    ).get("id")
+                    if prev != node.node_id:
+                        node.ghosts += 1
+                        return False
+
                 # Create shared mpc block and store tensor
                 self._store_tensor_in_shared_memory(key, tensor)
                 return True
@@ -510,6 +524,9 @@ class Torchnode(Smartnode):
                 tag="Torchnode",
             )
 
+            # Neighbours are set by the validator's JOB-REQ only, never by the user
+            module_info["peers"] = (self.modules.get(module_id) or {}).get("peers")
+
             module_info["mem_info"] = module_id
             module_info["host"] = node.node_id
             module_info["forward_queue"] = {}
@@ -592,6 +609,7 @@ class Torchnode(Smartnode):
                 "check_train": self._handle_check_train,
                 "check_validators": self._handle_check_validators,
                 "connect_node": self._handle_connect_node,
+                "connect_peer": self._handle_connect_peer,
                 "debug_print": self._handle_debug_print,
                 "generate": self._handle_send_generate,
                 "get_workers": self._handle_get_workers_request,
@@ -999,6 +1017,11 @@ class Torchnode(Smartnode):
         host, port, node_id = request["args"]
         connected = self.connect_node(host, port, node_id)
         self.response_queue.put({"status": "SUCCESS", "return": connected})
+
+    def _handle_connect_peer(self, request):
+        node_id, host, port = request["args"]
+        connected = self.connect_peer(node_id, host, port)
+        self.response_queue.put({"status": "SUCCESS", "return": bool(connected)})
 
     def _handle_get_info(self, request):
         self.response_queue.put(

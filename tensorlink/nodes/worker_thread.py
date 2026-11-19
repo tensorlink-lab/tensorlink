@@ -125,12 +125,10 @@ class WorkerThread(Torchnode):
         try:
             if node.role == "V":
                 # Accept job request from validator if we can handle it
-                (
-                    user_id,
-                    job_id,
-                    module_id,
-                    module_info,
-                ) = json.loads(data[7:])
+                parts = json.loads(data[7:])
+                user_id, job_id, module_id, module_info = parts[:4]
+                # Optional 5th element: pipeline neighbours chosen by the validator
+                peers = parts[4] if len(parts) > 4 else None
 
                 module_size = module_info["memory"]
                 model_name = module_info["name"]
@@ -141,6 +139,16 @@ class WorkerThread(Torchnode):
                 if self.available_gpu_memory >= module_size:
                     # Store a request to wait for the user connection
                     self._store_request(user_id, module_id + model_name)
+
+                    if peers:
+                        # Both neighbours are authorised for the worker-worker gate in
+                        # Smartnode._validate_node_credentials: upstream dials us, and
+                        # we dial downstream.
+                        for side in ("prev", "next"):
+                            peer = peers.get(side)
+                            if peer:
+                                self._store_request(peer["id"], module_id + model_name)
+                        module_info["peers"] = peers
 
                     if training:
                         self._store_request(user_id, "OPTIMIZER" + optimizer_name)

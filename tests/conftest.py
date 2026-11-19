@@ -64,6 +64,22 @@ def max_module_gb(pytestconfig):
 
 
 @pytest.fixture(scope="module")
+def worker_memory_gb(max_memory_gb):
+    """Per-module worker cap. Test modules can override this per param."""
+    return max_memory_gb
+
+
+@pytest.fixture(scope="module")
+def validator_memory_gb(max_memory_gb):
+    return max_memory_gb
+
+
+@pytest.fixture(scope="module")
+def validator_module_gb(max_module_gb):
+    return max_module_gb
+
+
+@pytest.fixture(scope="module")
 def uwv_nodes(print_level, max_memory_gb, max_module_gb):
     """
     Create User-Worker-Validator node group for tests.
@@ -120,7 +136,14 @@ def uwv_nodes(print_level, max_memory_gb, max_module_gb):
 
 
 @pytest.fixture(scope="module")
-def wwv_nodes(print_level, max_memory_gb, max_module_gb):
+def wwv_nodes(
+    print_level,
+    max_memory_gb,
+    max_module_gb,
+    worker_memory_gb,
+    validator_memory_gb,
+    validator_module_gb,
+):
     """
     Create Worker-Worker-Validator node group for tests.
     Only one node group fixture should be used per test to avoid having 6 processes active.
@@ -134,10 +157,10 @@ def wwv_nodes(print_level, max_memory_gb, max_module_gb):
             endpoint=True,
             endpoint_url="127.0.0.1",
             load_previous_state=False,
-            max_memory_gb=max_memory_gb,
+            max_memory_gb=validator_memory_gb,
         ),
         enable_hosting=ENABLE_HOSTED_MODULES,
-        max_module_gb=max_module_gb,
+        max_module_gb=validator_module_gb,
         benchmark=False,
     )
 
@@ -148,7 +171,7 @@ def wwv_nodes(print_level, max_memory_gb, max_module_gb):
             local_test=LOCAL,
             print_level=print_level,
             load_previous_state=False,
-            max_memory_gb=max_memory_gb,
+            max_memory_gb=worker_memory_gb,
         ),
         benchmark=False,
     )
@@ -161,7 +184,7 @@ def wwv_nodes(print_level, max_memory_gb, max_module_gb):
             print_level=print_level,
             load_previous_state=False,
             duplicate="1",
-            max_memory_gb=max_memory_gb,
+            max_memory_gb=worker_memory_gb,
         ),
         benchmark=False,
     )
@@ -174,11 +197,13 @@ def wwv_nodes(print_level, max_memory_gb, max_module_gb):
     worker.cleanup()
     worker2.cleanup()
     validator.cleanup()
-    time.sleep(30)
+    time.sleep(10)
 
 
 @pytest.fixture(scope="module")
-def connected_uwv_nodes(uwv_nodes):
+def connected_uwv_nodes(
+    uwv_nodes,
+):
     """
     Fully connected User-Worker-Validator network.
     """
