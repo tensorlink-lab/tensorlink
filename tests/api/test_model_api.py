@@ -41,14 +41,26 @@ MODELS = [
         },
         id="smollm2-135m",
     ),
-    # pytest.param(
-    #     {
-    #         "name": "Qwen/Qwen3-0.6B",
-    #         "model_type": "causal",
-    #         "timeout": 90,
-    #         "parsed": True,
-    #     }
-    # )
+    pytest.param(
+        {
+            "name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+            "model_type": "causal",
+            "timeout": 90,
+            "parsed": True,
+        }
+    ),
+    pytest.param(
+        {
+            "name": "Qwen/Qwen3-0.6B",
+            "model_type": "causal",
+            "timeout": 180,
+            "parsed": True,
+            "worker_memory_gb": 1.1,
+            "validator_memory_gb": 0.5,
+            "validator_module_gb": 0.5,
+        },
+        id="qwen3-0.6b",
+    ),
 ]
 
 
@@ -73,23 +85,42 @@ def get_model_status(model_name: str, timeout: int = 10) -> requests.Response:
     )
 
 
-@pytest.fixture(params=MODELS, scope="module")
-def model_env(request, connected_wwv_nodes):
+@pytest.fixture(scope="module", params=MODELS)
+def model_cfg(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def worker_memory_gb(model_cfg, max_memory_gb):
+    return model_cfg.get("worker_memory_gb", max_memory_gb)
+
+
+@pytest.fixture(scope="module")
+def validator_memory_gb(model_cfg, max_memory_gb):
+    return model_cfg.get("validator_memory_gb", max_memory_gb)
+
+
+@pytest.fixture(scope="module")
+def validator_module_gb(model_cfg, max_module_gb):
+    return model_cfg.get("validator_module_gb", max_module_gb)
+
+
+@pytest.fixture(scope="module")
+def model_env(model_cfg, connected_wwv_nodes):
     """
-    Uses existing WWV setup but guarantees fresh nodes per model param.
+    Requests the model on nodes built for this param.
     """
-    cfg = request.param
+    cfg = model_cfg
     worker, worker2, validator, _ = connected_wwv_nodes
 
     response = request_model(cfg["name"], cfg["model_type"], cfg["timeout"])
-
     assert response.status_code == 200
     time.sleep(1)
 
     yield cfg, (worker, worker2, validator)
 
     print(f"Waiting before switching away from {cfg['name']}...")
-    time.sleep(5)
+    time.sleep(3)
 
 
 @pytest.fixture(scope="module")
@@ -123,30 +154,18 @@ def active_model_env(model_env):
 
 
 # ========== Model Status Tests ==========
-
-
 @pytest.mark.order(1)
-def test_status_before_request(connected_wwv_nodes):
+def test_status_before_request(model_cfg, connected_wwv_nodes):
     """
     Query status before any model request has been made.
     """
-    for param in MODELS:
-        cfg = param.values[0]
-        response = get_model_status(cfg["name"])
-        assert response.status_code == 200, (
-            f"[{cfg['name']}] Status check failed with "
-            f"{response.status_code}: {response.text}"
-        )
-
-        result = response.json()
-        assert (
-            "status" in result
-        ), f"[{cfg['name']}] Response missing 'status' field: {result}"
-        assert result["status"] == "inactive", (
-            f"[{cfg['name']}] Expected 'inactive' before model request, "
-            f"got '{result['status']}'"
-        )
-        print(f"✅ [{cfg['name']}] status before request: '{result['status']}'")
+    cfg = model_cfg
+    response = get_model_status(cfg["name"])
+    assert (
+        response.status_code == 200
+    ), f"[{cfg['name']}] {response.status_code}: {response.text}"
+    result = response.json()
+    assert result.get("status") == "inactive", f"[{cfg['name']}] got {result}"
 
 
 @pytest.mark.order(2)

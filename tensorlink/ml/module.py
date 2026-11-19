@@ -17,9 +17,12 @@ import os
 from tensorlink.ml.utils.injector import (
     generate_new_forward_method,
     get_loop_io_signature,
+    RemoteKVCache,
+    swap_remote_cache,
 )
 from tensorlink.ml.optim import create_distributed_optimizer
-from tensorlink.ml.utils.graphing import ModelParser
+from tensorlink.ml.partition.plan import ModelParser
+from tensorlink.ml.pipeline import host as pipeline_host
 from tensorlink.ml.utils.loading import (
     load_model_skeleton,
     ModelCacheManager,
@@ -61,6 +64,31 @@ from tensorlink.utils.shared_memory import (
 
 MAX_WAIT_TIME = 150
 MAX_REPLACEMENT_ATTEMPTS = 3
+
+# Per-forward timing lines go through a blocking IPC round-trip to the node.
+# Set TENSORLINK_DEBUG_TIMING=0 to skip them entirely.
+DEBUG_TIMING = os.environ.get("TENSORLINK_DEBUG_TIMING", "1") != "0"
+
+
+class StageTimer:
+    """Records named lap times and formats them for debug output."""
+
+    def __init__(self):
+        self._start = self._last = time.perf_counter()
+        self.laps = {}
+
+    def lap(self, name):
+        now = time.perf_counter()
+        self.laps[name] = now - self._last
+        self._last = now
+
+    @property
+    def total(self):
+        return time.perf_counter() - self._start
+
+    def __str__(self):
+        parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
+        return f"{parts}, total={self.total:.4f}s"
 
 
 def contains_offloaded(module: nn.Module):
@@ -240,9 +268,16 @@ class DistributedModel(nn.Module):
         verbose: bool = False,
         tokenizer=None,
         config: dict = None,
+        host_pre_units: int = 0,
+        host_post_units: int = 0,
     ):
         """
         Parameters:
+            host_pre_units / host_post_units: optional privacy feature (off by default).
+                Keep this many weight-bearing units (embedding / layers) at the start /
+                end of the model on THIS device so workers never see raw inputs or
+                outputs. If the network cannot honour it the job fails instead of
+                silently running without the privacy guarantee.
             model (nn.Module): The base model to distribute.
             n_pipelines (int): Number of parallel pipelines for computation.
             optimizer (Type[optim.Optimizer]): Optimizer class to use.
@@ -317,6 +352,11 @@ class DistributedModel(nn.Module):
         self.cache_manager = ModelCacheManager("./tmp/snapshots")
 
         self.job_id = None
+
+        # Pipeline strategy (preferred); legacy OffloadedModule path remains as fallback
+        self.host_pre_units = int(host_pre_units)
+        self.host_post_units = int(host_post_units)
+        self._pipeline = None
 
         if verbose:
             print(f"DistributedModel '{self.name}' initialized on {self.device.type}")
@@ -707,6 +747,10 @@ class DistributedModel(nn.Module):
 
         self.distributed_graph = config
 
+        # Preferred strategy: chained pipeline segments (fewer RPCs per forward).
+        if pipeline_host.is_pipeline_config(config):
+            return self._distribute_pipeline(config, model_type)
+
         # For an HF model (self.model_name != None), load the model skeleton
         if self.model_name:
             self.model = load_model_skeleton(self.model_name, model_type)
@@ -786,6 +830,17 @@ class DistributedModel(nn.Module):
         args = attach_tensor(args, self.device)
         kwargs = attach_tensor(kwargs, self.device)
 
+        # Keep the KV cache on the workers: the host only tracks its length.
+        parent = getattr(self.model, "model", self.model)
+        has_groups = getattr(self, "_pipeline", None) is not None or any(
+            getattr(m, "is_layer_group", False)
+            for m in getattr(parent, "offloaded_modules", [])
+        )
+        if has_groups and not self.training and "past_key_values" not in kwargs:
+            kwargs["past_key_values"] = RemoteKVCache(
+                config=getattr(self.model, "config", None)
+            )
+
         try:
             with _set_micro(self._thread_local, 0):
                 return self.model.generate(*args, **kwargs)
@@ -819,6 +874,51 @@ class DistributedModel(nn.Module):
                 exc_info=True,
             )
             raise
+
+    def _distribute_pipeline(self, config: dict, model_type: str = "chat"):
+        """
+        Preferred strategy: the whole forward pass is cut into contiguous segments that
+        workers run back-to-back, passing activations directly worker -> worker
+        (see tensorlink/ml/pipeline). Raises PipelineFallback if it cannot be used.
+        """
+        if not self.model_name:
+            raise pipeline_host.PipelineFallback("pipeline needs an HF model name")
+        if self.training:
+            raise pipeline_host.PipelineFallback("pipeline is inference-only")
+        try:
+            model, program, entries, pre, post = pipeline_host.prepare_pipeline(
+                self, config, self.model_name, model_type
+            )
+        except Exception as e:
+            raise pipeline_host.PipelineFallback(f"{type(e).__name__}: {e}") from e
+
+        hops, offloaded = [], {}
+        for module_id, info in entries:
+            if info.get("type") != "offloaded_segment":
+                continue
+            worker_id = info["assigned_workers"][0]
+            file_name = f"{module_id}_{worker_id}.pt"
+            with open(file_name, "wb"):
+                pass
+            self.send_request("send_model", (file_name, worker_id, module_id, info))
+            hops.append({"worker": worker_id, "module_id": module_id})
+            offloaded[module_id] = info
+        if not hops:
+            raise pipeline_host.PipelineFallback("plan has no worker segments")
+
+        self.model = model
+        self._patch_skeleton_device(self.device)
+        self.model.n_batch = 0
+        self.model.forward_queues = {}
+        self.model.backward_queues = {}
+        self.model.intermediates = [[]]
+
+        # Workers load their segment (and link to the next worker) before replying
+        self._wait_all_modules_loaded(offloaded)
+
+        runner = pipeline_host.PipelineRunner(self, hops, pre, post, MAX_WAIT_TIME)
+        pipeline_host.install_forward(self.model, program, runner)
+        self._pipeline = runner
 
     def _wrap_hf_module(self, module_id: str, module_info: dict):
         """Handle single module offloading"""
@@ -887,6 +987,10 @@ class DistributedModel(nn.Module):
             offloaded_module.spawn_worker(file_name, module_info)
             offloaded_modules.append(offloaded_module)
 
+        if offloaded_modules:
+            # The last group advances the host-side KV length once per step
+            offloaded_modules[-1].is_last_group = True
+
         self._inject_grouped_layer_forward(offloaded_modules)
 
     def _inject_grouped_layer_forward(
@@ -927,18 +1031,38 @@ class DistributedModel(nn.Module):
             "optimizer": optimizer_spec,
         }
 
-        # Request job from network
-        distributed_config = self.node.send_request(
-            "request_job",
-            (self.n_pipelines, 1, distribution, self.training),
-            timeout=200,
-        )
+        distribution["strategy"] = os.environ.get("TENSORLINK_STRATEGY", "auto")
+        if self.host_pre_units or self.host_post_units:
+            distribution["host_pre_units"] = self.host_pre_units
+            distribution["host_post_units"] = self.host_post_units
+        privacy = bool(self.host_pre_units or self.host_post_units)
 
-        if not distributed_config:
-            raise RuntimeError("Could not obtain job from network... Please try again.")
+        for attempt in range(2):
+            # Request job from network
+            distributed_config = self.node.send_request(
+                "request_job",
+                (self.n_pipelines, 1, distribution, self.training),
+                timeout=200,
+            )
 
-        # Distribute the model according to the configuration
-        self.distribute_model(distributed_config)
+            if not distributed_config:
+                raise RuntimeError(
+                    "Could not obtain job from network... Please try again."
+                )
+
+            # Distribute the model according to the configuration
+            try:
+                self.distribute_model(distributed_config)
+                break
+            except pipeline_host.PipelineFallback as e:
+                # Never silently drop the privacy guarantee or an explicit request
+                if attempt or privacy or distribution["strategy"] == "pipeline":
+                    raise RuntimeError(f"Pipeline distribution failed: {e}") from e
+                logging.warning(f"Pipeline strategy unavailable ({e}); using legacy.")
+                distribution["strategy"] = "legacy"
+                if self.model_name:
+                    self.model = None
+                self._pipeline = None
 
         optimizer_type = get_optimizer_from_spec(optimizer_spec)
 
@@ -1215,6 +1339,11 @@ class DistributedModel(nn.Module):
                     waiting = False
 
                 elif status == "error":
+                    if module_info.get("strategy") == "pipeline":
+                        # Segments are linked to fixed neighbours: no single-worker swap
+                        raise pipeline_host.PipelineFallback(
+                            f"worker failed to load pipeline segment {module_id}"
+                        )
                     logging.warning(
                         f"Worker failed to load module {module_id}. "
                         f"Attempting to recruit a replacement worker..."
@@ -1311,6 +1440,7 @@ class OffloadedModule(nn.Module):
         self.n_batch = 0
 
         self.is_layer_group = False
+        self.is_last_group = False
         self.layer_range = None
         self.training = self.parent_model.training
 
@@ -1388,45 +1518,45 @@ class OffloadedModule(nn.Module):
         return output
 
     def forward(self, *args, **kwargs):
-        start_time = time.time()
+        timer = StageTimer()
+        path = getattr(self, "module_path", self.module_name)
         try:
             n_batch = self.parent_model.model.n_batch
             n_micro = getattr(self.parent_model._thread_local, "micro", None)
             tag = [n_batch, n_micro, self.module_id]
 
-            # Store the intermediate tensor for backwards pass
-            if not self.entire_model:
+            # Store the intermediate tensor for backwards pass (training only)
+            if self.training and not self.entire_model:
                 self.parent_model.model.intermediates[n_micro].append(
                     [handle_output(args), self.module_id]
                 )
-
-            # send_report = debug_structure(
-            #     {"args": args, "kwargs": kwargs},
-            #     name=(
-            #         f"[SEND] module_id={self.module_id} "
-            #         f"path={getattr(self, 'module_path', self.module_name)} "
-            #         f"micro={n_micro} batch={n_batch}"
-            #     ),
-            # )
-            # self.parent_model.send_request(
-            #     "debug_print",
-            #     (f"OffloadedModule -> {send_report}", "bright_magenta", logging.DEBUG),
-            # )
+            timer.lap("store_intermediate")
 
             detached_args = detach_tensor(args, clone=True)
+            timer.lap("detach")
+
             args_bytes = tensor_to_bytes(detached_args)
-            kwargs_bytes = tensor_to_bytes(kwargs)
+            timer.lap("args_to_bytes")
+
+            # A RemoteKVCache is replaced by a tiny reference; workers keep the real one
+            send_kwargs, remote_cache = (
+                swap_remote_cache(kwargs) if self.is_layer_group else (kwargs, None)
+            )
+            kwargs_bytes = tensor_to_bytes(send_kwargs)
+            timer.lap("kwargs_to_bytes")
+
             forward_bytes = (
                 len(args_bytes).to_bytes(8, "big") + args_bytes + kwargs_bytes
             )
-
             size, shm_name = store_in_shared_memory(forward_bytes, encoding=None)
+            timer.lap("shm_store")
 
             # Relay forward pass to next roles
             self.parent_model.send_request(
                 "send_forward",
                 (self.worker_id, self.module_id, size, shm_name, tag),
             )
+            timer.lap("send")
 
             # Wait for response
             key = (n_batch, n_micro, self.module_id)
@@ -1434,72 +1564,69 @@ class OffloadedModule(nn.Module):
 
             while output_bytes is None:
                 time.sleep(0.01)
-                response = self.parent_model.send_request(
-                    "check_forward",
-                    key,
-                )
+                response = self.parent_model.send_request("check_forward", key)
 
                 if response is not None:
                     size, name = response
                     output_bytes = get_from_shared_memory(size, name, encoding=None)
                     break
 
-                if time.time() - start_time >= MAX_WAIT_TIME:
+                if timer.total >= MAX_WAIT_TIME:
                     raise TimeoutError(
                         f"Timed out waiting for forward response: "
-                        f"module_id={self.module_id}, "
-                        f"batch={n_batch}, micro={n_micro}, "
-                        f"elapsed={time.time() - start_time:.3f}s"
+                        f"module_id={self.module_id}, batch={n_batch}, "
+                        f"micro={n_micro}, elapsed={timer.total:.3f}s"
                     )
+            timer.lap("wait_response")
 
             output = bytes_to_tensor(output_bytes)
-            output = attach_tensor(output, self.parent_model.device)
+            timer.lap("bytes_to_tensor")
 
-            # recv_report = debug_structure(
-            #     output,
-            #     name=(
-            #         f"[RECV] module_id={self.module_id} "
-            #         f"path={getattr(self, 'module_path', self.module_name)} "
-            #         f"elapsed={time.time() - start_time:.3f}s"
-            #     ),
-            # )
-            # self.parent_model.send_request(
-            #     "debug_print",
-            #     (f"OffloadedModule -> {recv_report}", "bright_cyan", logging.DEBUG),
-            # )
+            output = attach_tensor(output, self.parent_model.device)
+            timer.lap("attach")
 
             if self.training:
                 output = enable_grad(output)
+                timer.lap("enable_grad")
 
             self.parent_model.send_request(
-                "release_memory",
-                ("forward_queue", self.module_id, key),
+                "release_memory", ("forward_queue", self.module_id, key)
             )
-            inter_storage = [
-                self.module_id,
-                output,
-            ]
 
-            # Store intermediates and connection for backwards pass
-            self.parent_model.model.intermediates[n_micro].append(inter_storage)
+            # Store intermediates and connection for backwards pass (training only)
+            if self.training:
+                self.parent_model.model.intermediates[n_micro].append(
+                    [self.module_id, output]
+                )
+
+            # All groups have now seen this step's tokens
+            if remote_cache is not None and self.is_last_group:
+                remote_cache.advance_from_kwargs(kwargs)
+
+            if DEBUG_TIMING:
+                self.parent_model.send_request(
+                    "debug_print",
+                    (
+                        f"OffloadedModule -> [FORWARD] module_id={self.module_id} "
+                        f"path={path} micro={n_micro} batch={n_batch} "
+                        f"sent={len(forward_bytes) / 1e3:.1f}KB | {timer}",
+                        "bright_magenta",
+                        logging.DEBUG,
+                    ),
+                )
             return output
 
         except Exception as e:
-            elapsed = time.time() - start_time
-
             self.parent_model.send_request(
                 "debug_print",
                 (
                     f"OffloadedModule.forward failed: "
-                    f"module_id={getattr(self, 'module_id', None)} "
-                    f"path={getattr(self, 'module_path', self.module_name)} "
-                    f"elapsed={elapsed:.3f}s "
-                    f"error={type(e).__name__}: {e}",
+                    f"module_id={getattr(self, 'module_id', None)} path={path} "
+                    f"elapsed={timer.total:.3f}s error={type(e).__name__}: {e}",
                     "bright_red",
                     logging.ERROR,
                 ),
             )
-
             raise
 
     def add_distributed_parameter(self, name, distributed_param):

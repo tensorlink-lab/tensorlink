@@ -8,10 +8,12 @@ from tensorlink.api.models import (
     ModelDistributionEntry,
     EmbeddingCreateRequest,
 )
-from tensorlink.api.functions import build_hf_job_data, build_text_request
+from tensorlink.api.utils import build_hf_job_data, build_text_request
 from tensorlink.ml.utils.model_types import ModelType
-from tensorlink.api.generation import GenerationMixin
-from tensorlink.api.embeddings import EmbeddingMixin
+from tensorlink.api.tools.generation import GenerationMixin
+from tensorlink.api.tools.embeddings import EmbeddingMixin
+from tensorlink.api.tools.agents import AgentMixin
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, APIRouter, Request, Query
 from threading import Thread
 import traceback
@@ -20,22 +22,33 @@ import uvicorn
 import asyncio
 
 
-class TensorlinkAPI(GenerationMixin, EmbeddingMixin):
+DEFAULT_CORS_ORIGINS = ["https://tensorlink.io"]
+
+
+class TensorlinkAPI(GenerationMixin, EmbeddingMixin, AgentMixin):
     """
     Supports API requests to request and interact with models, along with
     probing node & job information.
     """
 
-    def __init__(self, smart_node, host="0.0.0.0", port=64747):
+    def __init__(self, smart_node, host="127.0.0.1", port=64747):
         self.smart_node = smart_node
         self.host = host
         self.port = port
         self.app = FastAPI()
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=DEFAULT_CORS_ORIGINS,
+            allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",  # local dev servers
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
         self.router = APIRouter()
         self.server_loop = None
 
         self._init_generation_state()
         self._init_embedding_state()
+        self._init_agent_state()
         self._define_routes()
         self._start_server()
 

@@ -1,6 +1,6 @@
 import traceback
-
-from tensorlink.ml.utils.graphing import ModelParser
+from tensorlink.ml.partition.partitioner import ModelPartitioner
+from tensorlink.ml.partition.plan import ModelParser
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, DistributedEmbedding, OffloadedModule
 from tensorlink.ml.embedding import EmbeddingManager, EmbeddingUnavailable
@@ -470,10 +470,46 @@ class DistributedValidator(DistributedWorker):
                 # Never sharded: the whole model goes on one worker
                 distribution = self._embedding_worker_distribution(model_name, workers)
             else:
-                distribution = parser.create_distributed_config(
-                    model_name,
-                    **kwargs,
-                )
+                distribution = None
+                strategy = job_data.get("strategy", "auto")
+                pre_n = int(job_data.get("host_pre_units", 0) or 0)
+                post_n = int(job_data.get("host_post_units", 0) or 0)
+                privacy = bool(pre_n or post_n)
+
+                # Preferred: chained pipeline segments (inference only)
+                if strategy in ("auto", "pipeline") and not kwargs["training"]:
+                    distribution = ModelPartitioner().create_pipeline_config_for_name(
+                        model_name,
+                        workers,
+                        model_type=kwargs["model_type"],
+                        batch_size=kwargs["batch_size"],
+                        max_seq_len=kwargs["max_seq_len"],
+                        host_pre_units=pre_n,
+                        host_post_units=post_n,
+                        host_max_memory_bytes=host_memory_budget,
+                    )
+                    if not distribution.get("success"):
+                        self.send_request(
+                            "debug_print",
+                            (
+                                f"Pipeline plan unavailable for {model_name}: "
+                                f"{distribution.get('error')}",
+                                "yellow",
+                                logging.WARNING,
+                            ),
+                        )
+                        if privacy or strategy == "pipeline":
+                            # Do not fall back: the requested guarantee would be lost
+                            return {}
+                        distribution = None
+                elif privacy:
+                    return {}
+
+                if distribution is None:
+                    distribution = parser.create_distributed_config(
+                        model_name,
+                        **kwargs,
+                    )
 
         except Exception as e:
             logging.exception(

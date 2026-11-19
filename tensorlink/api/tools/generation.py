@@ -11,7 +11,7 @@ from tensorlink.api.models import (
     ImageResponseRequest,
     EmbeddingResponseRequest,
 )
-from tensorlink.api.functions import build_text_request
+from tensorlink.api.utils import build_text_request
 from tensorlink.ml.utils.formatter import ResponseFormatter
 from fastapi.responses import StreamingResponse
 from fastapi import HTTPException
@@ -33,28 +33,37 @@ class GenerationMixin:
         self.api_loop: asyncio.AbstractEventLoop = None
         self._cancelled_requests: set = set()
 
-    async def _dispatch_text(self, gen_request: GenerationRequest):
-        start_time = time.time()
-        self._log_model_request(gen_request.hf_name)
-        gen_request.output = None
-        gen_request.id = hash(f"req_{random.random()}")
-
-        model_status = self._check_model_status(gen_request.hf_name)
+    def _assert_model_ready(self, model_name: str):
+        """Raise 503 unless the model is loaded (triggering a load if needed)."""
+        model_status = self._check_model_status(model_name)
         status = model_status["status"]
 
         if status == "not_loaded":
-            self._trigger_model_load(gen_request.hf_name)
+            self._trigger_model_load(model_name)
             raise HTTPException(
                 status_code=503,
-                detail=f"Model '{gen_request.hf_name}' requested. Try again shortly.",
+                detail=f"Model '{model_name}' requested. Try again shortly.",
             )
         if status != "loaded":
             # "loading" or "error": never dispatch to a model that isn't ready
             raise HTTPException(
                 status_code=503,
                 detail=model_status.get("message")
-                or f"Model {gen_request.hf_name} is still loading.",
+                or f"Model {model_name} is still loading.",
             )
+
+    async def _dispatch_text(self, gen_request: GenerationRequest):
+        start_time = time.time()
+        self._log_model_request(gen_request.hf_name)
+        gen_request.output = None
+        gen_request.id = hash(f"req_{random.random()}")
+
+        self._assert_model_ready(gen_request.hf_name)
+
+        # Tool-augmented generation (tools/agents.py). It issues its own
+        # GenerationRequests with web_search="off", so this cannot recurse.
+        if gen_request.web_search != "off":
+            return await self._dispatch_agentic(gen_request, start_time)
 
         self.smart_node.debug_print(
             f"Dispatching request: {gen_request}",
@@ -72,6 +81,30 @@ class GenerationMixin:
         if getattr(gen_request, "formatted_response", None):
             return gen_request.formatted_response
         return {"text": gen_request.output}
+
+    async def _generate_turn(
+        self, turn: GenerationRequest, timeout: int = 300
+    ) -> GenerationRequest:
+        """
+        One non-streaming generation through the ML process, for agent loops.
+        Unlike _dispatch_text it raises HTTPException when the ML process
+        reports an error instead of returning the error body.
+        """
+        turn.output = None
+        turn.formatted_response = None
+        turn.id = hash(f"turn_{random.random()}")
+        done = await self._wait_for_result(turn, timeout=timeout)
+
+        formatted = getattr(done, "formatted_response", None)
+        error = formatted.get("error") if isinstance(formatted, dict) else None
+        if isinstance(error, dict):
+            raise HTTPException(
+                status_code=int(
+                    error.get("status_code") or formatted.get("status_code") or 500
+                ),
+                detail=str(error.get("message") or "generation failed"),
+            )
+        return done
 
     async def _handle_text_response(self, request: TextResponseRequest):
         return await self._dispatch_text(build_text_request(request))

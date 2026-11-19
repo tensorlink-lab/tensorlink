@@ -17,6 +17,9 @@ from tensorlink.ml.utils.loading import (
     get_nested_module,
 )
 from tensorlink.ml.utils.injector import LayerGroupModule
+from tensorlink.ml.pipeline import wire as pipeline_wire
+from tensorlink.ml.pipeline.loader import load_segment_runner
+from tensorlink.ml.pipeline.segment import SegmentRunner
 from tensorlink.utils.shared_memory import (
     get_from_shared_memory,
     store_in_shared_memory,
@@ -247,38 +250,60 @@ class DistributedWorker:
 
     def _handle_forward(self, module_id, key, size, name):
         """Handle forward pass with proper KV cache structure preservation"""
+
+        class StageTimer:
+            """Records named lap times and formats them for debug output."""
+
+            def __init__(self):
+                self._start = self._last = time.perf_counter()
+                self.laps = {}
+
+            def lap(self, name):
+                now = time.perf_counter()
+                self.laps[name] = now - self._last
+                self._last = now
+
+            @property
+            def total(self):
+                return time.perf_counter() - self._start
+
+            def __str__(self):
+                parts = ", ".join(f"{k}={v:.4f}s" for k, v in self.laps.items())
+                return f"{parts}, total={self.total:.4f}s"
+
         module_path = "-"
+        timer = StageTimer()
         try:
             module = self.modules[module_id]
             module_path = self.module_paths[module_id]
 
-            # Get data from shared memory
+            if isinstance(module, SegmentRunner):
+                return self._handle_pipeline_forward(module, module_id, key, size, name)
+
             data = get_from_shared_memory(size, name, encoding=None)
             args_len = int.from_bytes(data[:8], "big")
             args_bytes = data[8 : 8 + args_len]
             kwargs_bytes = data[8 + args_len :]
+            timer.lap("shm_read")
+
             args = bytes_to_tensor(args_bytes)
+            timer.lap("args_from_bytes")
+
             kwargs = bytes_to_tensor(kwargs_bytes)
+            timer.lap("kwargs_from_bytes")
+
             inp = attach_tensor(args, self.device)
             kwargs = attach_tensor(kwargs, self.device)
+            timer.lap("attach")
 
             if module.training:
                 inp = enable_grad(inp)
                 kwargs = enable_grad(kwargs)
+                timer.lap("enable_grad")
 
             if not isinstance(inp, (list, tuple)):
                 inp = (inp,)
 
-            # recv_report = debug_structure(
-            #     {"args": inp, "kwargs": kwargs},
-            #     name=f"[RECV] module_id={module_id} path={module_path}",
-            # )
-            # self.send_request(
-            #     "debug_print",
-            #     (f"DistributedWorker -> {recv_report}", "magenta", logging.DEBUG),
-            # )
-
-            # Forward pass
             try:
                 if self.use_amp and module.training:
                     with amp.autocast():
@@ -300,13 +325,9 @@ class DistributedWorker:
                         logging.ERROR,
                     ),
                 )
-                # self.send_request(
-                #     "report_module_error",
-                #     (module_id, "forward", str(fwd_err)),
-                # )
                 return
+            timer.lap("forward")
 
-            # Store intermediate results if training
             if module.training:
                 try:
                     module.intermediates[key] = {
@@ -323,38 +344,35 @@ class DistributedWorker:
                             logging.ERROR,
                         ),
                     )
-                    # self.send_request(
-                    #     "report_module_error",
-                    #     (module_id, "store_intermediate", str(store_err)),
-                    # )
                     return
-
-            # send_report = debug_structure(
-            #     out,
-            #     name=f"[SEND] module_id={module_id} path={module_path}",
-            # )
-            # self.send_request(
-            #     "debug_print",
-            #     (f"DistributedWorker -> {send_report}", "cyan", logging.DEBUG),
-            # )
-
-            # Detach and store output
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                timer.lap("store_intermediate")
 
             detached_out = detach_tensor(out)
+            timer.lap("detach")
+
             output_bytes = tensor_to_bytes(detached_out)
+            timer.lap("out_to_bytes")
+
             out_size, out_name = store_in_shared_memory(output_bytes, encoding=None)
+            timer.lap("shm_store")
+
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [FORWARD] module_id={module_id} "
+                    f"path={module_path} | {timer}",
+                    "cyan",
+                    logging.DEBUG,
+                ),
+            )
 
             self.send_request(
                 "send_forward", (module.host, module_id, out_size, out_name, key)
             )
 
-            # Incremental training counter
             if module.training:
                 module.n_batch += 1
 
-            # Strategic memory management
             if self.device.type == "cuda" and module.n_batch % 20 == 0:
                 torch.cuda.empty_cache()
 
@@ -368,10 +386,6 @@ class DistributedWorker:
                     logging.ERROR,
                 ),
             )
-            # self.send_request(
-            #     "report_module_error",
-            #     (module_id, "unknown_module", "module_id not found on worker"),
-            # )
 
         except Exception as e:
             logging.error(
@@ -388,11 +402,88 @@ class DistributedWorker:
                     logging.ERROR,
                 ),
             )
-            # TODO:
-            # self.send_request(
-            #     "report_module_error",
-            #     (module_id, "unhandled", str(e)),
-            # )
+
+    def _load_pipeline_segment(self, module_info: dict):
+        model_path = self.cache_manager.load_model_path(module_info["name"])
+        runner = load_segment_runner(module_info, model_path, self.device)
+        runner.training = False
+        return runner
+
+    def _ensure_pipeline_links(self, module_info: dict):
+        """The upstream worker initiates the worker-worker connection (one direction
+        only, so two workers never dial each other simultaneously)."""
+        nxt = (module_info.get("peers") or {}).get("next")
+        if not nxt:
+            return
+        ok = self.send_request(
+            "connect_peer", (nxt["id"], nxt["host"], nxt["port"]), timeout=60
+        )
+        if not ok:
+            raise RuntimeError(f"could not link to next worker {nxt['id'][:12]}")
+
+    def _handle_pipeline_forward(self, module, module_id, key, size, name):
+        """Run our segment, then pass the result straight to the next worker, or reply
+        to the host if we are the last hop. One message in, one message out."""
+        meta = None
+        try:
+            data = get_from_shared_memory(size, name, encoding=None)
+            meta, variables = pipeline_wire.unpack(data)
+            hops, at = meta["hops"], meta["at"]
+            if hops[at]["module_id"] != module_id:
+                raise ValueError("route does not match this module")
+
+            out = module.run(variables, int(meta.get("new_tokens", 0)))
+
+            nxt = pipeline_wire.next_hop(meta)
+            if nxt is not None:
+                out_meta = {**meta, "at": at + 1}
+                target, target_module = nxt["worker"], nxt["module_id"]
+            else:
+                out_meta = dict(meta)
+                target, target_module = module.host, hops[-1]["module_id"]
+
+            payload = out["__vars__"] if nxt is not None else out
+            blob = pipeline_wire.pack(out_meta, payload)
+            osize, oname = store_in_shared_memory(blob, encoding=None)
+            self.send_request(
+                "send_forward",
+                (
+                    target,
+                    target_module,
+                    osize,
+                    oname,
+                    [meta["step"], meta["micro"], target_module],
+                ),
+            )
+        except Exception as e:
+            logging.error(
+                f"pipeline forward failed for {module_id}: {e}", exc_info=True
+            )
+            self.send_request(
+                "debug_print",
+                (
+                    f"DistributedWorker -> [PIPELINE FAILED] {module_id}: {e}",
+                    "red",
+                    logging.ERROR,
+                ),
+            )
+            if meta is not None:  # tell the host now instead of letting it time out
+                try:
+                    last = meta["hops"][-1]["module_id"]
+                    blob = pipeline_wire.pack({**meta, "error": str(e)[:500]}, None)
+                    osize, oname = store_in_shared_memory(blob, encoding=None)
+                    self.send_request(
+                        "send_forward",
+                        (
+                            module.host,
+                            last,
+                            osize,
+                            oname,
+                            [meta["step"], meta["micro"], last],
+                        ),
+                    )
+                except Exception:
+                    pass
 
     def _handle_generate(self, module_id, size, name, stream):
         """
@@ -506,8 +597,13 @@ class DistributedWorker:
             # Clear memory before loading
             self.cleanup_memory()
 
+            # Pipeline segments: source is re-derived from our own HF install and
+            # checked against the plan hash (nothing is exec()'d from the network)
+            if module_info.get("strategy") == "pipeline":
+                module = self._load_pipeline_segment(module_info)
+
             # Try to load the module based on trusted status
-            if self.trusted:
+            elif self.trusted:
                 with open(file_name, "rb") as f:
                     module = pickle.load(f)
                     module = module.to(self.device)
@@ -542,6 +638,10 @@ class DistributedWorker:
 
             self.modules[module_id] = module
             self.module_paths[module_id] = module_info.get("module_path", "")
+
+            if module_info.get("strategy") == "pipeline":
+                # Upstream worker dials the next one now, so the first forward is direct
+                self._ensure_pipeline_links(module_info)
 
             if training:
                 optimizer_cls = get_optimizer_from_spec(module_info["optimizer_spec"])
@@ -1063,10 +1163,6 @@ class DistributedWorker:
         """
         Return the already-loaded module resident on this worker whose
         module_path matches, or None if it isn't loaded here yet.
-
-        Paths are written by the same graphing.py logic on both sides
-        (tied_embed_path/tied_lm_head_path are built as f"model.{name}"),
-        so exact string equality is sufficient, no prefix fuzzing needed here.
         """
         for module_id, path in self.module_paths.items():
             if path == module_path:

@@ -52,6 +52,10 @@ class GenerationRequest(BaseModel):
     output_format: Literal["raw", "openai"] = "raw"
     is_chat_completion: bool = False
 
+    # Agentic tools. Handled entirely by the API process (tools/agents.py); the
+    # ML process never reads it.
+    web_search: Literal["off", "auto", "always"] = "off"
+
 
 class ChatMessage(BaseModel):
     role: str
@@ -73,6 +77,8 @@ class ChatCompletionRequest(BaseModel):
     # Newer OpenAI SDKs send this instead of max_tokens; it wins when both are set.
     max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     reasoning: Optional[bool] = False
+    # "off" | "auto" (model decides) | "always"; true is the same as "always"
+    web_search: Optional[Union[Literal["off", "auto", "always"], bool]] = None
 
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -107,6 +113,7 @@ class TextResponseRequest(_BaseResponseRequest):
     max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     stop: Optional[Union[str, List[str]]] = None
     reasoning: Optional[bool] = False
+    web_search: Optional[Union[Literal["off", "auto", "always"], bool]] = None
 
 
 class ImageResponseRequest(_BaseResponseRequest):

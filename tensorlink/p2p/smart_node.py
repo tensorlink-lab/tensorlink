@@ -25,6 +25,9 @@ import socket
 import threading
 import time
 
+_PEER_LOCKS: dict = {}
+_PEER_LOCKS_GUARD = threading.Lock()
+
 
 COLOURS = {
     "black": "\033[30m",
@@ -728,6 +731,16 @@ class Smartnode(threading.Thread):
                 )
                 return False
 
+        # Worker <-> worker links exist only for pipeline segments: a worker accepts a
+        # worker peer only if the validator named it as our upstream neighbour (the
+        # validator's JOB-REQ stores that id in self.requests). Everyone else is refused.
+        if node_info['role'].startswith("W") and self.role.startswith("W"):
+            if node_info['node_id_hash'] not in self.requests:
+                self.close_connection(
+                    connection, f"Not an assigned peer: {node_info['node_id_hash']}"
+                )
+                return False
+
         # Public key validation
         if not authenticate_public_key(node_info['node_id']):
             self.close_connection(connection, "Invalid RSA key")
@@ -896,6 +909,10 @@ class Smartnode(threading.Thread):
                 role=node_info['role'],
                 node_address=node_info['node_address'],
             )
+            # Who dialled: used to resolve two simultaneous connections between a pair
+            thread_client.initiator_hash = (
+                self.rsa_key_hash if instigator else node_info['node_id_hash']
+            )
             thread_client.start()
 
             # Store and categorize node
@@ -989,6 +1006,21 @@ class Smartnode(threading.Thread):
         if thread_client.terminate_flag.is_set():
             return False
 
+        # Two live connections to the same peer (both sides dialled at once): both ends
+        # keep the one whose INITIATOR hash is lower, so they always agree on the winner.
+        existing = self.nodes.get(node_info['node_id_hash'])
+        if (
+            existing is not None
+            and existing is not thread_client
+            and not existing.terminate_flag.is_set()
+        ):
+            new_init = getattr(thread_client, "initiator_hash", "")
+            old_init = getattr(existing, "initiator_hash", "")
+            if new_init != old_init and old_init < new_init:
+                thread_client.terminate_flag.set()  # keep the existing one
+                return True
+            existing.terminate_flag.set()  # the new one wins (or same dialler reconnecting)
+
         # Retrieve or generate node information
         stored_info = self.dht.query(node_info['node_id_hash']) or get_connection_info(
             thread_client,
@@ -1005,7 +1037,8 @@ class Smartnode(threading.Thread):
             self.validators.append(node_info["node_id_hash"])
 
         elif node_info["role"].startswith("W"):
-            self.workers.append(node_info["node_id_hash"])
+            if node_info["node_id_hash"] not in self.workers:
+                self.workers.append(node_info["node_id_hash"])
 
             # If we are connecting to a worker (for a job), boost connection speed
             if self.role == "U":
@@ -1417,7 +1450,44 @@ class Smartnode(threading.Thread):
         self.connection_listener = threading.Thread(target=self._listen, daemon=True)
         self.connection_listener.start()
 
-    def disconnect_node(self, node_id: str):
+    def connect_peer(
+        self, node_id: str, host: str, port: int, attempts: int = 3
+    ) -> bool:
+        """
+        Dial a specific peer (used by the upstream worker of a pipeline link). Serialised
+        per peer so concurrent callers cannot open duplicate connections, and verified:
+        success means a live connection to exactly ``node_id`` exists afterwards (the
+        handshake already proved that peer holds the matching RSA private key).
+        """
+        with _PEER_LOCKS_GUARD:
+            lock = _PEER_LOCKS.setdefault(node_id, threading.Lock())
+
+        def alive():
+            n = self.nodes.get(node_id)
+            return n is not None and not n.terminate_flag.is_set()
+
+        with lock:
+            for attempt in range(attempts):
+                if alive():
+                    return True
+                try:
+                    self.connect_node(host, port, id_hash=node_id)
+                except Exception as e:
+                    self._log_warning(f"connect_peer attempt {attempt + 1} failed: {e}")
+                if alive():
+                    return True
+                time.sleep(1 + attempt)
+        return False
+
+    def disconnect_node(self, node_id: str, connection=None):
+        # A stale connection (e.g. the loser of a duplicate pair) must not tear down the
+        # live one that replaced it in self.nodes.
+        if (
+            connection is not None
+            and node_id in self.nodes
+            and self.nodes[node_id] is not connection
+        ):
+            return
         if node_id in self.nodes:
             node = self.nodes[node_id]
 

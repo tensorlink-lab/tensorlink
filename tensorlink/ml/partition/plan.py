@@ -208,6 +208,7 @@ def _estimate_module_memory(
     depth,
     count_activations,
     dtype=None,
+    kv_config=None,
 ) -> float:
     """Estimate this module's memory footprint, dropping activation memory
     for non-root modules when the caller doesn't want it counted twice.
@@ -221,7 +222,8 @@ def _estimate_module_memory(
         dtype=dtype,
         recursive=True,
         count_activations=True,
-        include_kv_cache=(depth == 0),
+        include_kv_cache=True,
+        kv_config=kv_config,
     )
     if not count_activations:
         memory -= breakdown.get("activations", 0) * OVERHEAD
@@ -707,6 +709,7 @@ class ModelParser:
             depth,
             count_activations,
             self.dtype,
+            kv_config=getattr(root_module, "config", None),
         )
         self._log(indent, f"  Memory required: {memory / 1e6:.2f}MB")
 

@@ -95,6 +95,31 @@ def run_device_benchmark(force: bool = True) -> Tuple[Dict, Optional[Dict]]:
     return current_info, device_benchmark
 
 
+def _text_config(config):
+    """Multimodal configs keep the LM settings in a nested text config."""
+    getter = getattr(config, "get_text_config", None)
+    return getter() if callable(getter) else config
+
+
+def kv_bytes_per_token_per_layer(config, dtype_size: int) -> int:
+    """K and V bytes stored per token for ONE attention layer."""
+    cfg = _text_config(config)
+    n_heads = cfg.num_attention_heads
+    n_kv = getattr(cfg, "num_key_value_heads", None) or n_heads
+    # Many models (Qwen3, Gemma...) set head_dim explicitly: it is not hidden/heads
+    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // n_heads
+    return 2 * n_kv * head_dim * dtype_size
+
+
+def _count_kv_layers(module) -> int:
+    """Attention modules (they own a KV slot) inside a config-less module."""
+    return sum(
+        1
+        for m in module.modules()
+        if hasattr(m, "layer_idx") and "attention" in type(m).__name__.lower()
+    )
+
+
 def estimate_memory(
     module: nn.Module,
     training: bool = True,
@@ -105,6 +130,7 @@ def estimate_memory(
     include_kv_cache: bool = True,
     recursive: bool = True,
     count_activations: bool = True,
+    kv_config=None,
 ) -> tuple[float, dict]:
     """Estimate GPU memory required for a model."""
 
@@ -148,7 +174,7 @@ def estimate_memory(
     # ---- activations ----
     if count_activations:
         if hasattr(module, "config"):
-            hidden_size = module.config.hidden_size
+            hidden_size = _text_config(module.config).hidden_size
         elif hasattr(module, "hidden_size"):
             hidden_size = module.hidden_size
         elif hasattr(module, "embed_dim"):
@@ -165,23 +191,28 @@ def estimate_memory(
             batch_size * seq_length * hidden_size * dtype_size * activation_multiplier
         )
 
-        if include_kv_cache and hasattr(module, "config") and not training:
-            num_layers = module.config.num_hidden_layers
-            num_heads = getattr(
-                module.config,
-                "num_key_value_heads",
-                module.config.num_attention_heads,
-            )
-            head_dim = hidden_size // module.config.num_attention_heads
+    # ---- KV cache (inference only) ----
+    # Size it from the attention modules inside this module. Anything without
+    # attention (norm, rotary_emb, embeddings, lm_head) holds no KV, even if it
+    # happens to carry a `config` attribute.
+    if include_kv_cache and not training:
+        own_config = getattr(module, "config", None)
+        cfg_src = own_config if own_config is not None else kv_config
+        n_layers = _count_kv_layers(module) if cfg_src is not None else 0
 
+        if (
+            n_layers == 0
+            and own_config is not None
+            and hasattr(module, "get_input_embeddings")  # a full HF model
+        ):
+            n_layers = _text_config(own_config).num_hidden_layers
+
+        if cfg_src is not None and n_layers:
             breakdown["kv_cache"] = (
                 batch_size
                 * seq_length
-                * num_layers
-                * num_heads
-                * head_dim
-                * 2
-                * dtype_size
+                * n_layers
+                * kv_bytes_per_token_per_layer(cfg_src, dtype_size)
             )
 
     total = sum(breakdown.values()) * OVERHEAD

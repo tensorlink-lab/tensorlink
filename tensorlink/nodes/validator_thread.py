@@ -44,7 +44,7 @@ class ValidatorThread(Torchnode):
         on_chain=False,
         local_test=False,
         endpoint=True,
-        endpoint_url="0.0.0.0",
+        endpoint_url="127.0.0.1",
         endpoint_port=64747,
         load_previous_state=False,
         priority_nodes: list = None,
@@ -812,13 +812,21 @@ class ValidatorThread(Torchnode):
         worker_connection_info = {}
         groups = {}
         job_data["worker_modules"] = {}
+        peer_map = self._pipeline_peers(modules)
         for module_name, module_info in modules.items():
             module_id = hashlib.sha256(json.dumps(module_info).encode()).hexdigest()
 
             if "offloaded" in module_info.get("type", ""):
                 worker_id = module_info.get("assigned_workers", [])[-1]
                 groups[module_id] = module_info
-                self.recruit_worker(worker_id, author, job_id, module_info, module_id)
+                self.recruit_worker(
+                    worker_id,
+                    author,
+                    job_id,
+                    module_info,
+                    module_id,
+                    peers=peer_map.get(worker_id),
+                )
                 job_data["worker_modules"][worker_id] = module_id
                 worker_connection_info[module_id] = worker_id
 
@@ -828,6 +836,31 @@ class ValidatorThread(Torchnode):
         job_data["distribution"] = groups
 
         return worker_connection_info
+
+    def _pipeline_peers(self, modules: dict) -> dict:
+        """worker_id -> {"prev": peer|None, "next": peer|None} for pipeline segments.
+        peer = {"id", "host", "port"}; the upstream worker dials the downstream one."""
+        segs = sorted(
+            (m["index"], m["assigned_workers"][-1])
+            for m in modules.values()
+            if m.get("strategy") == "pipeline"
+            and "offloaded" in m.get("type", "")
+            and m.get("assigned_workers")
+        )
+
+        def info(wid):
+            n = self.nodes.get(wid)
+            return (
+                None if n is None else {"id": wid, "host": n.host, "port": n.main_port}
+            )
+
+        out = {}
+        for i, (_, wid) in enumerate(segs):
+            out[wid] = {
+                "prev": info(segs[i - 1][1]) if i > 0 else None,
+                "next": info(segs[i + 1][1]) if i + 1 < len(segs) else None,
+            }
+        return out
 
     def _update_job_distribution(self, job_data, n_pipelines, requesting_node):
         pass
@@ -909,11 +942,15 @@ class ValidatorThread(Torchnode):
         job_id: str,
         module_info: dict,
         module_id: str,
+        peers: dict = None,
     ):
         if user_id is None:
             user_id = self.rsa_key_hash
 
-        data = json.dumps([user_id, job_id, module_id, module_info])
+        payload = [user_id, job_id, module_id, module_info]
+        if peers:
+            payload.append(peers)  # pipeline neighbours (id, host, port)
+        data = json.dumps(payload)
         module_size = module_info.get("memory", 0)
 
         data = b"JOB-REQ" + data.encode()
