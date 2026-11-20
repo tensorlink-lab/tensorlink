@@ -10,7 +10,7 @@
     "type": "worker",
     "mode": "public",
     "endpoint": true,
-    "endpoint_url": "0.0.0.0",
+    "endpoint_url": "127.0.0.1",
     "endpoint_port": 64747,
     "priority_nodes": [],
     "logging": "WARNING"

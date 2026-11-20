@@ -68,7 +68,7 @@ class ValidatorConfig(BaseNodeConfig):
     """
 
     endpoint: bool = True
-    endpoint_url: str = "0.0.0.0"
+    endpoint_url: str = "127.0.0.1"
     endpoint_port: int = 64747
     load_previous_state: bool = False
 
