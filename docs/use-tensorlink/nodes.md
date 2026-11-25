@@ -1,19 +1,15 @@
-# Node Setup & Network Configuration
+## Node Setup & Network Configurations
+*Deploy and connect to nodes for distributed ML workflows.*
 
-Deploy workers, validators, and private clusters for distributed ML workflows.
+Tensorlink's node system allows you to access computation across devices, and pair their computing power over a network.
+It allows you to pool computing resources on a closed network of devices or on the public network over the internet. 
 
-Tensorlink's node system supports public, private, and local deployment. 
-Nodes are for when you want to **contribute compute or control your own infrastructure**:
+> **Looking to donate your GPU to the public network?** Skip ahead to the 
+> [Worker Quick Start Guide](worker-quickstart.md).
 
-- Contribute GPU resources to the public network and earn token rewards
-- Deploy private clusters for sensitive workloads with complete data privacy
-- Expose your hardware as a private API endpoint for external applications
-- Run custom models that require trusted execution environments
-
-> **Just want to contribute your GPU to the public network?** Skip ahead to the 
-> [Worker Quick Start Guide](worker-quickstart.md), and you'll be up and running in minutes.
-
-Public nodes communicate through a peer-to-peer network secured by smart contracts, enabling rewards and payments for GPU resources.
+Currently, nodes leverage UPnP to tunnel across networks, while hole punching and perhaps Tailscale are being 
+considered for a future release. Public nodes communicate through a peer-to-peer network secured by smart contracts, 
+enabling a reliable rewards and payments system for node operators.
 
 ---
 

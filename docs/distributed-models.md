@@ -16,7 +16,7 @@ input.
 
 By default, a distributed model will spawn a node in the background and automatically connect to the tensorlink public 
 network. If you wish to connect to private infrastructure, you will manually have to set up a node (see 
-[Node Setup Guide](nodes.md)). 
+[Node Setup Guide](use-tensorlink/nodes.md)). 
 
 | Parameter | Type | Default | Description                                                                                             |
 |-----------|------|---------|---------------------------------------------------------------------------------------------------------|
@@ -166,4 +166,4 @@ outputs = model(torch.randint(0, 50000, (1, 128)))
 - The `forward()` method defines the distributed compute graph
 
 Custom models cannot run on the public network for security reasons, this will be addressed in a future release. For 
-node topology, configuration examples, and network architecture patterns, see the [Node Setup Guide](nodes.md).
+node topology, configuration examples, and network architecture patterns, see the [Node Setup Guide](use-tensorlink/nodes.md).
