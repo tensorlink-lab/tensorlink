@@ -21,8 +21,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
 
-from .forward_program import ForwardProgram, ProgramError, build_forward_program
-from .pipeline_plan import PipelinePlan, PlanOptions, WorkerSpec, plan_pipeline
+from tensorlink.ml.partition.forward_program import (
+    ForwardProgram,
+    ProgramError,
+    build_forward_program,
+)
+from tensorlink.ml.partition.pipeline_plan import (
+    PipelinePlan,
+    PlanOptions,
+    WorkerSpec,
+    plan_pipeline,
+)
+from tensorlink.ml.pipeline.loader import build_skeleton
 
 _DTYPE_BYTES = {
     "float32": 4,
@@ -200,8 +210,6 @@ class ModelPartitioner:
         Never raises: any failure returns success=False so the caller can fall back
         to ModelParser."""
         try:
-            from tensorlink.ml.pipeline.loader import build_skeleton
-
             model = build_skeleton(model_name, model_type, dtype)
             ws = [
                 {"id": wid, "memory": int((w or {}).get("gpu_memory", 0))}

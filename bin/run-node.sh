@@ -43,19 +43,9 @@ except ImportError:
 "
 }
 
-# Function to get node type from config
+# Function to get node type from config (single source of truth: tensorlink.config)
 get_node_type() {
-    python3 -c "
-import json
-import sys
-try:
-    with open('config.json', 'r') as f:
-        config = json.load(f)
-        node_type = config.get('node', {}).get('type', 'worker')
-        print(str(node_type).strip().lower())
-except Exception as e:
-    print(f'Warning: Could not read node type from config.json, defaulting to worker. Error: {e}', file=sys.stderr)
-"
+    python -m tensorlink.config node.type || echo worker
 }
 
 # Trap any unexpected errors

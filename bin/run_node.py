@@ -4,7 +4,7 @@ Supports both Worker and Validator node types based on config.json
 """
 
 from tensorlink.nodes import Worker, WorkerConfig, Validator, ValidatorConfig
-import json
+from tensorlink.config import load, log_level as config_log_level, network_flags
 import logging
 import os
 import subprocess
@@ -22,26 +22,11 @@ def get_root_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 
-def load_config(config_path="config.json"):
-    """Load configuration from a JSON file."""
-    try:
-        with open(config_path, "r") as f:
-            config = json.load(f)
-            return config
-
-    except FileNotFoundError:
-        logging.warning(f"Config file {config_path} not found, using defaults")
-        return {}
-    except json.JSONDecodeError as e:
-        logging.error(f"Invalid JSON in config file: {e}")
-        return {}
-
-
-def create_env_file(env_path, config):
+def create_env_file(env_path, cfg):
     """Create a default .tensorlink.env file if it doesn't exist."""
     if not os.path.exists(env_path):
         with open(env_path, "w") as env_file:
-            env_file.write(f"PUBLIC_KEY={config.get('chain', {}).get('address', '')}\n")
+            env_file.write(f"PUBLIC_KEY={cfg.chain.address}\n")
 
 
 def check_env_file(env_path):
@@ -53,42 +38,10 @@ def check_env_file(env_path):
         )
 
 
-def parse_network_mode(mode):
-    """Parse network mode and return configuration flags."""
-    local = False
-    upnp = True
-    on_chain = False
-
-    if mode == "local":
-        local = True
-        upnp = False
-    elif mode == "public":
-        on_chain = True
-    elif mode == "private":
-        pass  # Use defaults
-    else:
-        raise ValueError(f"Unknown network mode: {mode}")
-
-    return local, upnp, on_chain
-
-
-def setup_logging(config):
+def setup_logging(cfg):
     """Setup logging based on configuration."""
-    level_str = config.get("node", {}).get("logging", "INFO").upper()
-
-    if not hasattr(logging, level_str):
-        if level_str == "VERBOSE":
-            log_level = 5
-        else:
-            raise ValueError(
-                f"Invalid logging level '{level_str}'. "
-                f"Must be one of: CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
-            )
-    else:
-        log_level = getattr(logging, level_str)
-
+    log_level = config_log_level(cfg)
     logging.basicConfig(level=log_level)
-
     return log_level
 
 
@@ -149,10 +102,10 @@ def stop_mining(mining_process):
         mining_process.wait()
 
 
-def run_worker_loop(worker, config):
+def run_worker_loop(worker, cfg):
     """Main loop for worker nodes with mining management."""
-    mining_enabled = config.get("chain", {}).get("mining", False)
-    mining_script = config.get("chain", {}).get("mining_script", "")
+    mining_enabled = cfg.chain.mining
+    mining_script = cfg.chain.mining_script
     use_sudo = os.geteuid() == 0
     mining_process = None
 
@@ -209,32 +162,34 @@ def run_validator_loop(validator):
 def main():
     root_dir = get_root_dir()
     env_path = os.path.join(root_dir, ".tensorlink.env")
-    config = load_config(os.path.join(root_dir, "config.json"))
+    cfg = load(search_dirs=[root_dir])
+    if cfg.path:
+        # Child processes (e.g. the DistributedValidator) read the same file
+        os.environ.setdefault("TENSORLINK_CONFIG", str(cfg.path))
 
     # Setup logging
-    log_level = setup_logging(config)
+    log_level = setup_logging(cfg)
 
     # Get node type from config
-    node_type = config.get("node", {}).get("type", "worker").lower()
+    node_type = cfg.node.type.lower()
 
     if node_type not in ["worker", "validator"]:
         raise ValueError(
             f"Invalid node type: {node_type}. Must be 'worker' or 'validator'."
         )
 
-    max_memory_gb = config.get("ml", {}).get("max_memory_gb")
-    max_module_gb = config.get("ml", {}).get("max_module_gb")
-    benchmark = config.get("ml", {}).get("benchmark", True)
+    max_memory_gb = cfg.ml.max_memory_gb
+    max_module_gb = cfg.ml.max_module_gb
+    benchmark = cfg.ml.benchmark
     enable_hosting = True
 
     # Parse common config
-    trusted = config.get("ml", {}).get("trusted", False)
-    mode = config.get("node", {}).get("mode", "private")
-    local, upnp, on_chain = parse_network_mode(mode)
+    trusted = cfg.ml.trusted
+    local, upnp, on_chain = network_flags(cfg.node.mode)
 
     # Handle env file
     if node_type == "worker":
-        create_env_file(env_path, config)
+        create_env_file(env_path, cfg)
     else:  # validator
         check_env_file(env_path)
 
@@ -251,29 +206,29 @@ def main():
                 local_test=local,
                 on_chain=on_chain,
                 print_level=log_level,
-                priority_nodes=config.get("node", {}).get("priority_nodes", []),
-                seed_validators=config.get("chain", {}).get("seed_validators", []),
+                priority_nodes=cfg.node.priority_nodes,
+                seed_validators=cfg.chain.seed_validators,
                 max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,
             utilization=True,
             benchmark=benchmark,
         )
-        run_worker_loop(worker, config)
+        run_worker_loop(worker, cfg)
 
-    else:  # validator
+    else:
         logging.info("Starting Validator node...")
         validator = Validator(
             config=ValidatorConfig(
                 upnp=upnp,
                 local_test=local,
                 on_chain=on_chain,
-                endpoint=config.get("node", {}).get("endpoint", False),
-                endpoint_url=config.get("node", {}).get("endpoint_url", "127.0.0.1"),
-                endpoint_port=config.get("node", {}).get("endpoint_port", 64747),
+                endpoint=cfg.node.endpoint,
+                endpoint_url=cfg.node.endpoint_url,
+                endpoint_port=cfg.node.endpoint_port,
                 print_level=log_level,
-                priority_nodes=config.get("node", {}).get("priority_nodes", []),
-                seed_validators=config.get("chain", {}).get("seed_validators", []),
+                priority_nodes=cfg.node.priority_nodes,
+                seed_validators=cfg.chain.seed_validators,
                 max_memory_gb=max_memory_gb,
             ),
             trusted=trusted,

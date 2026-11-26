@@ -1,6 +1,5 @@
-import traceback
-from tensorlink.ml.partition.partitioner import ModelPartitioner
 from tensorlink.ml.partition.plan import ModelParser
+from tensorlink.ml.partition.partitioner import ModelPartitioner
 from tensorlink.ml.worker import DistributedWorker
 from tensorlink.ml.module import DistributedModel, DistributedEmbedding, OffloadedModule
 from tensorlink.ml.embedding import EmbeddingManager, EmbeddingUnavailable
@@ -34,10 +33,13 @@ from tensorlink.ml.utils.utils import (
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.api.models import GenerationRequest
 from tensorlink.nodes.job_monitor import JobStatus
+from tensorlink.config import load as _load_config
 
 from transformers import AutoTokenizer, TextIteratorStreamer
 from collections import defaultdict
 from threading import Thread, Lock
+import traceback
+from typing import Optional
 import torch
 import logging
 import hashlib
@@ -133,14 +135,21 @@ class DistributedValidator(DistributedWorker):
         enable_hosting: bool = False,
         max_memory_gb: float = 0,
         max_module_gb: float = 0,
+        host_fill: Optional[bool] = None,
     ):
         """
         Args:
-
+            host_fill: fill hosted jobs' host segments (front/back of the model) up to
+                this validator's memory budget. None reads ml.host_fill from the shared
+                Tensorlink config.
         """
         super().__init__(node, trusted)
         self.endpoint = endpoint
         self._hosting_enabled = enable_hosting
+
+        if host_fill is None:
+            host_fill = _load_config().ml.host_fill
+        self._host_fill = bool(host_fill)
 
         self._max_memory_bytes = int(max_memory_gb * 1e9)  # Convert to bytes
         self._max_module_bytes = int(max_module_gb * 1e9)
@@ -437,18 +446,19 @@ class DistributedValidator(DistributedWorker):
             host_memory_budget = 0
             # host_memory_budget = job_data.get("available_memory", 0)
 
-        # Memory the host may spend on its own chunks of a pipeline
+        # Memory the host may spend on its own chunks of a pipeline plan.
         try:
             user_host_bytes = max(int(job_data.get("host_memory_bytes", 0) or 0), 0)
         except (TypeError, ValueError):
             user_host_bytes = 0
 
         pipeline_host_budget = host_memory_budget if hosted else user_host_bytes
-        host_fill = (
-            bool(user_host_bytes)
-            if not hosted
-            else bool(job_data.get("host_fill", False))
-        )
+        if hosted:
+            # Operator's choice only, a requester cannot switch fill on for a validator
+            host_fill = self._host_fill
+        else:
+            # User nodes spend their own memory; honour what they asked for
+            host_fill = bool(job_data.get("host_fill", True)) and bool(user_host_bytes)
 
         kwargs = {
             "workers": workers,

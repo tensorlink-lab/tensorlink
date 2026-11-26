@@ -149,7 +149,7 @@ class BaseNode:
 
         self.device_info, self.device_benchmark = run_device_benchmark(force=benchmark)
 
-        # IPC primitives for communicating with the role process
+        # IPC primitives for communicating with the node process
         self.node_requests = mp.Queue()
         self.node_responses = mp.Queue()
         self.mpc_lock = mp.Lock()
@@ -181,20 +181,20 @@ class BaseNode:
 
     def start(self):
         """
-        Spawn the multiprocessing role process.
+        Spawn the P2P communication thread in another process.
         """
         self.node_process = mp.Process(target=self.run_role, daemon=True)
         self.node_process.start()
 
     def cleanup(self):
         """
-        Gracefully shut down the role process and release resources.
+        Gracefully shut down the node and ML process and release resources.
         """
         if self.node_process is not None:
             # Signal process to stop
             self._stop_event.set()
 
-            # Ask the role to stop cleanly first via IPC
+            # Ask the node to stop cleanly first via IPC
             try:
                 _ = self.send_request("stop", (None,), timeout=10)
             except Exception as e:
@@ -213,21 +213,21 @@ class BaseNode:
 
     def send_request(self, request_type, args, timeout=5):
         """
-        Send a request to the role process and wait for a response.
+        Send a request to the node process and wait for a response.
 
         Parameters
         ----------
         request_type : str
             Type of request to send.
         args : tuple
-            Arguments to forward to the role.
+            Arguments to forward to the node.
         timeout : int, optional
             Timeout in seconds for request/response.
 
         Returns
         -------
         Any
-            Value returned by the role handler.
+            Value returned by the node handler.
         """
         request = {"type": request_type, "args": args}
 
@@ -356,7 +356,7 @@ class Validator(BaseNode):
 
     def run_role(self):
         """
-        Launch the ValidatorThread inside the role process.
+        Launch the ValidatorThread inside the node process.
         """
         node = ValidatorThread(
             self.node_requests,
@@ -373,7 +373,7 @@ class Validator(BaseNode):
 
     def start(self):
         """
-        Start the validator role and DistributedValidator controller.
+        Start the validator node and DistributedValidator ML controller.
         """
         from tensorlink.ml.validator import DistributedValidator
 
@@ -409,7 +409,7 @@ class User(BaseNode):
 
     def run_role(self):
         """
-        Launch the UserThread inside the role process.
+        Launch the UserThread inside the node process.
         """
         node = UserThread(
             self.node_requests,

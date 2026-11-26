@@ -21,6 +21,11 @@ from tensorlink.ml.utils.injector import (
     swap_remote_cache,
 )
 from tensorlink.ml.optim import create_distributed_optimizer
+from tensorlink.config import (
+    load as load_config,
+    log_level as config_log_level,
+    network_flags,
+)
 from tensorlink.ml.partition.plan import ModelParser
 from tensorlink.ml.pipeline import host as pipeline_host
 from tensorlink.ml.utils.loading import (
@@ -140,13 +145,24 @@ def _set_micro(local: threading.local, micro: int):
             pass
 
 
-def _create_user_node():
-    """Create a User instance if one wasn't provided."""
-    from tensorlink.nodes import User, UserConfig
+def _create_user_node(cfg=None):
+    """Create a User node that follows the loaded Tensorlink config."""
+    from tensorlink.nodes import User, UserConfig as NodeUserConfig
+
+    cfg = cfg if cfg is not None else load_config()
+
+    # Keep default unless a config file/env/argument sets mode.
+    mode = cfg.node.mode if "node.mode" in cfg.sources else "public"
+    local, upnp, on_chain = network_flags(mode)
 
     node = User(
-        config=UserConfig(
-            upnp=True, on_chain=True, local_test=False, print_level=logging.INFO
+        config=NodeUserConfig(
+            upnp=upnp,
+            on_chain=on_chain,
+            local_test=local,
+            print_level=config_log_level(cfg),
+            priority_nodes=cfg.node.priority_nodes,
+            seed_validators=cfg.chain.seed_validators,
         )
     )
 
@@ -267,9 +283,11 @@ class DistributedModel(nn.Module):
         verbose: bool = False,
         tokenizer=None,
         config: dict = None,
-        host_pre_units: int = 0,
-        host_post_units: int = 0,
-        host_memory_gb: float = 0.0,
+        host_pre_units: Optional[int] = None,
+        host_post_units: Optional[int] = None,
+        host_memory_gb: Optional[Union[float, str]] = None,
+        host_fill: Optional[bool] = None,
+        config_path: Optional[Union[str, bool]] = None,
     ):
         """
         Parameters:
@@ -285,8 +303,13 @@ class DistributedModel(nn.Module):
             verbose (bool): Enables debug messages if True.
             tokenizer: can be specified for inference
             config (dict): Optional tensorlink model distribution configuration
-            host_memory_gb: memory this device may spend hosting part of the model itself
-                (off by default). When > 0 the network keeps as many layers as fit at the
+            config_path: Tensorlink config.json to use (default: discovered; False ignores
+                all config files). Any argument left as None falls back to the config's
+                "user" section (then env vars, then built-in defaults), and the background
+                node started when `node` is None follows the "node"/"chain" sections.
+            host_fill: use host_memory_gb to host extra chunks (default from config: True).
+            host_memory_gb: memory (GB, or "auto") this device may spend hosting part of
+                the model itself (off by default; 0 = off). When > 0 the network keeps as many layers as fit at the
                 start and end of the model on this device (a chunk of the decoder loop
                 included), which means fewer worker hops. Combine with host_pre_units /
                 host_post_units, which then act as the minimum kept here for privacy.
@@ -295,10 +318,31 @@ class DistributedModel(nn.Module):
                 end of the model on THIS device so workers never see raw inputs or
                 outputs. If the network cannot honour it the job fails instead of
                 silently running without the privacy guarantee.
-
         """
 
         super().__init__()
+
+        # Resolve options: explicit args > env > config file > defaults
+        self.tl_config = load_config(
+            config_path,
+            overrides={
+                "user": {
+                    "host_memory_gb": host_memory_gb,
+                    "host_fill": host_fill,
+                    "host_pre_units": host_pre_units,
+                    "host_post_units": host_post_units,
+                    "device": str(device) if device else None,
+                    "dtype": (
+                        str(dtype).replace("torch.", "") if dtype is not None else None
+                    ),
+                }
+            },
+        )
+        self.options = self.tl_config.user
+        if dtype is None and self.options.dtype:
+            dtype = getattr(torch, str(self.options.dtype).replace("torch.", ""))
+        if device is None and self.options.device:
+            device = torch.device(self.options.device)
 
         # Set device
         self.device = (
@@ -347,7 +391,7 @@ class DistributedModel(nn.Module):
             _confirm_action()
 
         # Setup node if not provided
-        self.node = node if node else _create_user_node()
+        self.node = node if node else _create_user_node(self.tl_config)
 
         # Node communication attributes
         self.node_requests = self.node.node_requests
@@ -359,10 +403,13 @@ class DistributedModel(nn.Module):
 
         self.job_id = None
 
-        # Pipeline strategy (preferred); legacy OffloadedModule path remains as fallback
-        self.host_pre_units = int(host_pre_units)
-        self.host_post_units = int(host_post_units)
-        self.host_memory_bytes = self._clamp_host_memory(host_memory_gb)
+        # Pipeline strategy (preferred), legacy OffloadedModule path as fallback
+        self.host_pre_units = int(self.options.host_pre_units)
+        self.host_post_units = int(self.options.host_post_units)
+        self.host_fill = bool(self.options.host_fill)
+        self.host_memory_bytes = self._clamp_host_memory(
+            self.options.host_memory_gb, self.options.host_memory_fraction
+        )
         self._pipeline = None
 
         if verbose:
@@ -1022,9 +1069,13 @@ class DistributedModel(nn.Module):
         parent_module.forward = types.MethodType(new_forward, parent_module)
         _drop_replaced_layer_container(parent_module)
 
-    def _clamp_host_memory(self, gb: float) -> int:
-        """Bytes this device offers for its own chunks of the model (0 = none)."""
-        want = int(max(float(gb or 0.0), 0.0) * 1e9)
+    def _clamp_host_memory(self, gb, fraction: float = 0.5) -> int:
+        """Bytes this device offers for its own chunks of the model (0 = none).
+        gb may be a number of GB or "auto" (a `fraction` of the device's memory)."""
+        if isinstance(gb, str):  # "auto"
+            want = int(max(float(get_gpu_memory() or 0), 0.0) * float(fraction))
+        else:
+            want = int(max(float(gb or 0.0), 0.0) * 1e9)
         if not want:
             return 0
         try:
@@ -1051,12 +1102,15 @@ class DistributedModel(nn.Module):
             "optimizer": optimizer_spec,
         }
 
-        distribution["strategy"] = os.environ.get("TENSORLINK_STRATEGY", "auto")
+        distribution["strategy"] = (
+            os.environ.get("TENSORLINK_STRATEGY") or self.options.strategy
+        )
         if self.host_pre_units or self.host_post_units:
             distribution["host_pre_units"] = self.host_pre_units
             distribution["host_post_units"] = self.host_post_units
         if self.host_memory_bytes:
             distribution["host_memory_bytes"] = self.host_memory_bytes
+            distribution["host_fill"] = self.host_fill
         privacy = bool(self.host_pre_units or self.host_post_units)
 
         for attempt in range(2):
