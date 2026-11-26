@@ -437,6 +437,19 @@ class DistributedValidator(DistributedWorker):
             host_memory_budget = 0
             # host_memory_budget = job_data.get("available_memory", 0)
 
+        # Memory the host may spend on its own chunks of a pipeline
+        try:
+            user_host_bytes = max(int(job_data.get("host_memory_bytes", 0) or 0), 0)
+        except (TypeError, ValueError):
+            user_host_bytes = 0
+
+        pipeline_host_budget = host_memory_budget if hosted else user_host_bytes
+        host_fill = (
+            bool(user_host_bytes)
+            if not hosted
+            else bool(job_data.get("host_fill", False))
+        )
+
         kwargs = {
             "workers": workers,
             "training": job_data.get("training", False),
@@ -486,7 +499,8 @@ class DistributedValidator(DistributedWorker):
                         max_seq_len=kwargs["max_seq_len"],
                         host_pre_units=pre_n,
                         host_post_units=post_n,
-                        host_max_memory_bytes=host_memory_budget,
+                        host_max_memory_bytes=pipeline_host_budget,
+                        host_fill=host_fill,
                     )
                     if not distribution.get("success"):
                         self.send_request(

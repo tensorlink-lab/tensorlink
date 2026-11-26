@@ -10,8 +10,11 @@ available workers, decide who runs which contiguous slice of the forward pass.
   the host must hold at least ``host_pre_units`` / ``host_post_units`` weight-bearing
   units at the matching end of the model, otherwise planning FAILS (the privacy
   guarantee would not hold).
-* Tied weights (e.g. embed_tokens / lm_head): when privacy is on and one half
-  lands on the host, both halves stay on the host.
+* ``host_fill``: the host may ALSO spend its memory budget on extra units at either
+  end (a chunk of the decoder loop included) so fewer worker hops are needed. Privacy
+  counts are then a floor, not the total. Never fails: it takes what fits.
+* Tied weights (e.g. embed_tokens / lm_head): when privacy is on (or fill is on and the
+  budget allows) and one half lands on the host, both halves stay on the host.
 * Workers are filled one at a time (next-fit) in linear forward order, largest
   free memory first. A worker is never revisited.
 
@@ -22,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 Position = Tuple[int, int]
@@ -36,9 +39,12 @@ class WorkerSpec:
 
 @dataclass
 class PlanOptions:
-    host_pre_units: int = 0
+    host_pre_units: int = 0  # units of layers / module components
     host_post_units: int = 0
     host_budget_bytes: int = 0  # memory the host may spend on its own segments
+    host_fill: bool = (
+        False  # use the budget for extra host units beyond the privacy floor
+    )
     reserve_frac: float = 0.10  # worker memory kept free for activations / runtime
     max_workers: int = 6
     tied_groups: Sequence[Sequence[str]] = ()  # groups of module paths sharing weights
@@ -120,11 +126,16 @@ def _fail(msg: str) -> PipelinePlan:
 
 
 def _expand_for_ties(
-    n_units: int, unit_of: Dict[str, int], opts: PlanOptions, pre: int, post: int
+    n_units: int,
+    unit_of: Dict[str, int],
+    opts: PlanOptions,
+    pre: int,
+    post: int,
+    force: bool = False,
 ):
     """Grow the host prefix/suffix until every tied group is entirely on the host or
-    entirely off it. Only applies when privacy is on."""
-    if not opts.privacy:
+    entirely off it. Applies when privacy is on, or when ``force`` (host fill)."""
+    if not (opts.privacy or force):
         return pre, post
     mid = n_units / 2.0
     changed = True
@@ -173,12 +184,14 @@ def plan_pipeline(
     pre, post = opts.host_pre_units, opts.host_post_units
     if pre < 0 or post < 0:
         return _fail("host_pre_units / host_post_units must be >= 0")
+
     pre, post = _expand_for_ties(n, unit_of, opts, pre, post)
     if pre + post >= n:
         return _fail(
             f"privacy needs {pre} pre + {post} post host units but the model only has {n}; "
             "nothing would be left to distribute"
         )
+
     host_bytes = sum(sizes[:pre]) + sum(sizes[n - post :])
     if opts.privacy and opts.host_budget_bytes and host_bytes > opts.host_budget_bytes:
         return _fail(
@@ -186,7 +199,28 @@ def plan_pipeline(
             f"{opts.host_budget_bytes}; cannot provide the requested privacy"
         )
 
-    # ---- pack the middle across workers (next-fit, largest first) ----
+    # optional: spend the rest of the host budget on extra units at both ends
+    if opts.host_fill and opts.host_budget_bytes > 0:
+        budget = int(opts.host_budget_bytes * (1.0 - opts.reserve_frac))
+
+        def span_bytes(a: int, b: int) -> int:
+            return sum(sizes[:a]) + sum(sizes[n - b :]) if (a or b) else 0
+
+        blocked = {"front": False, "back": False}
+        side = "front"
+        while not (blocked["front"] and blocked["back"]):
+            if not blocked[side]:
+                np_, nq = (pre + 1, post) if side == "front" else (pre, post + 1)
+                np_, nq = _expand_for_ties(n, unit_of, opts, np_, nq, force=True)
+                # always leave at least one unit for the workers
+                if np_ + nq >= n or span_bytes(np_, nq) > budget:
+                    blocked[side] = True
+                else:
+                    pre, post = np_, nq
+            side = "back" if side == "front" else "front"
+        host_bytes = span_bytes(pre, post)
+
+    # pack the middle across workers (next-fit, largest first)
     ws = sorted(workers, key=lambda w: w.free_bytes, reverse=True)
     mid_lo, mid_hi = pre, n - post
     groups: List[Tuple[WorkerSpec, int, int]] = (
@@ -215,11 +249,12 @@ def plan_pipeline(
             continue
         groups.append((w, i, j))
         i, wi = j, wi + 1
+
     if len(groups) > opts.max_workers:
         return _fail(f"plan needs {len(groups)} workers, limit is {opts.max_workers}")
 
-    # ---- cut positions ----
-    def cut_after(unit_idx: int) -> Position:  # boundary right after unit_idx
+    # cut positions
+    def cut_after(unit_idx: int) -> Position:
         return units[unit_idx].end
 
     bounds: List[Tuple[str, str, int, int]] = []  # (owner, kind, u0, u1)

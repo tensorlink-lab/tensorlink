@@ -48,6 +48,29 @@ def attach(obj, device):
     return obj
 
 
+class _LengthOnlyCache(DynamicCache):
+    """Reports how many tokens the real (remote) cache holds without storing anything."""
+
+    def __init__(self, n_cached: int, cfg=None):
+        try:
+            super().__init__(config=cfg)
+        except TypeError:
+            super().__init__()
+        self._n_cached = int(n_cached)
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self._n_cached
+
+    def get_mask_sizes(self, cache_position, layer_idx: int = 0):
+        # transformers <5 passes cache_position (a tensor); 5.x passes the query length
+        q = (
+            int(cache_position.shape[0])
+            if hasattr(cache_position, "shape")
+            else int(cache_position)
+        )
+        return self._n_cached + q, 0
+
+
 class SegmentRunner:
     def __init__(self, model, program, code, device):
         self.model = model
@@ -60,7 +83,6 @@ class SegmentRunner:
         self.has_layers = code.has_layers
         self.final = code.final
 
-    # ---- dtype handling ----------------------------------------------------
     def _param_dtype(self):
         counts: dict = {}
         for path in self.code.modules:
@@ -105,7 +127,6 @@ class SegmentRunner:
                 self._describe(v, f"{prefix}.{k}" if prefix else str(k), out, depth + 1)
         return out
 
-    # ---- cache handling ---------------------------------------------------
     def _new_cache(self):
         cfg = getattr(self.model, "config", None)
         try:
@@ -116,6 +137,13 @@ class SegmentRunner:
     def _resolve(self, obj, found: list):
         if is_cache_ref(obj):
             sid, n = obj["__cache__"], int(obj["len"])
+            if not self.has_layers:
+                # The position / mask statements that` run before the layer loop
+                # need the number of cached tokens, so hand them a length-only cache.
+                cache = _LengthOnlyCache(n, getattr(self.model, "config", None))
+                found.append(([cache, n], dict(obj)))
+                return cache
+
             entry = self._caches.get(sid)
             if n == 0:
                 entry = [self._new_cache(), 0]
@@ -164,7 +192,6 @@ class SegmentRunner:
             return type(obj)(self._scrub(v, ref, cache) for v in obj)
         return obj
 
-    # ---- run ---------------------------------------------------------------
     @torch.no_grad()
     def run(self, variables: Dict[str, Any], new_tokens: int = 0) -> Dict[str, Any]:
         found: list = []

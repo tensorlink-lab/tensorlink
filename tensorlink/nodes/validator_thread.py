@@ -689,6 +689,7 @@ class ValidatorThread(Torchnode):
 
         self._update_job_distribution(job_data, n_pipelines, requesting_node)
 
+        # The case we have a hosted job (ie. DistributedModel hosted on another node)
         if requesting_node:
             if any(
                 "offloaded" in module_info.get("type", "")

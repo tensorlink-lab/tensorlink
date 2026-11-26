@@ -60,9 +60,8 @@ class ModelPartitioner:
         self.program: Optional[ForwardProgram] = None
         self.plan: Optional[PipelinePlan] = None
 
-    # ------------------------------------------------------------------ sizing
+    @staticmethod
     def module_bytes(
-        self,
         model,
         program: ForwardProgram,
         dtype: str = "float16",
@@ -125,7 +124,6 @@ class ModelPartitioner:
             pass
         return groups
 
-    # -------------------------------------------------------------------- main
     def create_pipeline_config(
         self,
         model,
@@ -137,13 +135,13 @@ class ModelPartitioner:
         host_pre_units: int = 0,
         host_post_units: int = 0,
         host_max_memory_bytes: int = 0,
+        host_fill: bool = False,
         reserve_frac: float = 0.10,
         max_workers: int = 6,
         model_name: str = "",
         model_type: str = "chat",
         is_module=None,
     ) -> dict:
-        """``workers``: [{"id": str, "memory": int_bytes}, ...]"""
         try:
             program = build_forward_program(
                 model, is_module=is_module, max_inline_depth=self.max_inline_depth
@@ -154,6 +152,7 @@ class ModelPartitioner:
                 host_pre_units=host_pre_units,
                 host_post_units=host_post_units,
                 host_budget_bytes=host_max_memory_bytes,
+                host_fill=host_fill,
                 reserve_frac=reserve_frac,
                 max_workers=max_workers,
                 tied_groups=self.tied_groups(model, program),
@@ -164,9 +163,10 @@ class ModelPartitioner:
                 [WorkerSpec(w["id"], int(w["memory"])) for w in workers],
                 opts,
             )
+
         except ProgramError as e:
             return self._result(False, error=f"pipeline unsupported: {e}")
-        except Exception as e:  # never let analysis crash the validator
+        except Exception as e:
             return self._result(False, error=f"pipeline analysis failed: {e!r}")
 
         self.program, self.plan = program, plan
@@ -181,7 +181,7 @@ class ModelPartitioner:
             "tied_groups": opts.tied_groups,
         }
         return self._result(
-            True,
+            success=True,
             config=plan.to_config(extra),
             model_memory=plan.total_bytes,
             host_memory_used=plan.host_bytes,

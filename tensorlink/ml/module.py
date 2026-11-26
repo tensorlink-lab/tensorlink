@@ -29,7 +29,6 @@ from tensorlink.ml.utils.loading import (
     load_module_weights,
     get_nested_module,
     load_full_model,
-    # find_meta_tensors,
 )
 from tensorlink.ml.utils.gpu_benchmark import get_gpu_memory
 from tensorlink.ml.embedding import (
@@ -270,14 +269,10 @@ class DistributedModel(nn.Module):
         config: dict = None,
         host_pre_units: int = 0,
         host_post_units: int = 0,
+        host_memory_gb: float = 0.0,
     ):
         """
         Parameters:
-            host_pre_units / host_post_units: optional privacy feature (off by default).
-                Keep this many weight-bearing units (embedding / layers) at the start /
-                end of the model on THIS device so workers never see raw inputs or
-                outputs. If the network cannot honour it the job fails instead of
-                silently running without the privacy guarantee.
             model (nn.Module): The base model to distribute.
             n_pipelines (int): Number of parallel pipelines for computation.
             optimizer (Type[optim.Optimizer]): Optimizer class to use.
@@ -290,6 +285,17 @@ class DistributedModel(nn.Module):
             verbose (bool): Enables debug messages if True.
             tokenizer: can be specified for inference
             config (dict): Optional tensorlink model distribution configuration
+            host_memory_gb: memory this device may spend hosting part of the model itself
+                (off by default). When > 0 the network keeps as many layers as fit at the
+                start and end of the model on this device (a chunk of the decoder loop
+                included), which means fewer worker hops. Combine with host_pre_units /
+                host_post_units, which then act as the minimum kept here for privacy.
+            host_pre_units / host_post_units: optional privacy feature (off by default).
+                Keep this many weight-bearing units (embedding / layers) at the start /
+                end of the model on THIS device so workers never see raw inputs or
+                outputs. If the network cannot honour it the job fails instead of
+                silently running without the privacy guarantee.
+
         """
 
         super().__init__()
@@ -356,6 +362,7 @@ class DistributedModel(nn.Module):
         # Pipeline strategy (preferred); legacy OffloadedModule path remains as fallback
         self.host_pre_units = int(host_pre_units)
         self.host_post_units = int(host_post_units)
+        self.host_memory_bytes = self._clamp_host_memory(host_memory_gb)
         self._pipeline = None
 
         if verbose:
@@ -1015,6 +1022,19 @@ class DistributedModel(nn.Module):
         parent_module.forward = types.MethodType(new_forward, parent_module)
         _drop_replaced_layer_container(parent_module)
 
+    def _clamp_host_memory(self, gb: float) -> int:
+        """Bytes this device offers for its own chunks of the model (0 = none)."""
+        want = int(max(float(gb or 0.0), 0.0) * 1e9)
+        if not want:
+            return 0
+        try:
+            if self.device.type == "cuda":
+                free = torch.cuda.mem_get_info(self.device)[0]
+                want = min(want, int(free * 0.9))
+        except Exception:
+            pass
+        return want
+
     def _initialize_distribution(self):
         """Initialize the distributed model."""
         if self.optimizer is None:
@@ -1035,6 +1055,8 @@ class DistributedModel(nn.Module):
         if self.host_pre_units or self.host_post_units:
             distribution["host_pre_units"] = self.host_pre_units
             distribution["host_post_units"] = self.host_post_units
+        if self.host_memory_bytes:
+            distribution["host_memory_bytes"] = self.host_memory_bytes
         privacy = bool(self.host_pre_units or self.host_post_units)
 
         for attempt in range(2):
