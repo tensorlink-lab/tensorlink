@@ -5,8 +5,8 @@ This script tests distributed machine learning requests via node API on local no
 It simulates an endpoint where model requests, generations, and streamed generations can
 be tested on a tiny Hugging Face model.
 
-Furthermore, two types of models are tested to ensure full coverage of possible workflows: one tiny model
-that can be loaded on a single worker, and a slightly larger model that will require model sharding.
+Only the smallest models are used here so the API surface is exercised quickly. Other model
+architectures (including larger, sharded ones) are covered in test_model_architectures.py.
 """
 
 import requests
@@ -21,7 +21,7 @@ LOCAL = True
 UPNP = False
 SERVER_URL = "http://127.0.0.1:64747"
 
-# Models to test with
+# Models to test with (smallest only; more architectures live in test_model_architectures.py)
 MODELS = [
     pytest.param(
         {
@@ -34,32 +34,12 @@ MODELS = [
     ),
     pytest.param(
         {
-            "name": "HuggingFaceTB/SmolLM2-135M",
-            "model_type": "causal",
-            "timeout": 90,
-            "parsed": True,
-        },
-        id="smollm2-135m",
-    ),
-    pytest.param(
-        {
             "name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
             "model_type": "causal",
             "timeout": 90,
             "parsed": True,
-        }
-    ),
-    pytest.param(
-        {
-            "name": "Qwen/Qwen3-0.6B",
-            "model_type": "causal",
-            "timeout": 180,
-            "parsed": True,
-            "worker_memory_gb": 1.1,
-            "validator_memory_gb": 0.5,
-            "validator_module_gb": 0.5,
         },
-        id="qwen3-0.6b",
+        id="tiny-random-llama",
     ),
 ]
 
@@ -88,21 +68,6 @@ def get_model_status(model_name: str, timeout: int = 10) -> requests.Response:
 @pytest.fixture(scope="module", params=MODELS)
 def model_cfg(request):
     return request.param
-
-
-@pytest.fixture(scope="module")
-def worker_memory_gb(model_cfg, max_memory_gb):
-    return model_cfg.get("worker_memory_gb", max_memory_gb)
-
-
-@pytest.fixture(scope="module")
-def validator_memory_gb(model_cfg, max_memory_gb):
-    return model_cfg.get("validator_memory_gb", max_memory_gb)
-
-
-@pytest.fixture(scope="module")
-def validator_module_gb(model_cfg, max_module_gb):
-    return model_cfg.get("validator_module_gb", max_module_gb)
 
 
 @pytest.fixture(scope="module")

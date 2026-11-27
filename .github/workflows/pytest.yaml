@@ -57,6 +57,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
         run: poetry run pytest tests/torch/test_distributed_model.py -s
 
+      - name: "Test: distributed model architectures"
+        if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
+        run: poetry run pytest tests/torch/test_model_architectures.py -s
+
       - name: "Test: distributed embeddings"
         if: ${{ !cancelled() && steps.setup.conclusion == 'success' }}
         run: poetry run pytest tests/torch/test_distributed_embeddings.py -s
